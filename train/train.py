@@ -62,7 +62,7 @@ class ContactMatrixDataset(Dataset):
 
 
 class SimpleDecompositionModel(nn.Module):
-    """VAE-based model to decompose summed contact matrices."""
+    """Variational Autoencoder (VAE) to decompose summed contact matrices."""
     
     def __init__(self, matrix_size=100, hidden_size1=1024, hidden_size2=512, latent_dim=256):
         """
@@ -91,11 +91,16 @@ class SimpleDecompositionModel(nn.Module):
         self.encoder_layer1 = nn.Linear(conv_output_size, hidden_size1)
         self.encoder_layer2 = nn.Linear(hidden_size1, hidden_size2)
         
-        # Latent vector encoders (one for each phase)
-        # Each phase gets its own latent vector
-        self.latent_encoder_earlyG1 = nn.Linear(hidden_size2, latent_dim)
-        self.latent_encoder_midG1 = nn.Linear(hidden_size2, latent_dim)
-        self.latent_encoder_lateG1 = nn.Linear(hidden_size2, latent_dim)
+        # VAE: Encoder outputs both mean (mu) and log variance (logvar) for each phase
+        # Each phase gets its own latent distribution parameters
+        self.latent_mu_earlyG1 = nn.Linear(hidden_size2, latent_dim)
+        self.latent_logvar_earlyG1 = nn.Linear(hidden_size2, latent_dim)
+        
+        self.latent_mu_midG1 = nn.Linear(hidden_size2, latent_dim)
+        self.latent_logvar_midG1 = nn.Linear(hidden_size2, latent_dim)
+        
+        self.latent_mu_lateG1 = nn.Linear(hidden_size2, latent_dim)
+        self.latent_logvar_lateG1 = nn.Linear(hidden_size2, latent_dim)
         
         # ========== DECODER ==========
         # Decoder layers for each phase (fully connected)
@@ -106,13 +111,33 @@ class SimpleDecompositionModel(nn.Module):
         # Activation function
         self.relu = nn.ReLU()
     
-    def forward(self, x):
+    def reparameterize(self, mu, logvar):
+        """
+        Reparameterization trick: z = mu + sigma * epsilon
+        where epsilon ~ N(0, 1) and sigma = exp(0.5 * logvar)
+        
+        Args:
+            mu: Mean tensor (batch, latent_dim)
+            logvar: Log variance tensor (batch, latent_dim)
+        
+        Returns:
+            Sampled latent vector z (batch, latent_dim)
+        """
+        # Clip logvar to prevent numerical instability (exp of very large values)
+        logvar = torch.clamp(logvar, min=-10, max=10)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def forward(self, x, return_latent_params=False):
         """
         Args:
             x: Input tensor of shape (batch_size, 1, matrix_size, matrix_size)
+            return_latent_params: If True, also return mu and logvar for KL loss
         
         Returns:
-            Tuple of 3 tensors, each of shape (batch_size, output_size)
+            If return_latent_params=False: Tuple of 3 tensors (outputs), each (batch_size, output_size)
+            If return_latent_params=True: Tuple of (outputs, mu_dict, logvar_dict)
         """
         # ========== ENCODER ==========
         # Convolutional layers for spatial feature extraction
@@ -126,40 +151,72 @@ class SimpleDecompositionModel(nn.Module):
         x = self.relu(self.encoder_layer1(x))
         x = self.relu(self.encoder_layer2(x))
         
-        # Encode into 3 latent vectors (one for each phase)
-        latent_earlyG1 = self.latent_encoder_earlyG1(x)  # (batch, latent_dim)
-        latent_midG1 = self.latent_encoder_midG1(x)      # (batch, latent_dim)
-        latent_lateG1 = self.latent_encoder_lateG1(x)    # (batch, latent_dim)
+        # VAE: Encode into mu and logvar for each phase
+        mu_earlyG1 = self.latent_mu_earlyG1(x)  # (batch, latent_dim)
+        logvar_earlyG1 = self.latent_logvar_earlyG1(x)  # (batch, latent_dim)
+        
+        mu_midG1 = self.latent_mu_midG1(x)  # (batch, latent_dim)
+        logvar_midG1 = self.latent_logvar_midG1(x)  # (batch, latent_dim)
+        
+        mu_lateG1 = self.latent_mu_lateG1(x)  # (batch, latent_dim)
+        logvar_lateG1 = self.latent_logvar_lateG1(x)  # (batch, latent_dim)
+        
+        # Reparameterization trick: sample z from N(mu, sigma^2)
+        z_earlyG1 = self.reparameterize(mu_earlyG1, logvar_earlyG1)
+        z_midG1 = self.reparameterize(mu_midG1, logvar_midG1)
+        z_lateG1 = self.reparameterize(mu_lateG1, logvar_lateG1)
         
         # ========== DECODER ==========
-        # Decode from latent vectors (fully connected layers)
-        out_earlyG1 = self.decoder_earlyG1(latent_earlyG1)
-        out_midG1 = self.decoder_midG1(latent_midG1)
-        out_lateG1 = self.decoder_lateG1(latent_lateG1)
+        # Decode from sampled latent vectors
+        out_earlyG1 = self.decoder_earlyG1(z_earlyG1)
+        out_midG1 = self.decoder_midG1(z_midG1)
+        out_lateG1 = self.decoder_lateG1(z_lateG1)
+        
+        if return_latent_params:
+            mu_dict = {
+                'earlyG1': mu_earlyG1,
+                'midG1': mu_midG1,
+                'lateG1': mu_lateG1
+            }
+            logvar_dict = {
+                'earlyG1': logvar_earlyG1,
+                'midG1': logvar_midG1,
+                'lateG1': logvar_lateG1
+            }
+            return (out_earlyG1, out_midG1, out_lateG1), mu_dict, logvar_dict
         
         return out_earlyG1, out_midG1, out_lateG1
 
 
-def weighted_mse_loss(pred, target, weight_method='squared', alpha=2.0):
-    if weight_method == 'squared':
-        # Square both predictions and targets before computing MSE
-        # This amplifies the penalty for errors in high-contact regions
-        pred_sq = pred ** 2
-        target_sq = target ** 2
-        squared_diff = (pred_sq - target_sq) ** 2
-        loss = torch.mean(squared_diff)
+def kl_loss(mu, logvar):
+    """
+    Compute KL divergence: KL(N(mu, sigma^2) || N(0, 1))
+    Formula: -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
     
-    else:
-        # Default: standard MSE
-        loss = torch.mean((pred - target) ** 2)
+    Args:
+        mu: Mean tensor (batch, latent_dim)
+        logvar: Log variance tensor (batch, latent_dim)
     
-    return loss
+    Returns:
+        KL divergence loss (scalar)
+    """
+    # Clip logvar to prevent numerical instability
+    logvar = torch.clamp(logvar, min=-10, max=10)
+    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+    return torch.mean(kl)
 
 
-def train_epoch(model, dataloader, optimizer, device, weight_method='squared', alpha=2.0):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, criterion, optimizer, device, kl_weight=1.0):
+    """
+    Train for one epoch.
+    
+    Args:
+        kl_weight: Weight for KL divergence term in loss (default 1.0)
+    """
     model.train()
     total_loss = 0.0
+    total_recon_loss = 0.0
+    total_kl_loss = 0.0
     num_batches = 0
     
     for batch in dataloader:
@@ -169,34 +226,50 @@ def train_epoch(model, dataloader, optimizer, device, weight_method='squared', a
         # Flatten targets for loss computation
         targets_flat = targets.view(targets.size(0), 3, -1)  # (batch, 3, 10000)
         
-        # Forward pass
+        # Forward pass with latent parameters for KL loss
         optimizer.zero_grad()
-        outputs = model(inputs)  # Tuple of 3 tensors, each (batch, 10000)
+        outputs, mu_dict, logvar_dict = model(inputs, return_latent_params=True)
         
-        # Compute weighted loss for each phase and sum
-        loss = 0.0
-        for i, phase in enumerate(['earlyG1', 'midG1', 'lateG1']):
-            loss += weighted_mse_loss(
-                outputs[i], 
-                targets_flat[:, i, :],
-                weight_method=weight_method,
-                alpha=alpha
-            )
+        # Reconstruction loss (MSE)
+        recon_loss = 0.0
+        phases = ['earlyG1', 'midG1', 'lateG1']
+        for i, phase in enumerate(phases):
+            recon_loss += criterion(outputs[i], targets_flat[:, i, :])
+        
+        # KL divergence loss (regularization to standard normal)
+        kl = 0.0
+        for phase in phases:
+            kl += kl_loss(mu_dict[phase], logvar_dict[phase])
+        
+        # Total loss: reconstruction + KL divergence
+        loss = recon_loss + kl_weight * kl
         
         # Backward pass
         loss.backward()
+        
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
         total_loss += loss.item()
+        total_recon_loss += recon_loss.item()
+        total_kl_loss += kl.item()
         num_batches += 1
     
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_recon = total_recon_loss / num_batches if num_batches > 0 else 0.0
+    avg_kl = total_kl_loss / num_batches if num_batches > 0 else 0.0
+    
+    return avg_loss, avg_recon, avg_kl
 
 
-def evaluate(model, dataloader, device, weight_method='none', alpha=2.0):
+def evaluate(model, dataloader, criterion, device, kl_weight=1.0):
     """Evaluate on validation/test set."""
     model.eval()
     total_loss = 0.0
+    total_recon_loss = 0.0
+    total_kl_loss = 0.0
     num_batches = 0
     
     with torch.no_grad():
@@ -207,23 +280,33 @@ def evaluate(model, dataloader, device, weight_method='none', alpha=2.0):
             # Flatten targets
             targets_flat = targets.view(targets.size(0), 3, -1)  # (batch, 3, 10000)
             
-            # Forward pass
-            outputs = model(inputs)
+            # Forward pass with latent parameters
+            outputs, mu_dict, logvar_dict = model(inputs, return_latent_params=True)
             
-            # Compute weighted loss
-            loss = 0.0
-            for i in range(3):
-                loss += weighted_mse_loss(
-                    outputs[i],
-                    targets_flat[:, i, :],
-                    weight_method=weight_method,
-                    alpha=alpha
-                )
+            # Reconstruction loss
+            recon_loss = 0.0
+            phases = ['earlyG1', 'midG1', 'lateG1']
+            for i, phase in enumerate(phases):
+                recon_loss += criterion(outputs[i], targets_flat[:, i, :])
+            
+            # KL divergence loss
+            kl = 0.0
+            for phase in phases:
+                kl += kl_loss(mu_dict[phase], logvar_dict[phase])
+            
+            # Total loss
+            loss = recon_loss + kl_weight * kl
             
             total_loss += loss.item()
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl.item()
             num_batches += 1
     
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_recon = total_recon_loss / num_batches if num_batches > 0 else 0.0
+    avg_kl = total_kl_loss / num_batches if num_batches > 0 else 0.0
+    
+    return avg_loss, avg_recon, avg_kl
 
 
 def print_maps(model, dataset, device, matrix_size=100, sample_idx=0):
@@ -297,8 +380,8 @@ def main():
     """Main training function."""
     # Configuration
     data_dir = "/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn"
-    batch_size = 4
-    num_epochs = 10
+    batch_size = 1
+    num_epochs = 30
     learning_rate = 0.001
     hidden_size1 = 1024
     hidden_size2 = 512
@@ -335,7 +418,7 @@ def main():
     
     # Initialize model (1MB regions = 100x100 matrices)
     matrix_size = 100  # 1MB / 10kb resolution = 100 bins
-    latent_dim = 256  # Dimension of latent vectors
+    latent_dim =  1024  # Dimension of latent vectors
     model = SimpleDecompositionModel(
         matrix_size=matrix_size,
         hidden_size1=hidden_size1,
@@ -345,27 +428,24 @@ def main():
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Loss configuration (weighted MSE to emphasize high-contact regions)
-    # Options: 'squared' (square values), 'linear' (linear weighting), 'adaptive' (adaptive weighting)
-    weight_method = 'squared'  # Try 'squared', 'linear', or 'adaptive'
-    alpha = 2.0  # Weight factor for linear/adaptive methods
-    
-    # Optimizer
+    # Loss and optimizer
+    criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
-    print(f"Using weighted MSE loss method: {weight_method}")
-    if weight_method in ['linear', 'adaptive']:
-        print(f"  Weight factor (alpha): {alpha}")
+    # VAE KL weight - can be adjusted (typical range: 0.1 to 1.0)
+    # Higher values = stronger regularization, more compact latent space
+    kl_weight = 0.1  # Start with lower weight, can increase if needed
     
     # Training loop
     print("\nStarting training...")
+    print(f"KL divergence weight: {kl_weight}")
     for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, weight_method=weight_method, alpha=alpha)
-        test_loss = evaluate(model, test_loader, device, weight_method=weight_method, alpha=alpha)
+        train_loss, train_recon, train_kl = train_epoch(model, train_loader, criterion, optimizer, device, kl_weight=kl_weight)
+        test_loss, test_recon, test_kl = evaluate(model, test_loader, criterion, device, kl_weight=kl_weight)
         
         print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"  Train Loss: {train_loss:.6f}")
-        print(f"  Test Loss: {test_loss:.6f}")
+        print(f"  Train Loss: {train_loss:.6f} (Recon: {train_recon:.6f}, KL: {train_kl:.6f})")
+        print(f"  Test Loss: {test_loss:.6f} (Recon: {test_recon:.6f}, KL: {test_kl:.6f})")
     
     print("\nTraining completed!")
     
