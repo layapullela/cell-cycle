@@ -80,8 +80,11 @@ class CellCycleDataLoader:
         # Get chromosome information from first available file
         self.chromosomes = self._get_chromosomes()
         
-        # Generate all possible regions
+        # Generate all possible regions for all chromosomes
         self.regions = self._generate_regions(chromosome_sizes)
+        
+        # Filter out empty regions (regions that have no data in any phase)
+        self._filter_empty_regions()
         
         # Cache for loaded matrices
         self._matrix_cache: Dict[Tuple[str, str], np.ndarray] = {}
@@ -169,14 +172,11 @@ class CellCycleDataLoader:
     
     def _estimate_chromosome_sizes(self) -> Dict[str, int]:
         """
-        Estimate chromosome sizes by querying .hic files.
-        This is a heuristic approach - ideally chromosome sizes should be provided.
+        Return all default chromosome sizes without upfront filtering.
+        Individual regions will be checked when extracted.
         """
-        chrom_sizes = {}
-        first_file = next(iter(self.phase_paths.values()))
-        
         # mm39 chromosome sizes (matching the actual hic file format: '1', '2', ..., 'X', 'Y')
-        # Based on mm39.chrom.sizes and user's chromosome list
+        # Based on mm39.chrom.sizes
         default_sizes = {
             "1": 195154279,
             "2": 181755017,
@@ -201,26 +201,8 @@ class CellCycleDataLoader:
             "Y": 91455967,
         }
         
-        # Try to verify which chromosomes exist by testing queries
-        for chrom, default_size in default_sizes.items():
-            try:
-                # Test query - coordinates are 0-based
-                # Usage: straw [observed/oe/expected] <NONE/VC/VC_SQRT/KR> <hicFile> <chr1>[:x1:x2] <chr2>[:y1:y2] <BP/FRAG> <binsize>
-                result = straw.straw(
-                    "observed",                                    # data type
-                    self.normalization,                            # normalization
-                    str(first_file),                               # file
-                    f"{chrom}:0:{self.resolution * 10}",           # chr:start:end (0-based)
-                    f"{chrom}:0:{self.resolution * 10}",           # chr:start:end (0-based)
-                    "BP",                                          # unit
-                    self.resolution                                # binsize
-                )
-                if result and len(result) > 0:
-                    chrom_sizes[chrom] = default_size
-            except:
-                continue
-        
-        return chrom_sizes if chrom_sizes else {"1": 195154279}  # Default fallback
+        # Return all chromosomes - we'll check individual regions when extracted
+        return default_sizes
     
     def _extract_region_matrix(
         self,
@@ -283,6 +265,56 @@ class CellCycleDataLoader:
                     matrix[y_idx, x_idx] = float(count)
         
         return matrix
+    
+    def _is_region_empty(self, region: str) -> bool:
+        """
+        Check if a region is missing data in any phase.
+        A region is considered empty if it doesn't have data in ALL phases.
+        
+        Args:
+            region: Region string like "1:10000000-15000000"
+            
+        Returns:
+            True if region is missing data in any phase, False if it has data in all phases
+        """
+        # Check that region has data in ALL phases
+        for phase, filepath in self.phase_paths.items():
+            try:
+                matrix = self._extract_region_matrix(filepath, region)
+                # Check if matrix has any non-zero values
+                if not np.any(matrix > 0):
+                    # This phase is empty, so reject the region
+                    return True
+            except (ValueError, Exception) as e:
+                # If extraction fails (e.g., region doesn't exist in .hic file),
+                # this phase is missing data, so reject the region
+                return True
+        
+        # All phases have data
+        return False
+    
+    def _filter_empty_regions(self):
+        """
+        Filter out regions that don't have data in all phases.
+        Only keeps regions that have data in ALL phases.
+        """
+        if not self.regions:
+            return
+        
+        print(f"Filtering regions missing data in any phase from {len(self.regions)} total regions...")
+        valid_regions = []
+        rejected_count = 0
+        
+        for region in self.regions:
+            if not self._is_region_empty(region):
+                # Region has data in all phases
+                valid_regions.append(region)
+            else:
+                # Region is missing data in at least one phase
+                rejected_count += 1
+        
+        self.regions = valid_regions
+        print(f"Rejected {rejected_count} regions missing data in any phase. {len(self.regions)} valid regions (with data in all phases) remaining.")
     
     def __len__(self) -> int:
         """Return number of regions."""
