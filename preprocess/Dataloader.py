@@ -1,68 +1,60 @@
 """
-DataLoader for cell cycle Hi-C contact maps.
+Simple DataLoader for cell cycle Hi-C contact maps.
 
-This module provides a DataLoader class that:
-- Reads .hic files binned at 10kb resolution
-- Extracts 5Mb square regions along the main diagonal
-- Organizes samples with keys: region, earlyG1, lateG1, midG1, prometa, anaTelo
+Extracts 50x50 pixel (500kb) regions along the diagonal with sliding window.
+Only stores upper triangular portion of symmetric Hi-C matrices.
 """
 
-import os
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
-import warnings
+from typing import Dict, List, Union
 import hicstraw as straw
-import matplotlib.pyplot as plt
 
 
 class CellCycleDataLoader:
     """
-    DataLoader for cell cycle Hi-C contact maps.
+    Simple DataLoader for cell cycle Hi-C contact maps.
     
     Each sample contains:
-    - region: str, e.g., "chr1:10000000-15000000"
-    - earlyG1: numpy array (500x500 contact matrix)
-    - lateG1: numpy array (500x500 contact matrix)
-    - midG1: numpy array (500x500 contact matrix)
-    - prometa: numpy array (optional, 500x500 contact matrix)
-    - anaTelo: numpy array (optional, 500x500 contact matrix)
+    - region: str, e.g., "1:10000000-10500000"
+    - earlyG1: numpy array (flattened upper triangular vector, shape: (1275,))
+    - lateG1: numpy array (flattened upper triangular vector, shape: (1275,))
+    - midG1: numpy array (flattened upper triangular vector, shape: (1275,))
+    
+    For a 50x50 matrix, upper triangular has 50*51/2 = 1275 elements.
     """
     
     def __init__(
         self,
         data_dir: Union[str, Path],
         resolution: int = 10000,  # 10kb bins
-        region_size: int = 5000000,  # 5Mb regions
-        normalization: str = "NONE",  # or "VC", "VC_SQRT", "KR"
-        chromosome_sizes: Optional[Dict[str, int]] = None,
+        region_size: int = 500000,  # 500kb regions (50 pixels at 10kb resolution)
+        normalization: str = "VC",  # or "NONE", "KR", etc.
     ):
         """
         Initialize the DataLoader.
         
         Args:
-            data_dir: Directory containing .hic files (earlyG1.hic, lateG1.hic, etc.)
+            data_dir: Directory containing .hic files (earlyG1.hic, lateG1.hic, midG1.hic)
             resolution: Bin size in base pairs (default: 10000 for 10kb)
-            region_size: Size of square region to extract in base pairs (default: 5000000 for 5Mb)
+            region_size: Size of square region to extract in base pairs (default: 500000 for 500kb = 50 pixels)
             normalization: Normalization method for Hi-C data (NONE, VC, VC_SQRT, KR)
-            chromosome_sizes: Optional dict mapping chromosome names to sizes.
-                             If None, will try to infer from .hic files.
         """
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.region_size = region_size
         self.normalization = normalization
+        self.image_size = region_size // resolution  # 50 pixels for 500kb at 10kb
         
-        # Number of bins per region
-        self.bins_per_region = region_size // resolution  # 500 bins for 5Mb at 10kb
+        # Step size: sample every 10 pixels along the diagonal
+        self.step_pixels = 10
+        self.step_bp = self.step_pixels * resolution  # 100kb step
         
-        # Expected phase files
+        # Phase files
         self.phase_files = {
             'earlyG1': 'earlyG1.hic',
             'lateG1': 'lateG1.hic',
             'midG1': 'midG1.hic',
-            'prometa': 'prometa.hic',  # optional
-            'anaTelo': 'anaTelo.hic',  # optional
         }
         
         # Load available phase files
@@ -71,250 +63,119 @@ class CellCycleDataLoader:
             filepath = self.data_dir / filename
             if filepath.exists():
                 self.phase_paths[phase] = filepath
-            else:
-                warnings.warn(f"Phase file not found: {filepath}. Phase '{phase}' will be skipped.")
         
         if not self.phase_paths:
             raise ValueError(f"No .hic files found in {self.data_dir}")
         
-        # Get chromosome information from first available file
-        self.chromosomes = self._get_chromosomes()
+        # mm39 chromosome sizes (no "chr" prefix in .hic files)
+        self.chromosome_sizes = {
+            "1": 195154279, "2": 181755017, "3": 159745316, "4": 156860686,
+            "5": 151758149, "6": 149588044, "7": 144995196, "8": 130127694,
+            "9": 124359700, "10": 130530862, "11": 121973369, "12": 120092757,
+            "13": 120883175, "14": 125139656, "15": 104073951, "16": 98008968,
+            "17": 95294699, "18": 90720763, "19": 61420004,
+            "X": 169476592, "Y": 91455967,
+        }
         
-        # Generate all possible regions for all chromosomes
-        self.regions = self._generate_regions(chromosome_sizes)
-        
-        # Filter out empty regions (regions that have no data in any phase)
-        self._filter_empty_regions()
-        
-        # Cache for loaded matrices
-        self._matrix_cache: Dict[Tuple[str, str], np.ndarray] = {}
+        # Generate regions by sliding along diagonal every 10 pixels
+        self.regions = self._generate_regions()
     
-    def _get_chromosomes(self) -> Dict[str, int]:
-        """Extract chromosome information from .hic file header."""
-        # Use first available phase file to get chromosome info
-        first_file = next(iter(self.phase_paths.values()))
-        
-        try:
-            # Try to get chromosome sizes from the .hic file
-            # Note: straw doesn't directly provide this, so we'll need to extract regions dynamically
-            # For now, we'll use a common approach: try common chromosomes
-            chromosomes = {}
-            
-            # Mouse chromosomes in hic file: '1', '2', '3', ..., '19', 'X', 'Y' (no "chr" prefix)
-            common_chroms = [str(i) for i in range(1, 20)] + ["X", "Y"]
-            
-            # Try to determine chromosome sizes by querying the file
-            # We'll do a test query to see which chromosomes exist
-            for chrom in common_chroms:
-                try:
-                    # Try to get a small region to check if chromosome exists
-                    # Usage: straw [observed/oe/expected] <NONE/VC/VC_SQRT/KR> <hicFile> <chr1>[:x1:x2] <chr2>[:y1:y2] <BP/FRAG> <binsize>
-                    # Coordinates are 0-based
-                    result = straw.straw(
-                        "observed",                  # data type
-                        self.normalization,          # normalization
-                        str(first_file),             # file
-                        f"{chrom}:1000000:1500000",  # chr:start:end (0-based)
-                        f"{chrom}:1000000:1500000",  # chr:start:end (0-based)
-                        "BP",                        # unit
-                        self.resolution              # binsize
-                    )
-                    if result and len(result) > 0:
-                        # Estimate size - we'll refine this when generating regions
-                        chromosomes[chrom] = None  # Placeholder, will determine dynamically
-                except:
-                    continue
-            
-            return chromosomes if chromosomes else {"1": None}  # Default fallback
-            
-        except Exception as e:
-            warnings.warn(f"Could not determine chromosomes from .hic file: {e}. Using default.")
-            return {"1": None}
-    
-    def _generate_regions(
-        self, 
-        chromosome_sizes: Optional[Dict[str, int]] = None
-    ) -> List[str]:
+    def _generate_regions(self) -> List[str]:
         """
-        Generate all possible 5Mb regions along the diagonal.
+        Generate all 50x50 regions by sliding every 10 pixels along the diagonal.
         
         Returns:
-            List of region strings like "1:10000000-15000000" (0-based coordinates, no chr prefix)
+            List of region strings like "1:10000000-10500000" (0-based coordinates, no chr prefix)
         """
         regions = []
         
-        # If chromosome sizes provided, use them
-        if chromosome_sizes:
-            chrom_sizes = chromosome_sizes
-        else:
-            # Try to determine chromosome sizes dynamically
-            chrom_sizes = self._estimate_chromosome_sizes()
-        
-        # Generate regions (non-overlapping by default, can be modified for overlap)
-        # Use step_size = region_size for non-overlapping regions
-        # Use step_size = region_size // 2 for 50% overlap
-        step_size = self.region_size  # Non-overlapping regions
-        
-        for chrom, size in chrom_sizes.items():
-            if size is None:
-                continue
-            
-            # Start from 0 (0-based coordinates), extract regions until we run out of chromosome
+        for chrom, size in self.chromosome_sizes.items():
+            # Start from 0, step by step_bp (100kb = 10 pixels at 10kb resolution)
             start = 0
             while start + self.region_size <= size:
                 end = start + self.region_size
-                # Region format: "chrom:start-end" (0-based, inclusive start, exclusive end for straw)
-                region_str = f"{chrom}:{start}-{end}"
-                regions.append(region_str)
-                start += step_size
+                regions.append(f"{chrom}:{start}-{end}")
+                start += self.step_bp
         
         return regions
     
-    def _estimate_chromosome_sizes(self) -> Dict[str, int]:
+    def _extract_upper_triangular_vector(self, matrix: np.ndarray) -> np.ndarray:
         """
-        Return all default chromosome sizes without upfront filtering.
-        Individual regions will be checked when extracted.
-        """
-        # mm39 chromosome sizes (matching the actual hic file format: '1', '2', ..., 'X', 'Y')
-        # Based on mm39.chrom.sizes
-        default_sizes = {
-            "1": 195154279,
-            "2": 181755017,
-            "3": 159745316,
-            "4": 156860686,
-            "5": 151758149,
-            "6": 149588044,
-            "7": 144995196,
-            "8": 130127694,
-            "9": 124359700,
-            "10": 130530862,
-            "11": 121973369,
-            "12": 120092757,
-            "13": 120883175,
-            "14": 125139656,
-            "15": 104073951,
-            "16": 98008968,
-            "17": 95294699,
-            "18": 90720763,
-            "19": 61420004,
-            "X": 169476592,
-            "Y": 91455967,
-        }
+        Extract upper triangular portion of symmetric matrix as a flattened vector.
+        Elements are stacked row by row (e.g., row 0, then row 1, etc.).
         
-        # Return all chromosomes - we'll check individual regions when extracted
-        return default_sizes
-    
-    def _extract_region_matrix(
-        self,
-        hic_file: Path,
-        region: str,
-    ) -> np.ndarray:
+        Example:
+            [[1, 1, 0],
+             [0, 2, 1],
+             [0, 0, 0]]
+            -> [1, 1, 0, 2, 1, 0]
+        
+        Args:
+            matrix: 2D numpy array (square, symmetric)
+        
+        Returns:
+            1D numpy array containing upper triangular elements in row-major order
         """
-        Extract a square contact matrix for a given region.
+        n = matrix.shape[0]
+        upper_tri_vec = []
+        
+        # Stack rows: for row i, take elements from column i to n-1
+        for i in range(n):
+            upper_tri_vec.extend(matrix[i, i:].tolist())
+        
+        return np.array(upper_tri_vec, dtype=matrix.dtype)
+    
+    def _extract_region_matrix(self, hic_file: Path, region: str) -> np.ndarray:
+        """
+        Extract a square contact matrix for a given region and return upper triangular as vector.
         
         Args:
             hic_file: Path to .hic file
-            region: Region string like "1:10000000-15000000" (0-based coordinates, no chr prefix)
+            region: Region string like "1:10000000-10500000" (0-based coordinates, no chr prefix)
         
         Returns:
-            2D numpy array of shape (bins_per_region, bins_per_region)
+            1D numpy array containing upper triangular elements flattened row by row
         """
         # Parse region
         chrom, coords = region.split(':')
         start, end = map(int, coords.split('-'))
         
         # Extract contact matrix using hicstraw
-        # Usage: straw [observed/oe/expected] <NONE/VC/VC_SQRT/KR> <hicFile> <chr1>[:x1:x2] <chr2>[:y1:y2] <BP/FRAG> <binsize>
-        # So the order is: data_type, normalization, file, chr1, chr2, unit, binsize
         try:
             result = straw.straw(
-                "observed",                   # arg0: str (data type: observed/oe/expected)
-                self.normalization,           # arg1: str (normalization: NONE/VC/VC_SQRT/KR)
-                str(hic_file),                # arg2: str (file path)
-                f"{chrom}:{start}:{end}",     # arg3: str (chr1:start:end)
-                f"{chrom}:{start}:{end}",     # arg4: str (chr2:start:end)
-                "BP",                         # arg5: str (unit: BP or FRAG)
-                self.resolution               # arg6: int (binsize)
+                "observed",
+                self.normalization,
+                str(hic_file),
+                f"{chrom}:{start}:{end}",
+                f"{chrom}:{start}:{end}",
+                "BP",
+                self.resolution
             )
         except Exception as e:
             raise ValueError(f"Error reading region {region} from {hic_file}: {e}")
         
-        # Convert to dense matrix
-        bins = self.bins_per_region
-        matrix = np.zeros((bins, bins), dtype=np.float32)
-        
-        # hicstraw.straw returns a list of contactRecord objects
-        # Each contactRecord has: binX, binY, counts attributes
-        if not isinstance(result, list):
-            raise ValueError(f"Unexpected return format from straw: {type(result)}, expected list")
+        # Initialize matrix
+        matrix = np.zeros((self.image_size, self.image_size), dtype=np.float32)
         
         # Fill the matrix
         for record in result:
             x = record.binX
             y = record.binY
             count = record.counts
+            
             # Convert genomic positions to bin indices (0-indexed)
             x_idx = int((x - start) // self.resolution)
             y_idx = int((y - start) // self.resolution)
             
             # Ensure indices are within bounds
-            if 0 <= x_idx < bins and 0 <= y_idx < bins:
+            if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
                 matrix[x_idx, y_idx] = float(count)
-                # Matrix is symmetric
+                # Matrix is symmetric, so also set the transpose
                 if x_idx != y_idx:
                     matrix[y_idx, x_idx] = float(count)
         
-        return matrix
-    
-    def _is_region_empty(self, region: str) -> bool:
-        """
-        Check if a region is missing data in any phase.
-        A region is considered empty if it doesn't have data in ALL phases.
-        
-        Args:
-            region: Region string like "1:10000000-15000000"
-            
-        Returns:
-            True if region is missing data in any phase, False if it has data in all phases
-        """
-        # Check that region has data in ALL phases
-        for phase, filepath in self.phase_paths.items():
-            try:
-                matrix = self._extract_region_matrix(filepath, region)
-                # Check if matrix has any non-zero values
-                if not np.any(matrix > 0):
-                    # This phase is empty, so reject the region
-                    return True
-            except (ValueError, Exception) as e:
-                # If extraction fails (e.g., region doesn't exist in .hic file),
-                # this phase is missing data, so reject the region
-                return True
-        
-        # All phases have data
-        return False
-    
-    def _filter_empty_regions(self):
-        """
-        Filter out regions that don't have data in all phases.
-        Only keeps regions that have data in ALL phases.
-        """
-        if not self.regions:
-            return
-        
-        print(f"Filtering regions missing data in any phase from {len(self.regions)} total regions...")
-        valid_regions = []
-        rejected_count = 0
-        
-        for region in self.regions:
-            if not self._is_region_empty(region):
-                # Region has data in all phases
-                valid_regions.append(region)
-            else:
-                # Region is missing data in at least one phase
-                rejected_count += 1
-        
-        self.regions = valid_regions
-        print(f"Rejected {rejected_count} regions missing data in any phase. {len(self.regions)} valid regions (with data in all phases) remaining.")
+        # Return upper triangular portion as flattened vector
+        return self._extract_upper_triangular_vector(matrix)
     
     def __len__(self) -> int:
         """Return number of regions."""
@@ -325,10 +186,11 @@ class CellCycleDataLoader:
         Get a sample by index or region string.
         
         Args:
-            idx: Integer index or region string like "1:10000000-15000000" (0-based, no chr prefix)
+            idx: Integer index or region string like "1:10000000-10500000"
         
         Returns:
-            Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', etc.
+            Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1'
+            Each phase contains flattened upper triangular vector (shape: (1275,))
         """
         # Handle region string indexing
         if isinstance(idx, str):
@@ -341,18 +203,10 @@ class CellCycleDataLoader:
         # Build sample dictionary
         sample = {'region': region}
         
-        # Load matrices for each available phase
+        # Load matrices for each available phase (upper triangular as vector)
         for phase, filepath in self.phase_paths.items():
-            cache_key = (phase, region)
-            
-            # Check cache
-            if cache_key in self._matrix_cache:
-                matrix = self._matrix_cache[cache_key]
-            else:
-                matrix = self._extract_region_matrix(filepath, region)
-                self._matrix_cache[cache_key] = matrix
-            
-            sample[phase] = matrix
+            vector = self._extract_region_matrix(filepath, region)
+            sample[phase] = vector
         
         return sample
     
@@ -368,73 +222,32 @@ class CellCycleDataLoader:
     def get_available_phases(self) -> List[str]:
         """Get list of available phase names."""
         return list(self.phase_paths.keys())
-    
-    def clear_cache(self):
-        """Clear the matrix cache."""
-        self._matrix_cache.clear()
 
 
-def example_usage():
-    """Example of how to use the DataLoader."""
-    # Initialize dataloader
-    data_dir = "/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn"
+def upper_tri_vec_to_matrix(vec: np.ndarray, n: int) -> np.ndarray:
+    """
+    Convert flattened upper triangular vector back to square matrix.
     
-    # Optional: provide chromosome sizes for more accurate region generation
-    # chromosome_sizes = {"1": 195154279, "2": 181755017, ..., "X": 169476592, "Y": 91455967}
+    Args:
+        vec: 1D numpy array containing upper triangular elements (length: n*(n+1)/2)
+        n: Size of the square matrix (e.g., 50 for 50x50)
     
-    loader = CellCycleDataLoader(
-        data_dir=data_dir,
-        resolution=10000,  # 10kb bins
-        region_size=1000000,  # # for now we will do 1 Mb. 5Mb regions
-        normalization="NONE",  # or "VC", "KR", etc.
-        # chromosome_sizes=chromosome_sizes,  # optional
-    )
+    Returns:
+        2D numpy array of shape (n, n) with upper triangular filled and lower triangular zeros
     
-    print(f"Number of regions: {len(loader)}")
-    print(f"Available phases: {loader.get_available_phases()}")
-    print(f"First 5 regions: {loader.get_regions()[:5]}")
+    Example:
+        vec = [1, 1, 0, 2, 1, 0], n = 3
+        -> [[1, 1, 0],
+            [0, 2, 1],
+            [0, 0, 0]]
+    """
+    matrix = np.zeros((n, n), dtype=vec.dtype)
     
-    # Get a sample by index
-    sample = loader[0]
-    print(f"\nSample region: {sample['region']}")
-    print(f"EarlyG1 matrix shape: {sample['earlyG1'].shape}")
-    print(f"LateG1 matrix shape: {sample['lateG1'].shape}")
-    print(f"MidG1 matrix shape: {sample['midG1'].shape}")
+    idx = 0
+    for i in range(n):
+        # For row i, fill columns from i to n-1
+        num_elements = n - i
+        matrix[i, i:] = vec[idx:idx + num_elements]
+        idx += num_elements
     
-    # Get a sample by region string (0-based coordinates, no chr prefix)
-    region = "1:10000000-15000000"
-    if region in loader.get_regions():
-        sample = loader[region]
-        print(f"\nSample from region {region}:")
-        print(f"Matrix shapes: {[sample[k].shape for k in loader.get_available_phases()]}")
-    
-    # Iterate through samples
-    print("\nIterating through first 3 samples:")
-    for i, sample in enumerate(loader):
-        if i >= 3:
-            break
-        print(f"  Sample {i}: {sample['region']}")
-    
-    # Plot contact matrices for one sample
-    print("\nPlotting contact matrices for first sample...")
-    sample = loader[1]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
-    phases = ['earlyG1', 'midG1', 'lateG1']
-    for idx, phase in enumerate(phases):
-        if phase in sample:
-            matrix = sample[phase]
-            # Use log scale for better visualization
-            im = axes[idx].imshow(np.log1p(matrix), cmap='YlOrRd', aspect='auto')
-            axes[idx].set_title(f'{phase}\n{sample["region"]}')
-            axes[idx].set_xlabel('Bin')
-            axes[idx].set_ylabel('Bin')
-            plt.colorbar(im, ax=axes[idx], label='log(contacts + 1)')
-    
-    plt.tight_layout()
-    plt.savefig('contact_matrices_example.png', dpi=150, bbox_inches='tight')
-    print("  Saved plot to 'contact_matrices_example.png'")
-
-
-if __name__ == "__main__":
-    example_usage()
+    return matrix
