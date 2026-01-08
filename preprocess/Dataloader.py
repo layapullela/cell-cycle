@@ -10,13 +10,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Union, Optional
 import hicstraw as straw
-
-# Try to import pyBigWig for ChIP-seq loading
-try:
-    import pyBigWig
-    HAS_PYBIGWIG = True
-except ImportError:
-    HAS_PYBIGWIG = False
+import pyBigWig
 
 
 class CellCycleDataLoader:
@@ -25,10 +19,11 @@ class CellCycleDataLoader:
     
     Each sample contains:
     - region: str, e.g., "1:10000000-10500000"
-    - earlyG1: numpy array (flattened upper triangular vector, shape: (1275,))
+    - earlyG1: numpy array (flattened upper triangular vector, shape: (1275,)) 
     - lateG1: numpy array (flattened upper triangular vector, shape: (1275,))
     - midG1: numpy array (flattened upper triangular vector, shape: (1275,))
     - chip_seq: numpy array (shape: (50,)) - ChIP-seq signal for the region
+    * dim calc: 50 x 51 x 0.5 = 1275
     
     For a 50x50 matrix, upper triangular has 50*51/2 = 1275 elements.
     """
@@ -38,7 +33,7 @@ class CellCycleDataLoader:
         data_dir: Union[str, Path],
         resolution: int = 10000,  # 10kb bins
         region_size: int = 500000,  # 500kb regions (50 pixels at 10kb resolution)
-        normalization: str = "VC",  # or "NONE", "KR", etc.
+        normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage.
         chipseq_file: Optional[str] = None,  # Path to ChIP-seq bigWig file
     ):
         """
@@ -63,23 +58,9 @@ class CellCycleDataLoader:
         
         # Load ChIP-seq file
         self.chipseq_bw = None
-        if chipseq_file is None:
-            # Try to find default ChIP-seq file
-            chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
-        else:
-            chipseq_file = Path(chipseq_file)
-        
-        if HAS_PYBIGWIG and chipseq_file.exists():
-            try:
-                self.chipseq_bw = pyBigWig.open(str(chipseq_file))
-                print(f"Loaded ChIP-seq from: {chipseq_file}")
-            except Exception as e:
-                print(f"Warning: Could not load ChIP-seq file: {e}")
-        else:
-            if not HAS_PYBIGWIG:
-                print("Warning: pyBigWig not available. ChIP-seq data will be zeros.")
-            else:
-                print(f"Warning: ChIP-seq file not found: {chipseq_file}")
+        chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
+        self.chipseq_bw = pyBigWig.open(str(chipseq_file))
+        print(f"Loaded ChIP-seq from: {chipseq_file}")
         
         # Phase files
         self.phase_files = {
@@ -116,7 +97,7 @@ class CellCycleDataLoader:
     def _generate_regions(self) -> List[str]:
         """
         Generate all 50x50 regions by sliding every 10 pixels along the diagonal.
-        Skips the beginning of chromosomes (typically no mappable Hi-C data).
+        Skips the beginning of chromosomes (typically no mappable Hi-C data at start of chromosome).
         
         Returns:
             List of region strings like "1:10000000-10500000" (0-based coordinates, no chr prefix)
@@ -205,8 +186,7 @@ class CellCycleDataLoader:
             if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
                 matrix[x_idx, y_idx] = float(count)
                 # Matrix is symmetric, so also set the transpose
-                if x_idx != y_idx:
-                    matrix[y_idx, x_idx] = float(count)
+                matrix[y_idx, x_idx] = float(count)
         
         # Return upper triangular portion as flattened vector
         return self._extract_upper_triangular_vector(matrix)
@@ -277,7 +257,7 @@ class CellCycleDataLoader:
             Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'chip_seq'
             Each phase contains flattened upper triangular vector (shape: (1275,))
             normalized independently: (x - phase_min) / (phase_max - phase_min) * 2 - 1
-            Each phase is guaranteed to be in [-1, 1]
+            Each phase hic matrix is guaranteed to be in [-1, 1]
             chip_seq contains ChIP-seq signal (shape: (50,)) normalized to [-1, 1]
         """
         # Handle region string indexing
@@ -291,38 +271,23 @@ class CellCycleDataLoader:
         # Build sample dictionary
         sample = {'region': region}
         
-        # Load matrices for each available phase (upper triangular as vector)
-        phase_data = {}
+        # Load and normalize each phase INDEPENDENTLY using its own min/max
         for phase, filepath in self.phase_paths.items():
             vector = self._extract_region_matrix(filepath, region)
-            phase_data[phase] = vector
-        
-        # Compute summed contact map (bulk Hi-C)
-        summed = np.zeros_like(phase_data['earlyG1'])
-        for phase_vec in phase_data.values():
-            summed += phase_vec
-        
-        # Find min/max of the BULK (summed) contact map
-        bulk_min = summed.min()
-        bulk_max = summed.max()
-        
-        # Avoid division by zero
-        if bulk_max - bulk_min < 1e-10:
-            # All values are the same, map to 0
-            for phase, vector in phase_data.items():
-                sample[phase] = np.zeros_like(vector, dtype=np.float32)
-        else:
-            # Normalize using: (x - bulk_min) / (bulk_max - bulk_min) * 2 - 1
-            # This can be rewritten as: x * scale + offset where:
-            # scale = 2 / (bulk_max - bulk_min)
-            # offset = -2*bulk_min / (bulk_max - bulk_min) - 1
-            scale = 2.0 / (bulk_max - bulk_min)
-            offset = -2.0 * bulk_min / (bulk_max - bulk_min) - 1.0
             
-            # Apply transformation to each phase
-            for phase, vector in phase_data.items():
-                normalized = vector * scale + offset
-                sample[phase] = normalized.astype(np.float32)
+            # Find min/max for THIS phase
+            phase_min = vector.min()
+            phase_max = vector.max()
+            
+            # Normalize to [-1, 1] using phase's own statistics
+            if phase_max - phase_min < 1e-10:
+                # All values are the same, map to 0
+                normalized = np.zeros_like(vector, dtype=np.float32)
+            else:
+                # Linear transformation: (x - min) / (max - min) * 2 - 1
+                normalized = (vector - phase_min) / (phase_max - phase_min) * 2.0 - 1.0
+            
+            sample[phase] = normalized.astype(np.float32)
         
         # Load ChIP-seq signal and normalize to [-1, 1]
         chip_seq = self._extract_chipseq_signal(region)
