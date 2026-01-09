@@ -4,19 +4,22 @@ Cell-Cycle Hi-C Phase Decomposition via Conditional DDPM
 Train 3 separate conditional denoisers (one per phase: earlyG1/midG1/lateG1)
 Each denoiser predicts injected Gaussian noise ε from a noisy phase map x_t
 
-Architecture: U-Net with Convolutional Layers
+MEMORY OPTIMIZATION: Train one phase at a time to reduce GPU memory usage
+
+Architecture: ControlNet-Inspired U-Net with Parallel Conditioning Encoder
     - Converts upper triangular Hi-C vector to 2D symmetric matrix
-    - Encoder-decoder with skip connections
-    - FiLM conditioning (scale & shift) at each layer
-    - Multi-modal input: noisy phase + bulk Hi-C + ChIP outer product
+    - Parallel control encoder processes bulk Hi-C at multiple resolutions
+    - Main U-Net processes noisy input
+    - Conditioning features ADDED at each resolution level
+    - Time FiLM conditioning (scale & shift) globally injected at every ResBlock
 
 Conditioning signals:
-    (1) Diffusion time t    -> FiLM parameters for each conv block
-    (2) ChIP-seq 1D track   -> FiLM parameters + outer product as spatial input
-    (3) Bulk Hi-C (sum)     -> FiLM parameters + spatial input channel
+    (1) Diffusion time t         -> Sinusoidal embeddings + FiLM at every layer
+    (2) Bulk Hi-C               -> Parallel encoder → multi-resolution features
+                                    → Added to main U-Net at each level
 
 Loss: MSE between predicted noise and true noise (standard DDPM)
-    loss = MSE(ε_pred_early, ε_early) + MSE(ε_pred_mid, ε_mid) + MSE(ε_pred_late, ε_late)
+    loss = MSE(ε_pred, ε_true)  [per phase]
 """
 
 import os
@@ -102,17 +105,26 @@ class CellCycleDataset(Dataset):
 # 1) CONFIG
 ############################################
 PHASES = ["earlyG1", "midG1", "lateG1"]
+
+# MEMORY OPTIMIZATION: Train one phase at a time
+# Change this to 'earlyG1', 'midG1', or 'lateG1' to train different phases
+CURRENT_PHASE = 'earlyG1'  # <-- CHANGE THIS to train different phases
+
 T = 1000              # diffusion steps
-N = 50                # contact map size (50 x 50)
-VEC_DIM = 1275        # upper triangular vector dimension (50*51/2)
+N = 64                # contact map size (64 x 64)
+VEC_DIM = 2080        # upper triangular vector dimension (64*65/2)
 L = 2                 # number of bottleneck blocks in U-Net
-HIDDEN_DIM = 256      # base channel dimension for U-Net
+HIDDEN_DIM = 128      # base channel dimension for U-Net (reduced from 256)
 d_t = 256             # time embedding dimension
 
-BATCH_SIZE = 64
+BATCH_SIZE = 32       # Increased from 8 since we have more memory with single model
 LR = 1e-4
-NUM_EPOCHS = 1
+NUM_EPOCHS = 2        # More epochs since we're training one at a time
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Model checkpoints directory
+CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
+CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 
 
@@ -169,29 +181,25 @@ class TimeEmbedding(nn.Module):
     
     def forward(self, t):
         """
-        t: (batch,) normalized timestep in [0, 1]
+        t: (batch,) integer timestep in [0, max_timesteps-1]
         returns: (batch, dim)
         """
-        # Scale back to original range for sinusoidal encoding
-        t_scaled = t * (self.max_timesteps - 1)
-        emb = self.sinusoidal(t_scaled)
+        emb = self.sinusoidal(t)
         return self.mlp(emb)
 
 
-
-
 ############################################
-# 3) CONVOLUTIONAL RESIDUAL BLOCK
+# 3) CONVOLUTIONAL RESIDUAL BLOCK (with Time FiLM)
 ############################################
 class ConvResBlock(nn.Module):
     """
-    Convolutional residual block with group normalization and conditioning.
+    Convolutional residual block with group normalization and TIME conditioning only.
     
     Inputs:
         x: (batch, channels, H, W) feature map
-        cond: (batch, cond_dim) conditioning vector (time + chip combined)
+        time_emb: (batch, time_dim) time embedding for FiLM conditioning
     """
-    def __init__(self, channels, cond_dim):
+    def __init__(self, channels, time_dim):
         super().__init__()
         self.channels = channels
         
@@ -204,28 +212,28 @@ class ConvResBlock(nn.Module):
         self.gn1 = nn.GroupNorm(num_groups, channels)
         self.gn2 = nn.GroupNorm(num_groups, channels)
         
-        # Conditioning projection (FiLM: scale and shift)
-        self.cond_proj = nn.Linear(cond_dim, channels * 2)
+        # Time conditioning projection (FiLM: scale and shift)
+        self.time_proj = nn.Linear(time_dim, channels * 2)
         
         self.act = nn.SiLU()
     
-    def forward(self, x, cond):
+    def forward(self, x, time_emb):
         """
         x: (batch, channels, H, W)
-        cond: (batch, cond_dim) - conditioning
+        time_emb: (batch, time_dim) - time embedding only
         """
         residual = x
         
-        # Project conditioning to scale and shift
-        cond_params = self.cond_proj(cond)  # (batch, channels * 2)
-        scale, shift = cond_params.chunk(2, dim=1)  # Each (batch, channels)
+        # Project time embedding to scale and shift
+        time_params = self.time_proj(time_emb)  # (batch, channels * 2)
+        scale, shift = time_params.chunk(2, dim=1)  # Each (batch, channels)
         scale = scale.unsqueeze(-1).unsqueeze(-1)  # (batch, channels, 1, 1)
         shift = shift.unsqueeze(-1).unsqueeze(-1)  # (batch, channels, 1, 1)
         
-        # First conv + FiLM conditioning
+        # First conv + FiLM conditioning (time only)
         h = self.conv1(x)
         h = self.gn1(h)
-        h = h * (1 + scale) + shift  # FiLM: scale and shift
+        h = h * (1 + scale) + shift  # FiLM: scale and shift from time
         h = self.act(h)
         
         # Second conv
@@ -236,161 +244,207 @@ class ConvResBlock(nn.Module):
 
 
 ############################################
-# 4) CONVOLUTIONAL EPSILON NETWORK (U-Net Style)
+# 4) CONTROL ENCODER (Parallel Conditioning Pathway)
+############################################
+class ControlEncoder(nn.Module):
+    """
+    Parallel encoder that processes bulk Hi-C conditioning image.
+    Produces multi-resolution features to be added to main U-Net at each level.
+    
+    Architecture matches the main U-Net structure to ensure resolution compatibility.
+    """
+    def __init__(self, base_ch: int = 64, time_dim: int = 256):
+        super().__init__()
+        
+        # Input: (B, 1, 64, 64) bulk Hi-C map
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(1, base_ch, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, base_ch), base_ch),
+            nn.SiLU(),
+        )
+        
+        # Level 1: 64x64 @ base_ch
+        self.enc1 = ConvResBlock(base_ch, time_dim)
+        self.down1 = nn.Conv2d(base_ch, base_ch * 2, kernel_size=3, stride=2, padding=1)
+        
+        # Level 2: 32x32 @ base_ch*2
+        self.enc2 = ConvResBlock(base_ch * 2, time_dim)
+        self.down2 = nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=3, stride=2, padding=1)
+        
+        # Level 3: 16x16 @ base_ch*4 (bottleneck)
+        self.enc3 = ConvResBlock(base_ch * 4, time_dim)
+        
+        # Zero-initialize output to start with no conditioning
+        for module in [self.enc1, self.enc2, self.enc3]:
+            if hasattr(module, 'conv2'):
+                nn.init.zeros_(module.conv2.weight)
+                nn.init.zeros_(module.conv2.bias)
+    
+    def forward(self, cond_img: torch.Tensor, t_emb: torch.Tensor):
+        """
+        Args:
+            cond_img: (B, 1, 64, 64) bulk Hi-C conditioning image
+            t_emb: (B, time_dim) time embedding
+        
+        Returns:
+            Dictionary of conditioning features at each resolution:
+            {
+                'feat_64': (B, base_ch, 64, 64),
+                'feat_32': (B, base_ch*2, 32, 32),
+                'feat_16': (B, base_ch*4, 16, 16)
+            }
+        """
+        # Input processing
+        h = self.input_conv(cond_img)  # (B, base_ch, 64, 64)
+        
+        # Level 1: 64x64
+        feat_64 = self.enc1(h, t_emb)  # (B, base_ch, 64, 64)
+        h = self.down1(feat_64)        # (B, base_ch*2, 32, 32)
+        
+        # Level 2: 32x32
+        feat_32 = self.enc2(h, t_emb)  # (B, base_ch*2, 32, 32)
+        h = self.down2(feat_32)        # (B, base_ch*4, 16, 16)
+        
+        # Level 3: 16x16 (bottleneck)
+        feat_16 = self.enc3(h, t_emb)  # (B, base_ch*4, 16, 16)
+        
+        return {
+            'feat_64': feat_64,
+            'feat_32': feat_32,
+            'feat_16': feat_16
+        }
+
+
+############################################
+# 5) MAIN U-NET (EpsilonNet with ControlNet Architecture)
 ############################################
 class EpsilonNet(nn.Module):
     """
-    Convolutional U-Net denoiser with conditioning from time and ChIP-seq.
+    Main denoising U-Net with parallel control encoder.
     
     Architecture:
-        - Converts upper triangular vector to 2D matrix
-        - U-Net encoder-decoder with skip connections
-        - FiLM conditioning at each layer from time + ChIP
-        - Converts back to upper triangular vector
+        - Control encoder processes bulk Hi-C → multi-resolution features
+        - Main U-Net processes noisy input
+        - Conditioning features ADDED at each level
+        - Time FiLM at every ResBlock
     """
-    def __init__(self, vec_dim=VEC_DIM, n=N, hidden_dim=512, num_blocks=L, time_emb_dim=d_t, max_timesteps=T):
+    def __init__(self, vec_dim, n, time_embed_module, base_ch: int = 64):
         super().__init__()
         self.vec_dim = vec_dim
         self.n = n
-        self.matrix_size = n  # 50x50 matrix
-        self.hidden_dim = hidden_dim
+        self.time_embed = time_embed_module  # TimeEmbedding module
         
-        # Time embedding
-        self.time_embed = TimeEmbedding(time_emb_dim, max_timesteps=max_timesteps)
+        time_dim = self.time_embed.mlp[-1].out_features
         
-        # ChIP embedding: 1D signal -> embedding vector
-        self.chip_embed = nn.Sequential(
-            nn.Linear(n, 256),
-            nn.SiLU(),
-            nn.Linear(256, 512)
-        )
+        # ---- Control Encoder (processes bulk Hi-C) ----
+        self.control_encoder = ControlEncoder(base_ch=base_ch, time_dim=time_dim)
         
-        # Bulk Hi-C + ChIP outer product encoder
-        # Input: bulk matrix + ChIP outer product (2 channels)
-        self.bulk_encoder = nn.Sequential(
-            nn.Conv2d(2, 32, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d(1)  # Global average pooling -> (batch, 64, 1, 1)
-        )
-        self.bulk_proj = nn.Linear(64, 512)
-        
-        # Combined conditioning dimension: time + chip + bulk
-        cond_dim = time_emb_dim + 512 + 512
-        
-        # Initial conv: 3 channels (noisy input + bulk + chip outer) -> 64 channels
+        # ---- Main U-Net (processes noisy input) ----
+        # Input: (B, 1, 64, 64) noisy Hi-C map
         self.input_conv = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU()
+            nn.Conv2d(1, base_ch, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, base_ch), base_ch),
+            nn.SiLU(),
         )
         
-        # Encoder (downsampling)
-        self.enc1 = ConvResBlock(64, cond_dim)
-        self.down1 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
+        # Encoder Level 1: 64x64 @ base_ch
+        self.enc1 = ConvResBlock(base_ch, time_dim)
+        self.down1 = nn.Conv2d(base_ch, base_ch * 2, kernel_size=3, stride=2, padding=1)
         
-        self.enc2 = ConvResBlock(128, cond_dim)
-        self.down2 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
+        # Encoder Level 2: 32x32 @ base_ch*2
+        self.enc2 = ConvResBlock(base_ch * 2, time_dim)
+        self.down2 = nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=3, stride=2, padding=1)
         
-        # Bottleneck
-        self.bottleneck = nn.Sequential(
-            ConvResBlock(256, cond_dim),
-            ConvResBlock(256, cond_dim)
-        )
+        # Bottleneck: 16x16 @ base_ch*4
+        self.bottleneck = nn.ModuleList([
+            ConvResBlock(base_ch * 4, time_dim),
+            ConvResBlock(base_ch * 4, time_dim),
+        ])
         
-        # Decoder (upsampling) - use interpolation + conv instead of transposed conv
-        self.up1_conv = nn.Conv2d(256, 128, kernel_size=3, padding=1)
-        self.dec1 = ConvResBlock(128 + 128, cond_dim)  # +128 from skip connection
+        # Decoder Level 2: 16x16 -> 32x32 @ base_ch*2
+        self.up2_conv = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=3, padding=1)
+        self.dec2_reduce = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)  # Reduce after concat
+        self.dec2 = ConvResBlock(base_ch * 2, time_dim)
         
-        self.up2_conv = nn.Conv2d(128 + 128, 64, kernel_size=3, padding=1)
-        self.dec2 = ConvResBlock(64 + 64, cond_dim)  # +64 from skip connection
+        # Decoder Level 1: 32x32 -> 64x64 @ base_ch
+        self.up1_conv = nn.Conv2d(base_ch * 2, base_ch, kernel_size=3, padding=1)
+        self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)  # Reduce after concat
+        self.dec1 = ConvResBlock(base_ch, time_dim)
         
-        # Output conv: channels -> 1
-        self.output_conv = nn.Conv2d(64 + 64, 1, kernel_size=3, padding=1)
-        
-        # Initialize output to near zero
+        # Output: (B, 1, 64, 64) predicted noise
+        self.output_conv = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
         nn.init.zeros_(self.output_conv.weight)
         nn.init.zeros_(self.output_conv.bias)
     
-    def forward(self, x_t_vec, t, chip_1d, bulk_vec):
+    def forward(self, x_t_vec, t_idx, chip_1d, bulk_vec):
         """
-        Process noisy Hi-C vector through convolutional U-Net.
+        Args:
+            x_t_vec:  (B, vec_dim) noisy Hi-C vector
+            t_idx:    (B,) integer timestep in [0..T-1]
+            chip_1d:  (B, N) ChIP-seq signal (IGNORED for now)
+            bulk_vec: (B, vec_dim) bulk Hi-C vector (conditioning)
         
-        x_t_vec: (batch, vec_dim) noisy phase vector in [-1, 1]
-        t: (batch,) normalized timestep in [0, 1]
-        chip_1d: (batch, n) 1D chip track in [-1, 1]
-        bulk_vec: (batch, vec_dim) bulk Hi-C (sum of phases) in [-1, 1]
-        
-        returns: eps_hat_vec (batch, vec_dim) - predicted noise
+        Returns:
+            eps_vec: (B, vec_dim) predicted noise vector
         """
-        batch_size = x_t_vec.shape[0]
+        B = x_t_vec.shape[0]
+        N = self.n
         
-        # Time embedding
-        t_emb = self.time_embed(t)  # (batch, time_emb_dim)
+        # --- Build time embedding ---
+        t_emb = self.time_embed(t_idx)  # (B, time_dim)
         
-        # ChIP embedding (1D signal)
-        chip_emb = self.chip_embed(chip_1d)  # (batch, 512)
+        # --- Convert vectors to maps ---
+        x_t_map = upper_tri_vec_to_matrix(x_t_vec, N).unsqueeze(1)     # (B, 1, 64, 64)
+        bulk_map = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)   # (B, 1, 64, 64)
         
-        # Create ChIP outer product: chip ⊗ chip^T
-        chip_outer = torch.bmm(chip_1d.unsqueeze(2), chip_1d.unsqueeze(1))  # (batch, n, n)
-        chip_outer = chip_outer.unsqueeze(1)  # (batch, 1, n, n)
+        # ========== CONTROL ENCODER: Process bulk Hi-C ==========
+        cond_feats = self.control_encoder(bulk_map, t_emb)
+        # cond_feats = {
+        #     'feat_64': (B, base_ch, 64, 64),
+        #     'feat_32': (B, base_ch*2, 32, 32),
+        #     'feat_16': (B, base_ch*4, 16, 16)
+        # }
         
-        # Convert bulk to matrix
-        bulk_matrix = upper_tri_vec_to_matrix(bulk_vec, self.matrix_size)  # (batch, n, n)
-        bulk_matrix = bulk_matrix.unsqueeze(1)  # (batch, 1, n, n)
+        # ========== MAIN U-NET: Process noisy input ==========
+        # Input stem
+        h = self.input_conv(x_t_map)  # (B, base_ch, 64, 64)
         
-        # Encode bulk + chip outer product
-        bulk_chip_input = torch.cat([bulk_matrix, chip_outer], dim=1)  # (batch, 2, n, n)
-        bulk_features = self.bulk_encoder(bulk_chip_input)  # (batch, 64, 1, 1)
-        bulk_features = bulk_features.squeeze(-1).squeeze(-1)  # (batch, 64)
-        bulk_emb = self.bulk_proj(bulk_features)  # (batch, 512)
+        # ENCODER LEVEL 1: 64x64
+        h = h + cond_feats['feat_64']  # ← ADD control features
+        enc1 = self.enc1(h, t_emb)     # (B, base_ch, 64, 64)
+        h = self.down1(enc1)           # (B, base_ch*2, 32, 32)
         
-        # Combine all conditioning: time + chip + bulk
-        cond = torch.cat([t_emb, chip_emb, bulk_emb], dim=1)  # (batch, cond_dim)
+        # ENCODER LEVEL 2: 32x32
+        h = h + cond_feats['feat_32']  # ← ADD control features
+        enc2 = self.enc2(h, t_emb)     # (B, base_ch*2, 32, 32)
+        h = self.down2(enc2)           # (B, base_ch*4, 16, 16)
         
-        # Convert noisy input to matrix
-        x_t_matrix = upper_tri_vec_to_matrix(x_t_vec, self.matrix_size)  # (batch, n, n)
-        x_t_matrix = x_t_matrix.unsqueeze(1)  # (batch, 1, n, n)
+        # BOTTLENECK: 16x16
+        h = h + cond_feats['feat_16']  # ← ADD control features
+        for blk in self.bottleneck:
+            h = blk(h, t_emb)          # (B, base_ch*4, 16, 16)
         
-        # Concatenate input with bulk and chip outer as additional channels
-        x_input = torch.cat([x_t_matrix, bulk_matrix, chip_outer], dim=1)  # (batch, 3, n, n)
+        # DECODER LEVEL 2: 16x16 -> 32x32
+        h = F.interpolate(h, size=enc2.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.up2_conv(h)                    # (B, base_ch*2, 32, 32)
+        h = h + cond_feats['feat_32']          # ← ADD control features again
+        h = torch.cat([h, enc2], dim=1)        # (B, base_ch*4, 32, 32)
+        h = self.dec2_reduce(h)                # (B, base_ch*2, 32, 32) - reduce channels
+        h = self.dec2(h, t_emb)                # (B, base_ch*2, 32, 32)
         
-        # Initial conv
-        x = self.input_conv(x_input)  # (batch, 64, n, n)
-        
-        # Encoder
-        enc1 = self.enc1(x, cond)  # (batch, 64, n, n)
-        x = self.down1(enc1)  # (batch, 128, n/2, n/2)
-        
-        enc2 = self.enc2(x, cond)  # (batch, 128, n/2, n/2)
-        x = self.down2(enc2)  # (batch, 256, n/4, n/4)
-        
-        # Bottleneck
-        for block in self.bottleneck:
-            x = block(x, cond)
-        
-        # Decoder with interpolation upsampling (matches encoder sizes exactly)
-        x = F.interpolate(x, size=enc2.shape[2:], mode='bilinear', align_corners=False)
-        x = self.up1_conv(x)  # (batch, 128, n/2, n/2)
-        x = torch.cat([x, enc2], dim=1)  # Skip connection
-        x = self.dec1(x, cond)
-        
-        x = F.interpolate(x, size=enc1.shape[2:], mode='bilinear', align_corners=False)
-        x = self.up2_conv(x)  # (batch, 64, n, n)
-        x = torch.cat([x, enc1], dim=1)  # Skip connection
-        x = self.dec2(x, cond)
+        # DECODER LEVEL 1: 32x32 -> 64x64
+        h = F.interpolate(h, size=enc1.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.up1_conv(h)                    # (B, base_ch, 64, 64)
+        h = h + cond_feats['feat_64']          # ← ADD control features again
+        h = torch.cat([h, enc1], dim=1)        # (B, base_ch*2, 64, 64)
+        h = self.dec1_reduce(h)                # (B, base_ch, 64, 64) - reduce channels
+        h = self.dec1(h, t_emb)                # (B, base_ch, 64, 64)
         
         # Output
-        eps_matrix = self.output_conv(x)  # (batch, 1, n, n)
-        eps_matrix = eps_matrix.squeeze(1)  # (batch, n, n)
+        eps_map = self.output_conv(h).squeeze(1)  # (B, 64, 64)
+        eps_vec = matrix_to_upper_tri_vec(eps_map)  # (B, vec_dim)
         
-        # Convert back to upper triangular vector
-        eps_hat_vec = matrix_to_upper_tri_vec(eps_matrix)  # (batch, vec_dim)
-        
-        return eps_hat_vec
+        return eps_vec
 
 
 ############################################
@@ -418,89 +472,86 @@ def q_sample(x0, t, noise):
 ############################################
 # 6) TRAINING LOOP
 ############################################
-def train_step(models, optimizers, batch, device):
+def train_step(model, optimizer, batch, device, phase_name):
     """
-    Single training step for all three phase denoisers.
+    Single training step for ONE phase denoiser.
     
-    batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'chip_seq'
-          Each value is already batched by PyTorch DataLoader: (batch_size, dim)
+    Args:
+        model: EpsilonNet for the current phase
+        optimizer: optimizer for this model
+        batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'chip_seq'
+        device: torch device
+        phase_name: 'earlyG1', 'midG1', or 'lateG1'
+    
+    Returns:
+        float: loss for this phase
     """
-    # Extract clean x0 for each phase (already batched)
+    # Extract clean x0 for each phase (needed for bulk conditioning)
     x0_early = batch['earlyG1'].float().to(device)  # (batch_size, vec_dim)
     x0_mid = batch['midG1'].float().to(device)
     x0_late = batch['lateG1'].float().to(device)
     
-    # Compute bulk Hi-C (sum of three phases)
-    x0_bulk = (x0_early + x0_mid + x0_late) / 3  # (batch_size, vec_dim)
-    batch_size = x0_bulk.shape[0]
-    x0_bulk_normalized = x0_bulk # let's normalize later if needed
+    # Select the current phase's ground truth
+    phase_data = {
+        'earlyG1': x0_early,
+        'midG1': x0_mid,
+        'lateG1': x0_late
+    }
+    x0_current = phase_data[phase_name]  # (batch_size, vec_dim)
+    
+    # Compute bulk Hi-C (average of three phases) for conditioning
+    x0_bulk_normalized = (x0_early + x0_mid + x0_late) / 3  # (batch_size, vec_dim)
+    batch_size = x0_bulk_normalized.shape[0]
     
     # Get ChIP-seq conditioning (already batched)
     chip_1d = batch['chip_seq'].float().to(device)  # (batch_size, N)
     
     # Sample random timestep for each sample in batch
     t = torch.randint(0, T, (batch_size,), device=device).long()  # (batch_size,)
-    t_normalized = t.float() / (T - 1)  # normalize to [0, 1] for model input
     
-    # Sample random noise (epsilon) for each phase
-    eps_early = torch.randn_like(x0_early)  # (batch_size, vec_dim)
-    eps_mid = torch.randn_like(x0_mid)
-    eps_late = torch.randn_like(x0_late)
+    # Sample random noise (epsilon)
+    eps_true = torch.randn_like(x0_current)  # (batch_size, vec_dim)
     
     # Forward diffusion: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon
-    x_t_early = q_sample(x0_early, t, eps_early)
-    x_t_mid = q_sample(x0_mid, t, eps_mid)
-    x_t_late = q_sample(x0_late, t, eps_late)
+    x_t = q_sample(x0_current, t, eps_true)
     
     # Predict the noise that was added (with bulk conditioning)
-    eps_hat_early = models['earlyG1'](x_t_early, t_normalized, chip_1d, x0_bulk_normalized)
-    eps_hat_mid = models['midG1'](x_t_mid, t_normalized, chip_1d, x0_bulk_normalized)
-    eps_hat_late = models['lateG1'](x_t_late, t_normalized, chip_1d, x0_bulk_normalized)
+    eps_hat = model(x_t, t, chip_1d, x0_bulk_normalized)
     
     # DDPM loss: MSE between predicted noise and true noise
-    loss_early = F.mse_loss(eps_hat_early, eps_early)
-    loss_mid = F.mse_loss(eps_hat_mid, eps_mid)
-    loss_late = F.mse_loss(eps_hat_late, eps_late)
-    
-    # Total loss: sum of all three phase losses
-    loss = loss_early + loss_mid + loss_late
+    loss = F.mse_loss(eps_hat, eps_true)
     
     # Backward pass
-    for opt in optimizers.values():
-        opt.zero_grad()
+    optimizer.zero_grad()
     loss.backward()
-    for opt in optimizers.values():
-        opt.step()
+    optimizer.step()
     
-    return {
-        'loss': loss.item(),
-        'loss_early': loss_early.item(),
-        'loss_mid': loss_mid.item(),
-        'loss_late': loss_late.item(),
-    }
+    return loss.item()
 
 
-def test_training(models, batch, device, step):
+def test_training(model, batch, device, step, phase_name):
     """
-    Test the models by sampling and visualizing predictions.
+    Test the model by reconstruction and visualizing predictions.
     Called every ~100 training steps to monitor progress.
     
     Args:
-        models: dict with keys 'earlyG1', 'midG1', 'lateG1'
+        model: EpsilonNet for the current phase
         batch: training batch
         device: torch device
         step: current training step number
+        phase_name: 'earlyG1', 'midG1', or 'lateG1'
     
     Returns:
         Path to saved visualization
     """
-    from visualize_diffusion_training import visualize_training_step
+    from visualize_diffusion_training import visualize_training_step_single_phase
     
     print(f"\n{'='*60}")
-    print(f"Testing at step {step}...")
+    print(f"Testing {phase_name} at step {step}...")
     
-    save_path = visualize_training_step(
-        models=models,
+    save_path = visualize_training_step_single_phase(
+        model=model,
+        phase_name=phase_name,
         batch=batch,
         device=device,
         step=step,
@@ -508,7 +559,6 @@ def test_training(models, batch, device, step):
         output_dir="./training_visualizations"
     )
     
-    print(f"Visualization saved to: {save_path}")
     print(f"{'='*60}\n")
     
     return save_path
@@ -518,25 +568,31 @@ def test_training(models, batch, device, step):
 # 7) MAIN TRAINING
 ############################################
 def main():
+    print("="*80)
+    print(f"TRAINING PHASE: {CURRENT_PHASE}")
+    print("="*80)
     print(f"Device: {DEVICE}")
     print(f"Vector dimension: {VEC_DIM}, Matrix size: {N}x{N}")
+    print(f"Batch size: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}")
     
-    # Initialize models (one per phase)
-    models = {
-        'earlyG1': EpsilonNet(hidden_dim=HIDDEN_DIM, num_blocks=L).to(DEVICE),
-        'midG1': EpsilonNet(hidden_dim=HIDDEN_DIM, num_blocks=L).to(DEVICE),
-        'lateG1': EpsilonNet(hidden_dim=HIDDEN_DIM, num_blocks=L).to(DEVICE),
-    }
+    # Create time embedding module
+    time_embed_module = TimeEmbedding(d_t, max_timesteps=T)
+    
+    # Initialize ONE model for the current phase with ControlNet architecture
+    model = EpsilonNet(
+        vec_dim=VEC_DIM,
+        n=N,
+        time_embed_module=time_embed_module,
+        base_ch=64            # Base channels for U-Net and Control Encoder
+    ).to(DEVICE)
     
     # Count parameters
-    num_params = sum(p.numel() for p in models['earlyG1'].parameters())
-    print(f"Parameters per model: {num_params:,}")
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {num_params:,}")
+    print(f"Estimated memory: ~{num_params * 4 / 1e9:.2f} GB (fp32)")
     
-    # Optimizers
-    optimizers = {
-        phase: torch.optim.Adam(models[phase].parameters(), lr=LR)
-        for phase in PHASES
-    }
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     
     # Load data
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
@@ -545,7 +601,7 @@ def main():
     cell_cycle_loader = CellCycleDataLoader(
         data_dir=data_dir,
         resolution=10000,
-        region_size=500000,
+        region_size=640000,
         normalization="VC"
     )
     
@@ -562,44 +618,66 @@ def main():
         pin_memory=True if torch.cuda.is_available() else False
     )
     
-    print(f"Batch size: {BATCH_SIZE}")
     print(f"Number of batches per epoch: {len(dataloader)}")
+    print("="*80)
     
     # Training loop
     global_step = 0
+    best_loss = float('inf')
+    
     for epoch in range(NUM_EPOCHS):
         epoch_losses = []
+        model.train()
         
         # Iterate through batches
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [{CURRENT_PHASE}]")
         for batch_idx, batch in enumerate(pbar):
-            losses = train_step(models, optimizers, batch, DEVICE)
-            epoch_losses.append(losses)
+            loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE)
+            epoch_losses.append(loss)
             global_step += 1
             
             # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{losses['loss']:.4f}",
-                'early': f"{losses['loss_early']:.4f}",
-                'mid': f"{losses['loss_mid']:.4f}",
-                'late': f"{losses['loss_late']:.4f}",
-            })
+            pbar.set_postfix({'loss': f"{loss:.4f}"})
             
             # Visualize every 100 steps
-            if global_step % 10 == 0:
-                test_training(models, batch, DEVICE, global_step)
+            if global_step % 100 == 0:
+                test_training(model, batch, DEVICE, global_step, CURRENT_PHASE)
         
         # Epoch summary
-        avg_loss = np.mean([l['loss'] for l in epoch_losses])
-        avg_early = np.mean([l['loss_early'] for l in epoch_losses])
-        avg_mid = np.mean([l['loss_mid'] for l in epoch_losses])
-        avg_late = np.mean([l['loss_late'] for l in epoch_losses])
+        avg_loss = np.mean(epoch_losses)
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} - Average Loss: {avg_loss:.6f}")
         
-        print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Early: {avg_early:.4f}, Mid: {avg_mid:.4f}, Late: {avg_late:.4f}")
+        # Save checkpoint if best
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_best.pth"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'global_step': global_step,
+            }, checkpoint_path)
+            print(f"✓ Saved best checkpoint: {checkpoint_path}")
+        
+        # Save epoch checkpoint
+        checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_epoch{epoch+1}.pth"
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_loss,
+            'global_step': global_step,
+        }, checkpoint_path)
+    
+    print("\n" + "="*80)
+    print(f"Training complete for {CURRENT_PHASE}!")
+    print(f"Best loss: {best_loss:.6f}")
+    print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
+    print("="*80)
     
     # Cleanup
     cell_cycle_loader.close()
-    print("Training complete!")
 
 
 if __name__ == "__main__":
