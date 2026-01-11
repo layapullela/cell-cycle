@@ -1,7 +1,7 @@
 """
 Simple DataLoader for cell cycle Hi-C contact maps.
 
-Extracts 50x50 pixel (500kb) regions along the diagonal with sliding window.
+Extracts 64x64 pixel (640kb) regions along the diagonal with sliding window.
 Only stores upper triangular portion of symmetric Hi-C matrices.
 Includes ChIP-seq signal for each region.
 """
@@ -18,21 +18,21 @@ class CellCycleDataLoader:
     Simple DataLoader for cell cycle Hi-C contact maps.
     
     Each sample contains:
-    - region: str, e.g., "1:10000000-10500000"
-    - earlyG1: numpy array (flattened upper triangular vector, shape: (1275,)) 
-    - lateG1: numpy array (flattened upper triangular vector, shape: (1275,))
-    - midG1: numpy array (flattened upper triangular vector, shape: (1275,))
-    - chip_seq: numpy array (shape: (50,)) - ChIP-seq signal for the region
-    * dim calc: 50 x 51 x 0.5 = 1275
+    - region: str, e.g., "1:10000000-10640000"
+    - earlyG1: numpy array (flattened upper triangular vector, shape: (2080,))
+    - lateG1: numpy array (flattened upper triangular vector, shape: (2080,))
+    - midG1: numpy array (flattened upper triangular vector, shape: (2080,))
+    - chip_seq: numpy array (shape: (64,)) - ChIP-seq signal for the region
+    * dimention calculation: 64 x 65 x 0.5 = 2080
     
-    For a 50x50 matrix, upper triangular has 50*51/2 = 1275 elements.
+    For a 64x64 matrix, upper triangular has 64*65/2 = 2080 elements.
     """
     
     def __init__(
         self,
         data_dir: Union[str, Path],
         resolution: int = 10000,  # 10kb bins
-        region_size: int = 500000,  # 500kb regions (50 pixels at 10kb resolution)
+        region_size: int = 640000,  # 640kb regions (64 pixels at 10kb resolution)
         normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage.
         chipseq_file: Optional[str] = None,  # Path to ChIP-seq bigWig file
     ):
@@ -42,7 +42,7 @@ class CellCycleDataLoader:
         Args:
             data_dir: Directory containing .hic files (earlyG1.hic, lateG1.hic, midG1.hic)
             resolution: Bin size in base pairs (default: 10000 for 10kb)
-            region_size: Size of square region to extract in base pairs (default: 500000 for 500kb = 50 pixels)
+            region_size: Size of square region to extract in base pairs (default: 640000 for 640kb = 64 pixels)
             normalization: Normalization method for Hi-C data (NONE, VC, VC_SQRT, KR)
             chipseq_file: Optional path to ChIP-seq bigWig file (if None, looks for default file)
         """
@@ -58,9 +58,11 @@ class CellCycleDataLoader:
         
         # Load ChIP-seq file
         self.chipseq_bw = None
-        chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
-        self.chipseq_bw = pyBigWig.open(str(chipseq_file))
-        print(f"Loaded ChIP-seq from: {chipseq_file}")
+        self.chipseq_chrom_stats = {}  # Per-chromosome mean and std
+        if chipseq_file is None:
+            chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
+        if chipseq_file.exists() if isinstance(chipseq_file, Path) else Path(chipseq_file).exists():
+                self.chipseq_bw = pyBigWig.open(str(chipseq_file))
         
         # Phase files
         self.phase_files = {
@@ -93,14 +95,19 @@ class CellCycleDataLoader:
         # Skip first 3MB of each chromosome (typically no mappable data)
         self.min_start_position = 3000000  # 3MB
         self.regions = self._generate_regions()
+        
+        # Compute ChIP-seq statistics PER CHROMOSOME (after regions are generated)
+        if self.chipseq_bw is not None:
+            print(f"Loaded ChIP-seq from: {chipseq_file}")
+            self._compute_chipseq_per_chromosome_stats()
     
     def _generate_regions(self) -> List[str]:
         """
-        Generate all 50x50 regions by sliding every 10 pixels along the diagonal.
+        Generate all 64x64 regions by sliding every 10 pixels along the diagonal.
         Skips the beginning of chromosomes (typically no mappable Hi-C data at start of chromosome).
         
         Returns:
-            List of region strings like "1:10000000-10500000" (0-based coordinates, no chr prefix)
+            List of region strings like "1:10000000-10640000" (0-based coordinates, no chr prefix)
         """
         regions = []
         
@@ -114,16 +121,76 @@ class CellCycleDataLoader:
         
         return regions
     
+    def _compute_chipseq_per_chromosome_stats(self):
+        """
+        Compute per-chromosome mean and std for ChIP-seq signal.
+        Normalization: log1p → z-score (per chromosome) → clip ±3σ → scale to [-1, 1]
+        
+        Samples regions for efficiency (~100 regions per chromosome).
+        """
+        if self.chipseq_bw is None:
+            return
+        
+        print("Computing per-chromosome ChIP-seq statistics (z-score)...")
+        
+        # Group regions by chromosome
+        chrom_regions = {}
+        for region in self.regions:
+            chrom = region.split(':')[0]
+            if chrom not in chrom_regions:
+                chrom_regions[chrom] = []
+            chrom_regions[chrom].append(region)
+        
+        # Compute mean/std for each chromosome
+        for chrom, regions in chrom_regions.items():
+            # Sample ~100 regions per chromosome for efficiency
+            sample_step = max(1, len(regions) // 100)
+            sampled = regions[::sample_step]
+            
+            chrom_signals = []
+            for region in sampled:
+                _, coords = region.split(':')
+                start, end = map(int, coords.split('-'))
+                
+                # Try with and without 'chr' prefix
+                chrom_names = [chrom, f"chr{chrom}"]
+                
+                for chrom_name in chrom_names:
+                    try:
+                        signal = np.zeros(self.image_size, dtype=np.float32)
+                        
+                        for i in range(self.image_size):
+                            bin_start = start + i * self.resolution
+                            bin_end = start + (i + 1) * self.resolution
+                            values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="mean")
+                            signal[i] = values[0] if values[0] is not None else 0.0
+                        
+                        # Log transformation
+                        signal = np.log1p(signal)
+                        chrom_signals.extend(signal.tolist())
+                        break
+                    except:
+                        continue
+            
+            # Compute and store per-chromosome statistics
+            if chrom_signals:
+                self.chipseq_chrom_stats[chrom] = {
+                    'mean': float(np.mean(chrom_signals)),
+                    'std': float(np.std(chrom_signals))
+                }
+                print(f"  Chr {chrom}: mean={self.chipseq_chrom_stats[chrom]['mean']:.4f}, "
+                      f"std={self.chipseq_chrom_stats[chrom]['std']:.4f}")
+            else:
+                # Fallback
+                self.chipseq_chrom_stats[chrom] = {'mean': 0.0, 'std': 1.0}
+                print(f"  Chr {chrom}: Using default stats (no data)")
+        
+        print(f"Computed statistics for {len(self.chipseq_chrom_stats)} chromosomes")
+    
     def _extract_upper_triangular_vector(self, matrix: np.ndarray) -> np.ndarray:
         """
         Extract upper triangular portion of symmetric matrix as a flattened vector.
         Elements are stacked row by row (e.g., row 0, then row 1, etc.).
-        
-        Example:
-            [[1, 1, 0],
-             [0, 2, 1],
-             [0, 0, 0]]
-            -> [1, 1, 0, 2, 1, 0]
         
         Args:
             matrix: 2D numpy array (square, symmetric)
@@ -186,7 +253,8 @@ class CellCycleDataLoader:
             if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
                 matrix[x_idx, y_idx] = float(count)
                 # Matrix is symmetric, so also set the transpose
-                matrix[y_idx, x_idx] = float(count)
+                if x_idx != y_idx:
+                    matrix[y_idx, x_idx] = float(count)
         
         # Return upper triangular portion as flattened vector
         return self._extract_upper_triangular_vector(matrix)
@@ -194,12 +262,13 @@ class CellCycleDataLoader:
     def _extract_chipseq_signal(self, region: str) -> np.ndarray:
         """
         Extract ChIP-seq signal for a genomic region.
+        Returns log-transformed signal (normalization happens in __getitem__ using per-chromosome stats).
         
         Args:
             region: Region string like "1:10000000-10500000"
         
         Returns:
-            1D numpy array of shape (image_size,) with ChIP-seq signal per bin
+            1D numpy array of shape (image_size,) with log-transformed ChIP-seq signal
         """
         if self.chipseq_bw is None:
             # Return zeros if ChIP-seq not available
@@ -226,10 +295,8 @@ class CellCycleDataLoader:
                         values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="mean")
                         signal[i] = values[0] if values[0] is not None else 0.0
                     
-                    # Normalize signal: log(1+x) + z-score
+                    # Apply log transformation (z-score normalization in __getitem__)
                     signal = np.log1p(signal)
-                    if signal.std() > 0:
-                        signal = (signal - signal.mean()) / signal.std()
                     
                     return signal
                 except:
@@ -251,14 +318,21 @@ class CellCycleDataLoader:
         Get a sample by index or region string.
         
         Args:
-            idx: Integer index or region string like "1:10000000-10500000"
+            idx: Integer index or region string like "1:10000000-10640000"
         
         Returns:
             Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'chip_seq'
-            Each phase contains flattened upper triangular vector (shape: (1275,))
-            normalized independently: (x - phase_min) / (phase_max - phase_min) * 2 - 1
-            Each phase hic matrix is guaranteed to be in [-1, 1]
-            chip_seq contains ChIP-seq signal (shape: (50,)) normalized to [-1, 1]
+            
+            Hi-C phases (shape: (2080,) each):
+                - Log-transformed: log1p(x)
+                - Normalized INDEPENDENTLY per phase to [-1, 1]:
+                  (log1p(x) - phase_min) / (phase_max - phase_min) * 2 - 1
+            
+            ChIP-seq (shape: (64,)):
+                - Log-transformed: log1p(x)
+                - Per-chromosome z-score: (x - chrom_mean) / chrom_std
+                - Clipped to ±3 sigma
+                - Rescaled to [-1, 1]: x / 3.0
         """
         # Handle region string indexing
         if isinstance(idx, str):
@@ -275,6 +349,10 @@ class CellCycleDataLoader:
         for phase, filepath in self.phase_paths.items():
             vector = self._extract_region_matrix(filepath, region)
             
+            # Apply log transformation (standard for Hi-C data)
+            # log1p = log(1 + x) handles zeros gracefully
+            vector = np.log1p(vector)
+            
             # Find min/max for THIS phase
             phase_min = vector.min()
             phase_max = vector.max()
@@ -290,10 +368,27 @@ class CellCycleDataLoader:
             sample[phase] = normalized.astype(np.float32)
         
         # Load ChIP-seq signal and normalize to [-1, 1]
-        chip_seq = self._extract_chipseq_signal(region)
-        # ChIP-seq is already log-transformed and z-scored, clip to [-1, 1]
-        chip_seq = np.clip(chip_seq, -3, 3)  # Clip to ±3 std devs
-        chip_seq = chip_seq / 3.0  # Map to [-1, 1]
+        chip_seq = self._extract_chipseq_signal(region)  # Log-transformed
+        
+        # Get chromosome for per-chromosome z-score normalization
+        chrom = region.split(':')[0]
+        
+        # Per-chromosome z-score normalization with clipping
+        if chrom in self.chipseq_chrom_stats and self.chipseq_chrom_stats[chrom]['std'] > 0:
+            # Step 1: z-score using per-chromosome mean/std
+            mean = self.chipseq_chrom_stats[chrom]['mean']
+            std = self.chipseq_chrom_stats[chrom]['std']
+            chip_seq = (chip_seq - mean) / std
+            
+            # Step 2: Clip to ±3 sigma
+            chip_seq = np.clip(chip_seq, -3.0, 3.0)
+            
+            # Step 3: Rescale to [-1, 1]
+            chip_seq = chip_seq / 3.0  # Maps [-3, 3] → [-1, 1]
+        else:
+            # Fallback: map to zeros
+            chip_seq = np.zeros_like(chip_seq, dtype=np.float32)
+        
         sample['chip_seq'] = chip_seq.astype(np.float32)
         
         return sample
@@ -319,32 +414,3 @@ class CellCycleDataLoader:
     def __del__(self):
         """Cleanup when object is deleted."""
         self.close()
-    
-
-def upper_tri_vec_to_matrix(vec: np.ndarray, n: int) -> np.ndarray:
-    """
-    Convert flattened upper triangular vector back to square matrix.
-    
-    Args:
-        vec: 1D numpy array containing upper triangular elements (length: n*(n+1)/2)
-        n: Size of the square matrix (e.g., 50 for 50x50)
-    
-    Returns:
-        2D numpy array of shape (n, n) with upper triangular filled and lower triangular zeros
-    
-    Example:
-        vec = [1, 1, 0, 2, 1, 0], n = 3
-        -> [[1, 1, 0],
-            [0, 2, 1],
-            [0, 0, 0]]
-    """
-    matrix = np.zeros((n, n), dtype=vec.dtype)
-    
-    idx = 0
-    for i in range(n):
-        # For row i, fill columns from i to n-1
-        num_elements = n - i
-        matrix[i, i:] = vec[idx:idx + num_elements]
-        idx += num_elements
-    
-    return matrix

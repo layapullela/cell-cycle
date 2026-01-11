@@ -1,0 +1,13 @@
+raw_data/
+requirements.txt
+__pycache__/
+
+*.out
+*.err
+*.log
+*.sh
+
+train/logs/
+train/images/
+preprocess/CHIPSEQ_NORMALIZATION.md
+

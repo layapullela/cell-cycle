@@ -1,29 +1,50 @@
 """
-Cell-Cycle Hi-C Phase Decomposition via Conditional DDPM
+Cell-Cycle Hi-C Phase Decomposition via SR3-Style Iterative Refinement
 
 Train 3 separate conditional denoisers (one per phase: earlyG1/midG1/lateG1)
-Each denoiser predicts injected Gaussian noise ε from a noisy phase map x_t
+Each denoiser iteratively refines noisy bulk Hi-C toward phase-specific data
+
+SR3 NOTATION (from "Image Super-Resolution via Iterative Refinement"):
+    γ_t: Noise level at timestep t (linearly spaced: 1e-4 → 0.02)
+    α_t: Step size = γ_{t-1} / γ_t (relates consecutive noise levels)
+    ᾱ_t: Cumulative product = ∏_{s=1}^t α_s
+
+FORWARD PROCESS:
+    y_t = √(1-γ_t) · y_0 + √γ_t · ϵ,  where ϵ ~ N(0, I)
+    As t increases, γ_t increases (more noise)
+
+TRAINING (Algorithm 1):
+    - Sample noise level γ ~ Uniform(γ_min, γ_max)
+    - Sample noise ϵ ~ N(0, I)
+    - Create noisy: y_γ = √γ · y_0 + √(1-γ) · ϵ
+    - Train: loss = MSE(model(y_γ, γ), ϵ)  ← Model predicts NOISE!
+    - Model learns to predict the noise that was added
+
+SAMPLING (Algorithm 2):
+    - Start with pure noise y_T ~ N(0, I)
+    - For t = T-1, T-2, ..., 0:
+        ε_pred = model(y_t, t, conditioning)  ← Predict noise
+        y_{t-1} = 1/√α_t * (y_t - (1-α_t)/√(1-γ_t) * ε_pred)  ← Remove noise
+    - Result: y_0 (phase-specific Hi-C)
 
 MEMORY OPTIMIZATION: Train one phase at a time to reduce GPU memory usage
 
-Architecture: ControlNet-Inspired U-Net with Parallel Conditioning Encoder
+Architecture: SR3-Style U-Net with BigGAN Residual Blocks
     - Converts upper triangular Hi-C vector to 2D symmetric matrix
-    - Parallel control encoder processes bulk Hi-C at multiple resolutions
-    - Main U-Net processes noisy input
-    - Conditioning features ADDED at each resolution level
-    - Time FiLM conditioning (scale & shift) globally injected at every ResBlock
+    - Input: Concatenate noisy image + bulk Hi-C conditioning → (B, 2, 64, 64)
+    - Four downsampling stages: 64 → 32 → 16 → 8 (bottleneck)
+    - BigGAN residual blocks at each resolution with time conditioning
+    - Standard U-Net skip connections via concatenation
+    - Output: Predicted noise ε (what was added to create noisy image)
 
-Conditioning signals:
-    (1) Diffusion time t         -> Sinusoidal embeddings + FiLM at every layer
-    (2) Bulk Hi-C               -> Parallel encoder → multi-resolution features
-                                    → Added to main U-Net at each level
-
-Loss: MSE between predicted noise and true noise (standard DDPM)
-    loss = MSE(ε_pred, ε_true)  [per phase]
+Conditioning:
+    (1) Noise level γ / time t  -> Sinusoidal embeddings + adaptive group norm
+    (2) Bulk Hi-C              -> Concatenated with noisy input at start
 """
 
 import os
 import sys
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,7 +140,7 @@ d_t = 256             # time embedding dimension
 
 BATCH_SIZE = 32       # Increased from 8 since we have more memory with single model
 LR = 1e-4
-NUM_EPOCHS = 2        # More epochs since we're training one at a time
+NUM_EPOCHS = 5        # More epochs since we're training one at a time
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Model checkpoints directory
@@ -130,18 +151,47 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 
 ############################################
-# 1) DIFFUSION SCHEDULE (DDPM)
+# 1) SR3 NOISE SCHEDULE
 ############################################
-def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02): # same as ddpm paper
-    """Linear schedule from Ho et al. (DDPM paper)"""
-    betas = torch.linspace(beta_start, beta_end, timesteps)
-    alphas = 1.0 - betas
+def sr3_noise_schedule(timesteps, gamma_min=1e-4, gamma_max=0.02):
+    """
+    SR3 noise schedule following Algorithm 1 & 2 from SR3 paper.
+    
+    γ_t: Linearly spaced noise levels from γ_min to γ_max
+    α_t: Step-wise alpha = γ_{t-1} / γ_t
+    ᾱ_t: Cumulative product of alphas
+    
+    Args:
+        timesteps: Number of diffusion steps T
+        gamma_min: Minimum noise level (start, less noisy)
+        gamma_max: Maximum noise level (end, more noisy)
+    
+    Returns:
+        gammas: (T,) tensor of noise levels
+        alphas: (T,) tensor of step-wise alphas
+        alphas_cumprod: (T,) tensor of cumulative product alphas
+    """
+    # γ_t linearly spaced from γ_min to γ_max
+    gammas = torch.linspace(gamma_min, gamma_max, timesteps)
+    
+    # Compute α_t = γ_{t-1} / γ_t
+    # For t=0, we need γ_{-1}. Convention: γ_0 = γ_min (or could be 0)
+    # We'll use γ_{-1} = 0 so α_0 ≈ 0/γ_0 → 0
+    # Actually, let's set γ_{-1} = 0 for mathematical convenience
+    gammas_prev = torch.cat([torch.tensor([0.0]), gammas[:-1]])
+    alphas = gammas_prev / (gammas + 1e-10)  # Add small epsilon to avoid division by zero
+    
+    # For t=0, α_0 should be close to 0 (starting from clean)
+    alphas[0] = 0.0
+    
+    # Cumulative product: ᾱ_t = ∏_{s=1}^t α_s
     alphas_cumprod = torch.cumprod(alphas, dim=0)
-    return betas, alphas, alphas_cumprod
+    
+    return gammas, alphas, alphas_cumprod
 
 
-# Initialize schedule
-betas, alphas, alphas_cumprod = linear_beta_schedule(T)
+# Initialize SR3 schedule
+gammas, alphas, alphas_cumprod = sr3_noise_schedule(T, gamma_min=1e-4, gamma_max=0.02)
 sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
 sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
 
@@ -189,262 +239,233 @@ class TimeEmbedding(nn.Module):
 
 
 ############################################
-# 3) CONVOLUTIONAL RESIDUAL BLOCK (with Time FiLM)
+# 3) BIGGAN RESIDUAL BLOCK (SR3-style)
 ############################################
-class ConvResBlock(nn.Module):
+class BigGANResBlock(nn.Module):
     """
-    Convolutional residual block with group normalization and TIME conditioning only.
+    BigGAN-style residual block with time conditioning via adaptive group norm.
+    Used in SR3 paper for super-resolution diffusion.
     
     Inputs:
-        x: (batch, channels, H, W) feature map
-        time_emb: (batch, time_dim) time embedding for FiLM conditioning
+        x: (batch, in_channels, H, W) feature map
+        time_emb: (batch, time_dim) time embedding
     """
-    def __init__(self, channels, time_dim):
+    def __init__(self, in_channels, out_channels, time_dim, up=False, down=False):
         super().__init__()
-        self.channels = channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.up = up
+        self.down = down
         
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Group normalization
+        num_groups = min(8, in_channels)
+        self.gn1 = nn.GroupNorm(num_groups, in_channels)
+        self.gn2 = nn.GroupNorm(min(8, out_channels), out_channels)
         
-        # Group normalization (use 8 groups or channels if fewer)
-        num_groups = min(8, channels)
-        self.gn1 = nn.GroupNorm(num_groups, channels)
-        self.gn2 = nn.GroupNorm(num_groups, channels)
+        # Time conditioning (adaptive group norm - scale and shift)
+        self.time_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, out_channels * 2)
+        )
         
-        # Time conditioning projection (FiLM: scale and shift)
-        self.time_proj = nn.Linear(time_dim, channels * 2)
+        # Main pathway
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        
+        # Residual/skip connection
+        if in_channels != out_channels or up or down:
+            self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual_conv = nn.Identity()
         
         self.act = nn.SiLU()
     
     def forward(self, x, time_emb):
         """
-        x: (batch, channels, H, W)
-        time_emb: (batch, time_dim) - time embedding only
+        x: (batch, in_channels, H, W)
+        time_emb: (batch, time_dim)
         """
+        # Residual path
         residual = x
         
-        # Project time embedding to scale and shift
-        time_params = self.time_proj(time_emb)  # (batch, channels * 2)
-        scale, shift = time_params.chunk(2, dim=1)  # Each (batch, channels)
-        scale = scale.unsqueeze(-1).unsqueeze(-1)  # (batch, channels, 1, 1)
-        shift = shift.unsqueeze(-1).unsqueeze(-1)  # (batch, channels, 1, 1)
+        # Upsample/downsample residual if needed
+        if self.up:
+            residual = F.interpolate(residual, scale_factor=2, mode='nearest')
+        elif self.down:
+            residual = F.avg_pool2d(residual, kernel_size=2, stride=2)
         
-        # First conv + FiLM conditioning (time only)
-        h = self.conv1(x)
-        h = self.gn1(h)
-        h = h * (1 + scale) + shift  # FiLM: scale and shift from time
+        residual = self.residual_conv(residual)
+        
+        # Main path
+        h = self.gn1(x)
         h = self.act(h)
         
-        # Second conv
-        h = self.conv2(h)
+        # Upsample/downsample main path
+        if self.up:
+            h = F.interpolate(h, scale_factor=2, mode='nearest')
+        elif self.down:
+            h = F.avg_pool2d(h, kernel_size=2, stride=2)
+        
+        h = self.conv1(h)
+        
+        # Apply time conditioning (adaptive group norm)
+        time_params = self.time_proj(time_emb)  # (batch, out_channels * 2)
+        scale, shift = time_params.chunk(2, dim=1)  # Each (batch, out_channels)
+        scale = scale.unsqueeze(-1).unsqueeze(-1)  # (batch, out_channels, 1, 1)
+        shift = shift.unsqueeze(-1).unsqueeze(-1)  # (batch, out_channels, 1, 1)
+        
         h = self.gn2(h)
+        h = h * (1 + scale) + shift  # Adaptive group norm
+        h = self.act(h)
+        h = self.conv2(h)
         
-        return self.act(h + residual)
+        return h + residual
 
 
 ############################################
-# 4) CONTROL ENCODER (Parallel Conditioning Pathway)
+# 4) SR3-STYLE U-NET (Denoised Image Predictor)
 ############################################
-class ControlEncoder(nn.Module):
+class SR3UNet(nn.Module):
     """
-    Parallel encoder that processes bulk Hi-C conditioning image.
-    Produces multi-resolution features to be added to main U-Net at each level.
-    
-    Architecture matches the main U-Net structure to ensure resolution compatibility.
-    """
-    def __init__(self, base_ch: int = 64, time_dim: int = 256):
-        super().__init__()
-        
-        # Input: (B, 1, 64, 64) bulk Hi-C map
-        self.input_conv = nn.Sequential(
-            nn.Conv2d(1, base_ch, kernel_size=3, padding=1),
-            nn.GroupNorm(min(8, base_ch), base_ch),
-            nn.SiLU(),
-        )
-        
-        # Level 1: 64x64 @ base_ch
-        self.enc1 = ConvResBlock(base_ch, time_dim)
-        self.down1 = nn.Conv2d(base_ch, base_ch * 2, kernel_size=3, stride=2, padding=1)
-        
-        # Level 2: 32x32 @ base_ch*2
-        self.enc2 = ConvResBlock(base_ch * 2, time_dim)
-        self.down2 = nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=3, stride=2, padding=1)
-        
-        # Level 3: 16x16 @ base_ch*4 (bottleneck)
-        self.enc3 = ConvResBlock(base_ch * 4, time_dim)
-        
-        # Zero-initialize output to start with no conditioning
-        for module in [self.enc1, self.enc2, self.enc3]:
-            if hasattr(module, 'conv2'):
-                nn.init.zeros_(module.conv2.weight)
-                nn.init.zeros_(module.conv2.bias)
-    
-    def forward(self, cond_img: torch.Tensor, t_emb: torch.Tensor):
-        """
-        Args:
-            cond_img: (B, 1, 64, 64) bulk Hi-C conditioning image
-            t_emb: (B, time_dim) time embedding
-        
-        Returns:
-            Dictionary of conditioning features at each resolution:
-            {
-                'feat_64': (B, base_ch, 64, 64),
-                'feat_32': (B, base_ch*2, 32, 32),
-                'feat_16': (B, base_ch*4, 16, 16)
-            }
-        """
-        # Input processing
-        h = self.input_conv(cond_img)  # (B, base_ch, 64, 64)
-        
-        # Level 1: 64x64
-        feat_64 = self.enc1(h, t_emb)  # (B, base_ch, 64, 64)
-        h = self.down1(feat_64)        # (B, base_ch*2, 32, 32)
-        
-        # Level 2: 32x32
-        feat_32 = self.enc2(h, t_emb)  # (B, base_ch*2, 32, 32)
-        h = self.down2(feat_32)        # (B, base_ch*4, 16, 16)
-        
-        # Level 3: 16x16 (bottleneck)
-        feat_16 = self.enc3(h, t_emb)  # (B, base_ch*4, 16, 16)
-        
-        return {
-            'feat_64': feat_64,
-            'feat_32': feat_32,
-            'feat_16': feat_16
-        }
-
-
-############################################
-# 5) MAIN U-NET (EpsilonNet with ControlNet Architecture)
-############################################
-class EpsilonNet(nn.Module):
-    """
-    Main denoising U-Net with parallel control encoder.
+    SR3-style U-Net that predicts noise ε (following Algorithm 1).
     
     Architecture:
-        - Control encoder processes bulk Hi-C → multi-resolution features
-        - Main U-Net processes noisy input
-        - Conditioning features ADDED at each level
-        - Time FiLM at every ResBlock
+        - Input: Concatenate noisy image + bulk Hi-C conditioning → (B, 2, 64, 64)
+        - Four downsampling stages: 64 → 32 → 16 → 8
+        - BigGAN residual blocks at each resolution
+        - Standard U-Net skip connections (concatenation)
+        - Output: Predicted noise ε
     """
     def __init__(self, vec_dim, n, time_embed_module, base_ch: int = 64):
         super().__init__()
         self.vec_dim = vec_dim
         self.n = n
-        self.time_embed = time_embed_module  # TimeEmbedding module
+        self.time_embed = time_embed_module
         
         time_dim = self.time_embed.mlp[-1].out_features
         
-        # ---- Control Encoder (processes bulk Hi-C) ----
-        self.control_encoder = ControlEncoder(base_ch=base_ch, time_dim=time_dim)
+        # ---- Input: Concatenate noisy + conditioning → (B, 2, 64, 64) ----
+        self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
         
-        # ---- Main U-Net (processes noisy input) ----
-        # Input: (B, 1, 64, 64) noisy Hi-C map
-        self.input_conv = nn.Sequential(
-            nn.Conv2d(1, base_ch, kernel_size=3, padding=1),
-            nn.GroupNorm(min(8, base_ch), base_ch),
-            nn.SiLU(),
-        )
+        # ---- ENCODER ----
+        # Level 1: 64x64 @ base_ch
+        self.enc1 = BigGANResBlock(base_ch, base_ch, time_dim)
+        self.enc1_down = BigGANResBlock(base_ch, base_ch * 2, time_dim, down=True)
         
-        # Encoder Level 1: 64x64 @ base_ch
-        self.enc1 = ConvResBlock(base_ch, time_dim)
-        self.down1 = nn.Conv2d(base_ch, base_ch * 2, kernel_size=3, stride=2, padding=1)
+        # Level 2: 32x32 @ base_ch*2
+        self.enc2 = BigGANResBlock(base_ch * 2, base_ch * 2, time_dim)
+        self.enc2_down = BigGANResBlock(base_ch * 2, base_ch * 4, time_dim, down=True)
         
-        # Encoder Level 2: 32x32 @ base_ch*2
-        self.enc2 = ConvResBlock(base_ch * 2, time_dim)
-        self.down2 = nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=3, stride=2, padding=1)
+        # Level 3: 16x16 @ base_ch*4
+        self.enc3 = BigGANResBlock(base_ch * 4, base_ch * 4, time_dim)
+        self.enc3_down = BigGANResBlock(base_ch * 4, base_ch * 8, time_dim, down=True)
         
-        # Bottleneck: 16x16 @ base_ch*4
+        # ---- BOTTLENECK: 8x8 @ base_ch*8 ----
         self.bottleneck = nn.ModuleList([
-            ConvResBlock(base_ch * 4, time_dim),
-            ConvResBlock(base_ch * 4, time_dim),
+            BigGANResBlock(base_ch * 8, base_ch * 8, time_dim),
+            BigGANResBlock(base_ch * 8, base_ch * 8, time_dim),
         ])
         
-        # Decoder Level 2: 16x16 -> 32x32 @ base_ch*2
-        self.up2_conv = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=3, padding=1)
-        self.dec2_reduce = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)  # Reduce after concat
-        self.dec2 = ConvResBlock(base_ch * 2, time_dim)
+        # ---- DECODER ----
+        # Level 3: 8x8 -> 16x16 @ base_ch*4
+        self.dec3_up = BigGANResBlock(base_ch * 8, base_ch * 4, time_dim, up=True)
+        self.dec3_reduce = nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)  # After concat
+        self.dec3 = BigGANResBlock(base_ch * 4, base_ch * 4, time_dim)
         
-        # Decoder Level 1: 32x32 -> 64x64 @ base_ch
-        self.up1_conv = nn.Conv2d(base_ch * 2, base_ch, kernel_size=3, padding=1)
-        self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)  # Reduce after concat
-        self.dec1 = ConvResBlock(base_ch, time_dim)
+        # Level 2: 16x16 -> 32x32 @ base_ch*2
+        self.dec2_up = BigGANResBlock(base_ch * 4, base_ch * 2, time_dim, up=True)
+        self.dec2_reduce = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)  # After concat
+        self.dec2 = BigGANResBlock(base_ch * 2, base_ch * 2, time_dim)
         
-        # Output: (B, 1, 64, 64) predicted noise
-        self.output_conv = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
-        nn.init.zeros_(self.output_conv.weight)
-        nn.init.zeros_(self.output_conv.bias)
+        # Level 1: 32x32 -> 64x64 @ base_ch
+        self.dec1_up = BigGANResBlock(base_ch * 2, base_ch, time_dim, up=True)
+        self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)  # After concat
+        self.dec1 = BigGANResBlock(base_ch, base_ch, time_dim)
+        
+        # ---- OUTPUT: Predict denoised image ----
+        self.output_block = nn.Sequential(
+            nn.GroupNorm(min(8, base_ch), base_ch),
+            nn.SiLU(),
+            nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
+        )
+        
+        # Zero-initialize output for stability
+        nn.init.zeros_(self.output_block[-1].weight)
+        nn.init.zeros_(self.output_block[-1].bias)
     
     def forward(self, x_t_vec, t_idx, chip_1d, bulk_vec):
         """
+        SR3 forward pass: Predict x_{t-1} from x_t (one iterative refinement step).
+        
         Args:
-            x_t_vec:  (B, vec_dim) noisy Hi-C vector
+            x_t_vec:  (B, vec_dim) noisy Hi-C vector at timestep t
             t_idx:    (B,) integer timestep in [0..T-1]
-            chip_1d:  (B, N) ChIP-seq signal (IGNORED for now)
+            chip_1d:  (B, N) ChIP-seq signal (UNUSED - kept for compatibility)
             bulk_vec: (B, vec_dim) bulk Hi-C vector (conditioning)
         
         Returns:
-            eps_vec: (B, vec_dim) predicted noise vector
+            x_prev_vec: (B, vec_dim) predicted x_{t-1} (less noisy image at previous timestep)
         """
         B = x_t_vec.shape[0]
         N = self.n
         
-        # --- Build time embedding ---
+        # --- Time embedding ---
         t_emb = self.time_embed(t_idx)  # (B, time_dim)
         
-        # --- Convert vectors to maps ---
+        # --- Convert vectors to 2D matrices ---
         x_t_map = upper_tri_vec_to_matrix(x_t_vec, N).unsqueeze(1)     # (B, 1, 64, 64)
         bulk_map = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)   # (B, 1, 64, 64)
         
-        # ========== CONTROL ENCODER: Process bulk Hi-C ==========
-        cond_feats = self.control_encoder(bulk_map, t_emb)
-        # cond_feats = {
-        #     'feat_64': (B, base_ch, 64, 64),
-        #     'feat_32': (B, base_ch*2, 32, 32),
-        #     'feat_16': (B, base_ch*4, 16, 16)
-        # }
+        # --- Concatenate noisy input + bulk conditioning ---
+        x_in = torch.cat([x_t_map, bulk_map], dim=1)  # (B, 2, 64, 64)
         
-        # ========== MAIN U-NET: Process noisy input ==========
-        # Input stem
-        h = self.input_conv(x_t_map)  # (B, base_ch, 64, 64)
+        # --- Input convolution ---
+        h = self.input_conv(x_in)  # (B, base_ch, 64, 64)
         
-        # ENCODER LEVEL 1: 64x64
-        h = h + cond_feats['feat_64']  # ← ADD control features
-        enc1 = self.enc1(h, t_emb)     # (B, base_ch, 64, 64)
-        h = self.down1(enc1)           # (B, base_ch*2, 32, 32)
+        # ========== ENCODER ==========
+        # Level 1: 64x64
+        h = self.enc1(h, t_emb)           # (B, base_ch, 64, 64)
+        skip1 = h                         # Save for skip connection
+        h = self.enc1_down(h, t_emb)      # (B, base_ch*2, 32, 32)
         
-        # ENCODER LEVEL 2: 32x32
-        h = h + cond_feats['feat_32']  # ← ADD control features
-        enc2 = self.enc2(h, t_emb)     # (B, base_ch*2, 32, 32)
-        h = self.down2(enc2)           # (B, base_ch*4, 16, 16)
+        # Level 2: 32x32
+        h = self.enc2(h, t_emb)           # (B, base_ch*2, 32, 32)
+        skip2 = h                         # Save for skip connection
+        h = self.enc2_down(h, t_emb)      # (B, base_ch*4, 16, 16)
         
-        # BOTTLENECK: 16x16
-        h = h + cond_feats['feat_16']  # ← ADD control features
-        for blk in self.bottleneck:
-            h = blk(h, t_emb)          # (B, base_ch*4, 16, 16)
+        # Level 3: 16x16
+        h = self.enc3(h, t_emb)           # (B, base_ch*4, 16, 16)
+        skip3 = h                         # Save for skip connection
+        h = self.enc3_down(h, t_emb)      # (B, base_ch*8, 8, 8)
         
-        # DECODER LEVEL 2: 16x16 -> 32x32
-        h = F.interpolate(h, size=enc2.shape[-2:], mode="bilinear", align_corners=False)
-        h = self.up2_conv(h)                    # (B, base_ch*2, 32, 32)
-        h = h + cond_feats['feat_32']          # ← ADD control features again
-        h = torch.cat([h, enc2], dim=1)        # (B, base_ch*4, 32, 32)
-        h = self.dec2_reduce(h)                # (B, base_ch*2, 32, 32) - reduce channels
-        h = self.dec2(h, t_emb)                # (B, base_ch*2, 32, 32)
+        # ========== BOTTLENECK: 8x8 ==========
+        for block in self.bottleneck:
+            h = block(h, t_emb)           # (B, base_ch*8, 8, 8)
         
-        # DECODER LEVEL 1: 32x32 -> 64x64
-        h = F.interpolate(h, size=enc1.shape[-2:], mode="bilinear", align_corners=False)
-        h = self.up1_conv(h)                    # (B, base_ch, 64, 64)
-        h = h + cond_feats['feat_64']          # ← ADD control features again
-        h = torch.cat([h, enc1], dim=1)        # (B, base_ch*2, 64, 64)
-        h = self.dec1_reduce(h)                # (B, base_ch, 64, 64) - reduce channels
-        h = self.dec1(h, t_emb)                # (B, base_ch, 64, 64)
+        # ========== DECODER ==========
+        # Level 3: 8x8 -> 16x16
+        h = self.dec3_up(h, t_emb)                    # (B, base_ch*4, 16, 16)
+        h = torch.cat([h, skip3], dim=1)              # (B, base_ch*8, 16, 16)
+        h = self.dec3_reduce(h)                       # (B, base_ch*4, 16, 16)
+        h = self.dec3(h, t_emb)                       # (B, base_ch*4, 16, 16)
         
-        # Output
-        eps_map = self.output_conv(h).squeeze(1)  # (B, 64, 64)
-        eps_vec = matrix_to_upper_tri_vec(eps_map)  # (B, vec_dim)
+        # Level 2: 16x16 -> 32x32
+        h = self.dec2_up(h, t_emb)                    # (B, base_ch*2, 32, 32)
+        h = torch.cat([h, skip2], dim=1)              # (B, base_ch*4, 32, 32)
+        h = self.dec2_reduce(h)                       # (B, base_ch*2, 32, 32)
+        h = self.dec2(h, t_emb)                       # (B, base_ch*2, 32, 32)
         
-        return eps_vec
+        # Level 1: 32x32 -> 64x64
+        h = self.dec1_up(h, t_emb)                    # (B, base_ch, 64, 64)
+        h = torch.cat([h, skip1], dim=1)              # (B, base_ch*2, 64, 64)
+        h = self.dec1_reduce(h)                       # (B, base_ch, 64, 64)
+        h = self.dec1(h, t_emb)                       # (B, base_ch, 64, 64)
+        
+        # ========== OUTPUT: Predict x_{t-1} (one refinement step) ==========
+        x_prev_map = self.output_block(h).squeeze(1)  # (B, 64, 64)
+        x_prev_vec = matrix_to_upper_tri_vec(x_prev_map)  # (B, vec_dim)
+        
+        return x_prev_vec
 
 
 ############################################
@@ -474,10 +495,13 @@ def q_sample(x0, t, noise):
 ############################################
 def train_step(model, optimizer, batch, device, phase_name):
     """
-    Single training step for ONE phase denoiser.
+    Single training step for SR3-style iterative refinement.
+    
+    Model learns to predict x_{t-1} (less noisy image) from x_t (current noisy image).
+    This is the core of SR3: iteratively refining from bulk Hi-C to phase-specific data.
     
     Args:
-        model: EpsilonNet for the current phase
+        model: SR3UNet for the current phase
         optimizer: optimizer for this model
         batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'chip_seq'
         device: torch device
@@ -503,23 +527,32 @@ def train_step(model, optimizer, batch, device, phase_name):
     x0_bulk_normalized = (x0_early + x0_mid + x0_late) / 3  # (batch_size, vec_dim)
     batch_size = x0_bulk_normalized.shape[0]
     
-    # Get ChIP-seq conditioning (already batched)
+    # Get ChIP-seq conditioning (already batched - kept for compatibility but unused)
     chip_1d = batch['chip_seq'].float().to(device)  # (batch_size, N)
     
-    # Sample random timestep for each sample in batch
-    t = torch.randint(0, T, (batch_size,), device=device).long()  # (batch_size,)
+    # SR3 TRAINING (Algorithm 1): Sample random noise level γ ~ p(γ)
+    gamma_min, gamma_max = 1e-4, 0.02
+    gamma_t = torch.rand(batch_size, 1, device=device) * (gamma_max - gamma_min) + gamma_min  # (batch_size, 1)
     
-    # Sample random noise (epsilon)
+    # Sample random noise ϵ ~ N(0, I) - THIS IS THE TARGET!
     eps_true = torch.randn_like(x0_current)  # (batch_size, vec_dim)
     
-    # Forward diffusion: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon
-    x_t = q_sample(x0_current, t, eps_true)
+    # SR3 forward process: y_γ = √γ · y_0 + √(1-γ) · ϵ
+    # Following SR3 Algorithm 1 line 5
+    sqrt_gamma_t = torch.sqrt(gamma_t)
+    sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
+    y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
     
-    # Predict the noise that was added (with bulk conditioning)
-    eps_hat = model(x_t, t, chip_1d, x0_bulk_normalized)
+    # Map γ to timestep t for model conditioning
+    t_continuous = ((gamma_t.squeeze() - gamma_min) / (gamma_max - gamma_min)) * (T - 1)
+    t = t_continuous.long().clamp(0, T-1)  # (batch_size,)
     
-    # DDPM loss: MSE between predicted noise and true noise
-    loss = F.mse_loss(eps_hat, eps_true)
+    # SR3 MODEL: Predicts noise ε (Algorithm 1)
+    eps_pred = model(y_gamma, t, chip_1d, x0_bulk_normalized)
+    
+    # SR3 LOSS: MSE between predicted noise and true noise
+    # Algorithm 1 line 5: minimize ||f_θ(x, √γ y_0 + √(1-γ)ε, γ) - ε||²
+    loss = F.mse_loss(eps_pred, eps_true)
     
     # Backward pass
     optimizer.zero_grad()
@@ -531,11 +564,10 @@ def train_step(model, optimizer, batch, device, phase_name):
 
 def test_training(model, batch, device, step, phase_name):
     """
-    Test the model by reconstruction and visualizing predictions.
-    Called every ~100 training steps to monitor progress.
+    Run inference and visualize results during training.
     
     Args:
-        model: EpsilonNet for the current phase
+        model: SR3UNet for the current phase
         batch: training batch
         device: torch device
         step: current training step number
@@ -544,19 +576,18 @@ def test_training(model, batch, device, step, phase_name):
     Returns:
         Path to saved visualization
     """
-    from visualize_diffusion_training import visualize_training_step_single_phase
+    from inference import run_inference_and_visualize
     
     print(f"\n{'='*60}")
-    print(f"Testing {phase_name} at step {step}...")
+    print(f"Running inference at step {step}...")
     
-    save_path = visualize_training_step_single_phase(
+    save_path = run_inference_and_visualize(
         model=model,
-        phase_name=phase_name,
         batch=batch,
+        phase_name=phase_name,
         device=device,
         step=step,
-        T=T,
-        output_dir="./training_visualizations"
+        output_dir="./inference_visualizations"
     )
     
     print(f"{'='*60}\n")
@@ -578,12 +609,12 @@ def main():
     # Create time embedding module
     time_embed_module = TimeEmbedding(d_t, max_timesteps=T)
     
-    # Initialize ONE model for the current phase with ControlNet architecture
-    model = EpsilonNet(
+    # Initialize SR3-style U-Net model
+    model = SR3UNet(
         vec_dim=VEC_DIM,
         n=N,
         time_embed_module=time_embed_module,
-        base_ch=64            # Base channels for U-Net and Control Encoder
+        base_ch=64            # Base channels for U-Net (64 -> 128 -> 256 -> 512)
     ).to(DEVICE)
     
     # Count parameters
@@ -639,9 +670,14 @@ def main():
             # Update progress bar
             pbar.set_postfix({'loss': f"{loss:.4f}"})
             
-            # Visualize every 100 steps
-            if global_step % 100 == 0:
+            # Visualize every 200 steps (reduced frequency to save memory)
+            if global_step % 200 == 0:
                 test_training(model, batch, DEVICE, global_step, CURRENT_PHASE)
+                
+                # Clear CUDA memory cache to prevent OOM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()  # Force garbage collection
         
         # Epoch summary
         avg_loss = np.mean(epoch_losses)
