@@ -52,11 +52,11 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader, random_split
 
 # Add preprocess dir to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess"))
-from Dataloader import CellCycleDataLoader, upper_tri_vec_to_matrix
+from Dataloader import CellCycleDataLoader
 
 torch.manual_seed(42)
 
@@ -140,7 +140,7 @@ d_t = 256             # time embedding dimension
 
 BATCH_SIZE = 32       # Increased from 8 since we have more memory with single model
 LR = 1e-4
-NUM_EPOCHS = 5        # More epochs since we're training one at a time
+NUM_EPOCHS = 1        # More epochs since we're training one at a time
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Model checkpoints directory
@@ -153,88 +153,88 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 ############################################
 # 1) SR3 NOISE SCHEDULE
 ############################################
-def sr3_noise_schedule(timesteps, gamma_min=1e-4, gamma_max=0.02):
+def sr3_noise_schedule(timesteps, gamma_min=1e-4, gamma_max=1.0):
     """
-    SR3 noise schedule following Algorithm 1 & 2 from SR3 paper.
+    SR3 inference schedule: γ decreases from 1.0 (pure noise) to ~0 (clean).
     
-    γ_t: Linearly spaced noise levels from γ_min to γ_max
-    α_t: Step-wise alpha = γ_{t-1} / γ_t
-    ᾱ_t: Cumulative product of alphas
+    During inference, we start at t=T (γ=1.0, pure noise) and denoise
+    down to t=0 (γ≈0, clean image).
     
     Args:
         timesteps: Number of diffusion steps T
-        gamma_min: Minimum noise level (start, less noisy)
-        gamma_max: Maximum noise level (end, more noisy)
+        gamma_min: Minimum noise level (end, almost clean) - default 1e-4
+        gamma_max: Maximum noise level (start, pure noise) - default 1.0
     
     Returns:
-        gammas: (T,) tensor of noise levels
-        alphas: (T,) tensor of step-wise alphas
-        alphas_cumprod: (T,) tensor of cumulative product alphas
+        gammas: (T,) tensor of noise levels, decreasing from gamma_max to gamma_min
+        alphas: (T,) tensor of step-wise alphas α_t = γ_{t-1} / γ_t
+        alphas_cumprod: (T,) tensor (kept for compatibility, not used in SR3)
     """
-    # γ_t linearly spaced from γ_min to γ_max
-    gammas = torch.linspace(gamma_min, gamma_max, timesteps)
+    # at inference, we start with gamma close to 0 at T - 1 and end with gamma close to 1 at time step 0
+    gammas = torch.linspace(gamma_max, gamma_min, T)
+
+    alphas = torch.ones(T)
     
-    # Compute α_t = γ_{t-1} / γ_t
-    # For t=0, we need γ_{-1}. Convention: γ_0 = γ_min (or could be 0)
-    # We'll use γ_{-1} = 0 so α_0 ≈ 0/γ_0 → 0
-    # Actually, let's set γ_{-1} = 0 for mathematical convenience
-    gammas_prev = torch.cat([torch.tensor([0.0]), gammas[:-1]])
-    alphas = gammas_prev / (gammas + 1e-10)  # Add small epsilon to avoid division by zero
+    # Compute α_t = γ_{t-1} / γ_t for reverse process
+    alphas[1:] = gammas[1:] / (gammas[:-1] + 1e-10)
     
-    # For t=0, α_0 should be close to 0 (starting from clean)
-    alphas[0] = 0.0
-    
-    # Cumulative product: ᾱ_t = ∏_{s=1}^t α_s
+    # Cumulative product (not used in SR3, kept for compatibility)
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     
     return gammas, alphas, alphas_cumprod
 
 
-# Initialize SR3 schedule
-gammas, alphas, alphas_cumprod = sr3_noise_schedule(T, gamma_min=1e-4, gamma_max=0.02)
-sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+# Initialize SR3 inference schedule (only used during inference, not training)
+gammas, alphas, alphas_cumprod = sr3_noise_schedule(T, gamma_min=1e-4, gamma_max=1.0)
+# Note: Training does NOT use this schedule - it samples γ ~ Uniform(0,1) directly
 
 
 ############################################
-# 2) TIME EMBEDDING (Sinusoidal)
+# 2) NOISE LEVEL EMBEDDING (Gamma)
 ############################################
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
-    def forward(self, time):
+    def forward(self, value):
         """
-        time: (batch,) tensor of timestep indices
-        returns: (batch, dim) embeddings
+        value: (batch,) tensor of values to embed (e.g., scaled gamma)
+        returns: (batch, dim) sinusoidal embeddings
         """
-        device = time.device
+        device = value.device
         half_dim = self.dim // 2
         embeddings = np.log(10000) / (half_dim - 1)
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = value[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
 
-class TimeEmbedding(nn.Module):
-    def __init__(self, dim, max_timesteps=1000):
+class NoiseEmbedding(nn.Module):
+    """
+    Embeds noise level γ ∈ [0, 1] using sinusoidal embeddings.
+    
+    In SR3, γ represents the noise variance:
+    - γ = 0: clean image
+    - γ = 1: pure noise
+    """
+    def __init__(self, dim, max_value=1000):
         super().__init__()
         self.sinusoidal = SinusoidalPositionEmbeddings(dim)
-        self.max_timesteps = max_timesteps
+        self.max_value = max_value
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.SiLU(),
             nn.Linear(dim * 4, dim),
         )
     
-    def forward(self, t):
+    def forward(self, gamma):
         """
-        t: (batch,) integer timestep in [0, max_timesteps-1]
-        returns: (batch, dim)
+        gamma: (batch,) noise level γ (pre-scaled to ~[0, 1000])
+        returns: (batch, dim) noise level embedding
         """
-        emb = self.sinusoidal(t)
+        emb = self.sinusoidal(gamma)
         return self.mlp(emb)
 
 
@@ -243,14 +243,14 @@ class TimeEmbedding(nn.Module):
 ############################################
 class BigGANResBlock(nn.Module):
     """
-    BigGAN-style residual block with time conditioning via adaptive group norm.
+    BigGAN-style residual block with noise level conditioning via adaptive group norm.
     Used in SR3 paper for super-resolution diffusion.
     
     Inputs:
         x: (batch, in_channels, H, W) feature map
-        time_emb: (batch, time_dim) time embedding
+        noise_emb: (batch, noise_dim) noise level embedding (γ)
     """
-    def __init__(self, in_channels, out_channels, time_dim, up=False, down=False):
+    def __init__(self, in_channels, out_channels, noise_dim, up=False, down=False):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -262,10 +262,10 @@ class BigGANResBlock(nn.Module):
         self.gn1 = nn.GroupNorm(num_groups, in_channels)
         self.gn2 = nn.GroupNorm(min(8, out_channels), out_channels)
         
-        # Time conditioning (adaptive group norm - scale and shift)
-        self.time_proj = nn.Sequential(
+        # Noise level conditioning (adaptive group norm - scale and shift)
+        self.noise_proj = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_dim, out_channels * 2)
+            nn.Linear(noise_dim, out_channels * 2)
         )
         
         # Main pathway
@@ -280,10 +280,10 @@ class BigGANResBlock(nn.Module):
         
         self.act = nn.SiLU()
     
-    def forward(self, x, time_emb):
+    def forward(self, x, noise_emb):
         """
         x: (batch, in_channels, H, W)
-        time_emb: (batch, time_dim)
+        noise_emb: (batch, noise_dim) - embedding of noise level γ
         """
         # Residual path
         residual = x
@@ -308,9 +308,9 @@ class BigGANResBlock(nn.Module):
         
         h = self.conv1(h)
         
-        # Apply time conditioning (adaptive group norm)
-        time_params = self.time_proj(time_emb)  # (batch, out_channels * 2)
-        scale, shift = time_params.chunk(2, dim=1)  # Each (batch, out_channels)
+        # Apply noise level conditioning (adaptive group norm - FiLM)
+        noise_params = self.noise_proj(noise_emb)  # (batch, out_channels * 2)
+        scale, shift = noise_params.chunk(2, dim=1)  # Each (batch, out_channels)
         scale = scale.unsqueeze(-1).unsqueeze(-1)  # (batch, out_channels, 1, 1)
         shift = shift.unsqueeze(-1).unsqueeze(-1)  # (batch, out_channels, 1, 1)
         
@@ -336,51 +336,51 @@ class SR3UNet(nn.Module):
         - Standard U-Net skip connections (concatenation)
         - Output: Predicted noise ε
     """
-    def __init__(self, vec_dim, n, time_embed_module, base_ch: int = 64):
+    def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64):
         super().__init__()
         self.vec_dim = vec_dim
         self.n = n
-        self.time_embed = time_embed_module
-        
-        time_dim = self.time_embed.mlp[-1].out_features
+        self.noise_embed = noise_embed_module
+
+        noise_dim = self.noise_embed.mlp[-1].out_features
         
         # ---- Input: Concatenate noisy + conditioning → (B, 2, 64, 64) ----
         self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
         
         # ---- ENCODER ----
         # Level 1: 64x64 @ base_ch
-        self.enc1 = BigGANResBlock(base_ch, base_ch, time_dim)
-        self.enc1_down = BigGANResBlock(base_ch, base_ch * 2, time_dim, down=True)
+        self.enc1 = BigGANResBlock(base_ch, base_ch, noise_dim)
+        self.enc1_down = BigGANResBlock(base_ch, base_ch * 2, noise_dim, down=True)
         
         # Level 2: 32x32 @ base_ch*2
-        self.enc2 = BigGANResBlock(base_ch * 2, base_ch * 2, time_dim)
-        self.enc2_down = BigGANResBlock(base_ch * 2, base_ch * 4, time_dim, down=True)
+        self.enc2 = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
+        self.enc2_down = BigGANResBlock(base_ch * 2, base_ch * 4, noise_dim, down=True)
         
         # Level 3: 16x16 @ base_ch*4
-        self.enc3 = BigGANResBlock(base_ch * 4, base_ch * 4, time_dim)
-        self.enc3_down = BigGANResBlock(base_ch * 4, base_ch * 8, time_dim, down=True)
+        self.enc3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
+        self.enc3_down = BigGANResBlock(base_ch * 4, base_ch * 8, noise_dim, down=True)
         
         # ---- BOTTLENECK: 8x8 @ base_ch*8 ----
         self.bottleneck = nn.ModuleList([
-            BigGANResBlock(base_ch * 8, base_ch * 8, time_dim),
-            BigGANResBlock(base_ch * 8, base_ch * 8, time_dim),
+            BigGANResBlock(base_ch * 8, base_ch * 8, noise_dim),
+            BigGANResBlock(base_ch * 8, base_ch * 8, noise_dim),
         ])
         
         # ---- DECODER ----
         # Level 3: 8x8 -> 16x16 @ base_ch*4
-        self.dec3_up = BigGANResBlock(base_ch * 8, base_ch * 4, time_dim, up=True)
+        self.dec3_up = BigGANResBlock(base_ch * 8, base_ch * 4, noise_dim, up=True)
         self.dec3_reduce = nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)  # After concat
-        self.dec3 = BigGANResBlock(base_ch * 4, base_ch * 4, time_dim)
+        self.dec3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
         
         # Level 2: 16x16 -> 32x32 @ base_ch*2
-        self.dec2_up = BigGANResBlock(base_ch * 4, base_ch * 2, time_dim, up=True)
+        self.dec2_up = BigGANResBlock(base_ch * 4, base_ch * 2, noise_dim, up=True)
         self.dec2_reduce = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)  # After concat
-        self.dec2 = BigGANResBlock(base_ch * 2, base_ch * 2, time_dim)
+        self.dec2 = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
         
         # Level 1: 32x32 -> 64x64 @ base_ch
-        self.dec1_up = BigGANResBlock(base_ch * 2, base_ch, time_dim, up=True)
+        self.dec1_up = BigGANResBlock(base_ch * 2, base_ch, noise_dim, up=True)
         self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)  # After concat
-        self.dec1 = BigGANResBlock(base_ch, base_ch, time_dim)
+        self.dec1 = BigGANResBlock(base_ch, base_ch, noise_dim)
         
         # ---- OUTPUT: Predict denoised image ----
         self.output_block = nn.Sequential(
@@ -393,24 +393,29 @@ class SR3UNet(nn.Module):
         nn.init.zeros_(self.output_block[-1].weight)
         nn.init.zeros_(self.output_block[-1].bias)
     
-    def forward(self, x_t_vec, t_idx, chip_1d, bulk_vec):
+    def forward(self, x_t_vec, gamma, chip_1d, bulk_vec):
         """
-        SR3 forward pass: Predict x_{t-1} from x_t (one iterative refinement step).
+        SR3 forward pass: Predict noise ε given noisy input y_γ.
         
         Args:
-            x_t_vec:  (B, vec_dim) noisy Hi-C vector at timestep t
-            t_idx:    (B,) integer timestep in [0..T-1]
+            x_t_vec:  (B, vec_dim) noisy Hi-C vector y_γ
+            gamma:    (B,) or (B, 1) noise level γ ∈ [0, 1]
             chip_1d:  (B, N) ChIP-seq signal (UNUSED - kept for compatibility)
             bulk_vec: (B, vec_dim) bulk Hi-C vector (conditioning)
         
         Returns:
-            x_prev_vec: (B, vec_dim) predicted x_{t-1} (less noisy image at previous timestep)
+            eps_vec: (B, vec_dim) predicted noise ε
         """
         B = x_t_vec.shape[0]
         N = self.n
         
-        # --- Time embedding ---
-        t_emb = self.time_embed(t_idx)  # (B, time_dim)
+        # --- Noise level embedding ---
+        # Ensure gamma is (B,) shape for the embedding
+        if gamma.dim() == 2:
+            gamma = gamma.squeeze(-1)  # (B, 1) -> (B,)
+        # Scale gamma [0,1] to a larger range for better sinusoidal embedding
+        gamma_scaled = gamma * 999.0  # Scale to ~[0, 999]
+        noise_emb = self.noise_embed(gamma_scaled)  # (B, noise_dim)
         
         # --- Convert vectors to 2D matrices ---
         x_t_map = upper_tri_vec_to_matrix(x_t_vec, N).unsqueeze(1)     # (B, 1, 64, 64)
@@ -424,70 +429,57 @@ class SR3UNet(nn.Module):
         
         # ========== ENCODER ==========
         # Level 1: 64x64
-        h = self.enc1(h, t_emb)           # (B, base_ch, 64, 64)
-        skip1 = h                         # Save for skip connection
-        h = self.enc1_down(h, t_emb)      # (B, base_ch*2, 32, 32)
+        h = self.enc1(h, noise_emb)           # (B, base_ch, 64, 64)
+        skip1 = h                             # Save for skip connection
+        h = self.enc1_down(h, noise_emb)      # (B, base_ch*2, 32, 32)
         
         # Level 2: 32x32
-        h = self.enc2(h, t_emb)           # (B, base_ch*2, 32, 32)
-        skip2 = h                         # Save for skip connection
-        h = self.enc2_down(h, t_emb)      # (B, base_ch*4, 16, 16)
+        h = self.enc2(h, noise_emb)           # (B, base_ch*2, 32, 32)
+        skip2 = h                             # Save for skip connection
+        h = self.enc2_down(h, noise_emb)      # (B, base_ch*4, 16, 16)
         
         # Level 3: 16x16
-        h = self.enc3(h, t_emb)           # (B, base_ch*4, 16, 16)
-        skip3 = h                         # Save for skip connection
-        h = self.enc3_down(h, t_emb)      # (B, base_ch*8, 8, 8)
+        h = self.enc3(h, noise_emb)           # (B, base_ch*4, 16, 16)
+        skip3 = h                             # Save for skip connection
+        h = self.enc3_down(h, noise_emb)      # (B, base_ch*8, 8, 8)
         
         # ========== BOTTLENECK: 8x8 ==========
         for block in self.bottleneck:
-            h = block(h, t_emb)           # (B, base_ch*8, 8, 8)
+            h = block(h, noise_emb)           # (B, base_ch*8, 8, 8)
         
         # ========== DECODER ==========
         # Level 3: 8x8 -> 16x16
-        h = self.dec3_up(h, t_emb)                    # (B, base_ch*4, 16, 16)
+        h = self.dec3_up(h, noise_emb)                # (B, base_ch*4, 16, 16)
         h = torch.cat([h, skip3], dim=1)              # (B, base_ch*8, 16, 16)
         h = self.dec3_reduce(h)                       # (B, base_ch*4, 16, 16)
-        h = self.dec3(h, t_emb)                       # (B, base_ch*4, 16, 16)
+        h = self.dec3(h, noise_emb)                   # (B, base_ch*4, 16, 16)
         
         # Level 2: 16x16 -> 32x32
-        h = self.dec2_up(h, t_emb)                    # (B, base_ch*2, 32, 32)
+        h = self.dec2_up(h, noise_emb)                # (B, base_ch*2, 32, 32)
         h = torch.cat([h, skip2], dim=1)              # (B, base_ch*4, 32, 32)
         h = self.dec2_reduce(h)                       # (B, base_ch*2, 32, 32)
-        h = self.dec2(h, t_emb)                       # (B, base_ch*2, 32, 32)
+        h = self.dec2(h, noise_emb)                   # (B, base_ch*2, 32, 32)
         
         # Level 1: 32x32 -> 64x64
-        h = self.dec1_up(h, t_emb)                    # (B, base_ch, 64, 64)
+        h = self.dec1_up(h, noise_emb)                # (B, base_ch, 64, 64)
         h = torch.cat([h, skip1], dim=1)              # (B, base_ch*2, 64, 64)
         h = self.dec1_reduce(h)                       # (B, base_ch, 64, 64)
-        h = self.dec1(h, t_emb)                       # (B, base_ch, 64, 64)
+        h = self.dec1(h, noise_emb)                   # (B, base_ch, 64, 64)
         
-        # ========== OUTPUT: Predict x_{t-1} (one refinement step) ==========
-        x_prev_map = self.output_block(h).squeeze(1)  # (B, 64, 64)
-        x_prev_vec = matrix_to_upper_tri_vec(x_prev_map)  # (B, vec_dim)
+        # ========== OUTPUT: Predict epsilon (noise) ==========
+        # SR3 trains the model to predict noise, not the denoised image
+        eps_map = self.output_block(h).squeeze(1)  # (B, 64, 64)
+        eps_vec = matrix_to_upper_tri_vec(eps_map)  # (B, vec_dim)
         
-        return x_prev_vec
+        return eps_vec
 
 
 ############################################
-# 6) FORWARD NOISING (q_sample)
+# 6) FORWARD NOISING - NOT USED IN SR3
 ############################################
-def q_sample(x0, t, noise):
-    """
-    Sample from q(x_t | x_0)
-    
-    x0: (batch, vec_dim) clean data
-    t: (batch,) timesteps
-    noise: (batch, vec_dim) Gaussian noise
-    
-    returns: x_t (batch, vec_dim)
-    """
-    device = x0.device
-    # Move schedule tensors to the same device as data
-    sqrt_alpha_cumprod_t = sqrt_alphas_cumprod.to(device)[t][:, None]  # (batch, 1)
-    sqrt_one_minus_alpha_cumprod_t = sqrt_one_minus_alphas_cumprod.to(device)[t][:, None]
-    
-    x_t = sqrt_alpha_cumprod_t * x0 + sqrt_one_minus_alpha_cumprod_t * noise
-    return x_t
+# SR3 training uses direct gamma sampling instead of timestep-based noising:
+# y_γ = √γ·y_0 + √(1-γ)·ε where γ ~ Uniform(0,1)
+# The q_sample function is not needed for SR3 training.
 
 
 ############################################
@@ -530,9 +522,9 @@ def train_step(model, optimizer, batch, device, phase_name):
     # Get ChIP-seq conditioning (already batched - kept for compatibility but unused)
     chip_1d = batch['chip_seq'].float().to(device)  # (batch_size, N)
     
-    # SR3 TRAINING (Algorithm 1): Sample random noise level γ ~ p(γ)
-    gamma_min, gamma_max = 1e-4, 0.02
-    gamma_t = torch.rand(batch_size, 1, device=device) * (gamma_max - gamma_min) + gamma_min  # (batch_size, 1)
+    # SR3 TRAINING (Algorithm 1): Sample random noise level γ ~ Uniform(0, 1)
+    # γ represents the noise variance: 0 = clean, 1 = pure noise
+    gamma_t = torch.rand(batch_size, 1, device=device)  # Uniform[0, 1]
     
     # Sample random noise ϵ ~ N(0, I) - THIS IS THE TARGET!
     eps_true = torch.randn_like(x0_current)  # (batch_size, vec_dim)
@@ -543,12 +535,9 @@ def train_step(model, optimizer, batch, device, phase_name):
     sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
     y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
     
-    # Map γ to timestep t for model conditioning
-    t_continuous = ((gamma_t.squeeze() - gamma_min) / (gamma_max - gamma_min)) * (T - 1)
-    t = t_continuous.long().clamp(0, T-1)  # (batch_size,)
-    
-    # SR3 MODEL: Predicts noise ε (Algorithm 1)
-    eps_pred = model(y_gamma, t, chip_1d, x0_bulk_normalized)
+    # SR3 MODEL: Predicts noise ε given (y_γ, γ, conditioning)
+    # No timesteps in training - γ is passed directly!
+    eps_pred = model(y_gamma, gamma_t.squeeze(), chip_1d, x0_bulk_normalized)
     
     # SR3 LOSS: MSE between predicted noise and true noise
     # Algorithm 1 line 5: minimize ||f_θ(x, √γ y_0 + √(1-γ)ε, γ) - ε||²
@@ -595,6 +584,50 @@ def test_training(model, batch, device, step, phase_name):
     return save_path
 
 
+def run_test_inference(model, test_dataloader, device, phase_name, epoch, num_samples=20):
+    """
+    Run inference on test samples and save visualizations.
+    
+    Args:
+        model: SR3UNet for the current phase
+        test_dataloader: DataLoader for test set
+        device: torch device
+        phase_name: 'earlyG1', 'midG1', or 'lateG1'
+        epoch: current epoch number
+        num_samples: number of test samples to visualize (default: 20)
+    """
+    from inference import run_inference_and_visualize
+    
+    print(f"\n{'='*80}")
+    print(f"RUNNING TEST INFERENCE - Epoch {epoch} - {phase_name}")
+    print("="*80)
+    
+    model.eval()
+    samples_processed = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_dataloader):
+            # Run inference and visualize
+            save_path = run_inference_and_visualize(
+                model=model,
+                batch=batch,
+                phase_name=phase_name,
+                device=device,
+                step=f"test_epoch{epoch}_batch{batch_idx}",
+                output_dir="./test_inference_visualizations"
+            )
+            
+            samples_processed += batch['earlyG1'].shape[0]
+            print(f"✓ Processed test batch {batch_idx+1}, total samples: {samples_processed}")
+            
+            # Stop after num_samples
+            if samples_processed >= num_samples:
+                break
+    
+    print(f"✓ Completed test inference on {samples_processed} samples")
+    print("="*80 + "\n")
+
+
 ############################################
 # 7) MAIN TRAINING
 ############################################
@@ -606,14 +639,14 @@ def main():
     print(f"Vector dimension: {VEC_DIM}, Matrix size: {N}x{N}")
     print(f"Batch size: {BATCH_SIZE}, Epochs: {NUM_EPOCHS}")
     
-    # Create time embedding module
-    time_embed_module = TimeEmbedding(d_t, max_timesteps=T)
+    # Create noise level embedding module (for gamma)
+    noise_embed_module = NoiseEmbedding(d_t, max_value=1000)
     
     # Initialize SR3-style U-Net model
     model = SR3UNet(
         vec_dim=VEC_DIM,
         n=N,
-        time_embed_module=time_embed_module,
+        noise_embed_module=noise_embed_module,
         base_ch=64            # Base channels for U-Net (64 -> 128 -> 256 -> 512)
     ).to(DEVICE)
     
@@ -639,17 +672,40 @@ def main():
     print(f"Number of regions: {len(cell_cycle_loader)}")
     print(f"Available phases: {cell_cycle_loader.get_available_phases()}")
     
-    # Wrap in PyTorch Dataset and DataLoader for batching
+    # Wrap in PyTorch Dataset
     dataset = CellCycleDataset(cell_cycle_loader)
-    dataloader = TorchDataLoader(
-        dataset,
+    
+    # Create train/test split (99% train, 1% test)
+    total_size = len(dataset)
+    test_size = max(20, int(0.01 * total_size))  # At least 20 samples for test
+    train_size = total_size - test_size
+    
+    train_dataset, test_dataset = random_split(
+        dataset, 
+        [train_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # Reproducible split
+    )
+    
+    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+    
+    # Create dataloaders
+    train_dataloader = TorchDataLoader(
+        train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues with hicstraw
         pin_memory=True if torch.cuda.is_available() else False
     )
     
-    print(f"Number of batches per epoch: {len(dataloader)}")
+    test_dataloader = TorchDataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
+    )
+    
+    print(f"Number of batches per epoch: {len(train_dataloader)}")
     print("="*80)
     
     # Training loop
@@ -660,8 +716,8 @@ def main():
         epoch_losses = []
         model.train()
         
-        # Iterate through batches
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [{CURRENT_PHASE}]")
+        # Iterate through training batches
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [{CURRENT_PHASE}]")
         for batch_idx, batch in enumerate(pbar):
             loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE)
             epoch_losses.append(loss)
@@ -670,14 +726,14 @@ def main():
             # Update progress bar
             pbar.set_postfix({'loss': f"{loss:.4f}"})
             
-            # Visualize every 200 steps (reduced frequency to save memory)
-            if global_step % 200 == 0:
-                test_training(model, batch, DEVICE, global_step, CURRENT_PHASE)
+            # # Visualize every 200 steps (reduced frequency to save memory)
+            # if global_step % 50 == 0:
+            #     test_training(model, batch, DEVICE, global_step, CURRENT_PHASE)
                 
-                # Clear CUDA memory cache to prevent OOM
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()  # Force garbage collection
+            #     # Clear CUDA memory cache to prevent OOM
+            #     if torch.cuda.is_available():
+            #         torch.cuda.empty_cache()
+            #     gc.collect()  # Force garbage collection
         
         # Epoch summary
         avg_loss = np.mean(epoch_losses)
@@ -705,11 +761,35 @@ def main():
             'loss': avg_loss,
             'global_step': global_step,
         }, checkpoint_path)
+        print(f"✓ Saved epoch checkpoint: {checkpoint_path}")
     
+    # Training complete - run test inference
     print("\n" + "="*80)
     print(f"Training complete for {CURRENT_PHASE}!")
     print(f"Best loss: {best_loss:.6f}")
     print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
+    print("="*80)
+    
+    # Run test inference on held-out test set
+    print(f"\n{'='*80}")
+    print(f"RUNNING TEST SET EVALUATION")
+    print("="*80)
+    run_test_inference(
+        model=model,
+        test_dataloader=test_dataloader,
+        device=DEVICE,
+        phase_name=CURRENT_PHASE,
+        epoch=NUM_EPOCHS,
+        num_samples=20
+    )
+    
+    # Clear memory after test inference
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    
+    print(f"\n{'='*80}")
+    print(f"All tasks complete for {CURRENT_PHASE}!")
     print("="*80)
     
     # Cleanup

@@ -105,20 +105,25 @@ class CellCycleDataLoader:
         """
         Generate all 64x64 regions by sliding every 10 pixels along the diagonal.
         Skips the beginning of chromosomes (typically no mappable Hi-C data at start of chromosome).
-        
+        Excludes sex chromosomes (X and Y).
+
         Returns:
             List of region strings like "1:10000000-10640000" (0-based coordinates, no chr prefix)
         """
         regions = []
-        
+
         for chrom, size in self.chromosome_sizes.items():
+            # Skip sex chromosomes
+            if chrom in ['X', 'Y']:
+                continue
+            
             # Start from min_start_position (skip beginning of chromosome)
             start = self.min_start_position
             while start + self.region_size <= size:
                 end = start + self.region_size
                 regions.append(f"{chrom}:{start}-{end}")
                 start += self.step_bp
-        
+
         return regions
     
     def _compute_chipseq_per_chromosome_stats(self):

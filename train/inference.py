@@ -17,14 +17,14 @@ class Inference:
     Implements SR3 Algorithm 2: iterative refinement using noise prediction.
     """
     
-    def __init__(self, model, device, T=1000, gamma_min=1e-4, gamma_max=0.02):
+    def __init__(self, model, device, T=1000, gamma_min=1e-4, gamma_max=1.0):
         """
         Args:
             model: Trained SR3UNet model (predicts noise ε)
             device: torch device
             T: Number of diffusion timesteps
-            gamma_min: Minimum noise level
-            gamma_max: Maximum noise level
+            gamma_min: Minimum noise level (almost clean) - default 1e-4
+            gamma_max: Maximum noise level (pure noise) - default 1.0
         """
         self.model = model
         self.device = device
@@ -33,8 +33,9 @@ class Inference:
         self.gamma_max = gamma_max
         
         # Load noise schedule from training
-        from train_diffusion import gammas
+        from train_diffusion import gammas, alphas
         self.gammas = gammas.to(device)
+        self.alphas = alphas.to(device)
         
         self.model.eval()
     
@@ -52,26 +53,23 @@ class Inference:
         """
         batch_size, vec_dim = bulk_vec.shape
         
-        # Start from pure Gaussian noise y_T ~ N(0, I)
+        # SR3 Algorithm 2 Line 1: Start from pure Gaussian noise
         y_t = torch.randn(batch_size, vec_dim, device=self.device)
         
         # Iteratively denoise: t = T-1, T-2, ..., 1
         # SR3 Algorithm 2: same formula for all steps, z=0 only at final step (t=1)
         for t_idx in range(self.T - 1, 0, -1):
-            t = torch.full((batch_size,), t_idx, device=self.device, dtype=torch.long)
-            
-            # Get noise levels
+            # Get noise levels from schedule
             gamma_t = self.gammas[t_idx]
-            gamma_prev = self.gammas[t_idx - 1]
-            
-            # Compute α_t = γ_{t-1} / γ_t
-            alpha_t = gamma_prev / gamma_t
+            # Get alpha_t from schedule
+            alpha_t = self.alphas[t_idx]
             sqrt_alpha_t = torch.sqrt(alpha_t)
             sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
             sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
 
-            # Predict noise ε
-            eps_pred = self.model(y_t, t, chip_1d, bulk_vec)
+            # Predict noise ε - pass gamma directly to model
+            gamma_batch = torch.full((batch_size,), gamma_t, device=self.device)
+            eps_pred = self.model(y_t, gamma_batch, chip_1d, bulk_vec)
 
             # SR3 Algorithm 2: z ~ N(0,I) if t > 1, else z = 0
             if t_idx > 1:
@@ -153,7 +151,14 @@ class Inference:
         
         # Compute metrics
         mse = np.mean((gt_matrix - sampled_matrix) ** 2)
-        corr = np.corrcoef(gt_matrix.flatten(), sampled_matrix.flatten())[0, 1]
+        
+        # Correlation (handle degenerate cases early in training)
+        try:
+            corr = np.corrcoef(gt_matrix.flatten(), sampled_matrix.flatten())[0, 1]
+            if np.isnan(corr):
+                corr = 0.0  # Zero variance or invalid data
+        except:
+            corr = 0.0  # Fallback for any issues
         
         region = batch.get('region', ['unknown'])[0]
         fig.suptitle(
