@@ -10,4 +10,14 @@ __pycache__/
 train/logs/
 train/images/
 preprocess/CHIPSEQ_NORMALIZATION.md
+preprocess/hic_visualizations/
+preprocess/simple_hic_plot.py
+preprocess/simple_hic_plot.sh
+preprocess/visualize_hic.py
+preprocess/visualize_hic.sh
+
+
+# Ignore any folder in train with "visualizations" in the name (regex)
+train/*visualizations*/
+
 

@@ -140,7 +140,7 @@ d_t = 256             # time embedding dimension
 
 BATCH_SIZE = 32       # Increased from 8 since we have more memory with single model
 LR = 1e-4
-NUM_EPOCHS = 1        # More epochs since we're training one at a time
+NUM_EPOCHS = 2        # More epochs since we're training one at a time
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Model checkpoints directory
@@ -323,6 +323,122 @@ class BigGANResBlock(nn.Module):
 
 
 ############################################
+# 3.5) CROSS-ATTENTION CONDITIONING BLOCK
+############################################
+class CrossAttentionCond(nn.Module):
+    """
+    Cross-attention conditioning block for injecting ChIP-seq signals into U-Net features.
+    
+    Implements text-style cross-attention:
+    - Q from spatial tokens of image features X
+    - K/V from ChIP-seq token embeddings
+    
+    Args:
+        d_model: Model dimension (should match feature map channels at 16x16)
+        d_cond: Hidden dimension for ChIP-seq embedding (default: 32)
+        n_heads: Number of attention heads (default: 4)
+        dropout: Dropout rate (default: 0.0)
+    """
+    def __init__(self, d_model=128, d_cond=32, n_heads=4, dropout=0.0):
+        super().__init__()
+        self.d_model = d_model
+        self.d_cond = d_cond
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        
+        assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+        
+        # ChIP-seq embedding path (conditioning)
+        # Tokenwise MLP: each ChIP-seq value -> d_cond embedding
+        self.chip_embed = nn.Sequential(
+            nn.Linear(1, d_cond),
+            nn.GELU(),
+            nn.Linear(d_cond, d_cond)
+        )
+        
+        # Project to K and V
+        self.k_proj = nn.Linear(d_cond, d_model)
+        self.v_proj = nn.Linear(d_cond, d_model)
+        
+        # Query projection from image features
+        self.q_proj = nn.Linear(d_model, d_model)
+        
+        # Output projection
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        # Layer normalization (pre-norm style)
+        self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, X, S):
+        """
+        Args:
+            X: (B, C, 16, 16) feature map where C == d_model
+            S: (B, 64) or (B, 64, 1) ChIP-seq signal
+        
+        Returns:
+            X_out: (B, C, 16, 16) conditioned feature map
+        """
+        B, C, H, W = X.shape
+        assert H == 16 and W == 16, f"Expected 16x16, got {H}x{W}"
+        assert C == self.d_model, f"Channel mismatch: X has {C}, expected {self.d_model}"
+        
+        # Handle ChIP-seq input shape
+        if S.dim() == 3:
+            S = S.squeeze(-1)  # (B, 64, 1) -> (B, 64)
+        assert S.shape == (B, 64), f"Expected S shape (B, 64), got {S.shape}"
+        
+        # 1) ChIP-seq embedding path
+        # Expand to (B, 64, 1) for tokenwise MLP
+        S_expanded = S.unsqueeze(-1)  # (B, 64, 1)
+        E = self.chip_embed(S_expanded)  # (B, 64, d_cond)
+        
+        # Project to K and V
+        K = self.k_proj(E)  # (B, 64, d_model)
+        V = self.v_proj(E)  # (B, 64, d_model)
+        
+        # 2) Query path from image features
+        # Reshape spatial map into tokens
+        X_tokens = X.permute(0, 2, 3, 1).reshape(B, H * W, self.d_model)  # (B, 256, d_model)
+        
+        # Apply pre-norm
+        X_tokens_norm = self.norm(X_tokens)
+        
+        # Project to Q
+        Q = self.q_proj(X_tokens_norm)  # (B, 256, d_model)
+        
+        # 3) Multi-head cross-attention
+        # Reshape for multi-head: (B, n_heads, seq_len, d_head)
+        Q = Q.view(B, H * W, self.n_heads, self.d_head).transpose(1, 2)  # (B, n_heads, 256, d_head)
+        K = K.view(B, 64, self.n_heads, self.d_head).transpose(1, 2)     # (B, n_heads, 64, d_head)
+        V = V.view(B, 64, self.n_heads, self.d_head).transpose(1, 2)     # (B, n_heads, 64, d_head)
+        
+        # Compute attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_head ** 0.5)  # (B, n_heads, 256, 64)
+        attn_weights = F.softmax(scores, dim=-1)  # (B, n_heads, 256, 64)
+        
+        # Apply attention to values
+        M_heads = torch.matmul(attn_weights, V)  # (B, n_heads, 256, d_head)
+        
+        # Merge heads
+        M_tokens = M_heads.transpose(1, 2).contiguous().view(B, H * W, self.d_model)  # (B, 256, d_model)
+        
+        # Output projection
+        M_tokens = self.out_proj(M_tokens)  # (B, 256, d_model)
+        
+        # 4) Reshape and residual fuse
+        M = M_tokens.reshape(B, H, W, self.d_model).permute(0, 3, 1, 2)  # (B, d_model, 16, 16)
+        M = self.dropout(M)
+        
+        # Residual connection
+        X_out = X + M  # (B, C, 16, 16)
+        
+        return X_out
+
+
+############################################
 # 4) SR3-STYLE U-NET (Denoised Image Predictor)
 ############################################
 class SR3UNet(nn.Module):
@@ -333,6 +449,7 @@ class SR3UNet(nn.Module):
         - Input: Concatenate noisy image + bulk Hi-C conditioning → (B, 2, 64, 64)
         - Four downsampling stages: 64 → 32 → 16 → 8
         - BigGAN residual blocks at each resolution
+        - Cross-attention conditioning with ChIP-seq at 16×16 (encoder + decoder)
         - Standard U-Net skip connections (concatenation)
         - Output: Predicted noise ε
     """
@@ -358,6 +475,13 @@ class SR3UNet(nn.Module):
         
         # Level 3: 16x16 @ base_ch*4
         self.enc3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
+        # Cross-attention conditioning at 16x16 (encoder)
+        self.enc3_cross_attn = CrossAttentionCond(
+            d_model=base_ch * 4,  # 256 when base_ch=64
+            d_cond=64,
+            n_heads=4,
+            dropout=0.0
+        )
         self.enc3_down = BigGANResBlock(base_ch * 4, base_ch * 8, noise_dim, down=True)
         
         # ---- BOTTLENECK: 8x8 @ base_ch*8 ----
@@ -371,6 +495,13 @@ class SR3UNet(nn.Module):
         self.dec3_up = BigGANResBlock(base_ch * 8, base_ch * 4, noise_dim, up=True)
         self.dec3_reduce = nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)  # After concat
         self.dec3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
+        # Cross-attention conditioning at 16x16 (decoder)
+        self.dec3_cross_attn = CrossAttentionCond(
+            d_model=base_ch * 4,  # 256 when base_ch=64
+            d_cond=64,
+            n_heads=4,
+            dropout=0.0
+        )
         
         # Level 2: 16x16 -> 32x32 @ base_ch*2
         self.dec2_up = BigGANResBlock(base_ch * 4, base_ch * 2, noise_dim, up=True)
@@ -400,7 +531,7 @@ class SR3UNet(nn.Module):
         Args:
             x_t_vec:  (B, vec_dim) noisy Hi-C vector y_γ
             gamma:    (B,) or (B, 1) noise level γ ∈ [0, 1]
-            chip_1d:  (B, N) ChIP-seq signal (UNUSED - kept for compatibility)
+            chip_1d:  (B, 64) ChIP-seq signal (used in cross-attention at 16x16)
             bulk_vec: (B, vec_dim) bulk Hi-C vector (conditioning)
         
         Returns:
@@ -440,6 +571,8 @@ class SR3UNet(nn.Module):
         
         # Level 3: 16x16
         h = self.enc3(h, noise_emb)           # (B, base_ch*4, 16, 16)
+        # Apply cross-attention conditioning with ChIP-seq
+        h = self.enc3_cross_attn(h, chip_1d)  # (B, base_ch*4, 16, 16)
         skip3 = h                             # Save for skip connection
         h = self.enc3_down(h, noise_emb)      # (B, base_ch*8, 8, 8)
         
@@ -453,6 +586,8 @@ class SR3UNet(nn.Module):
         h = torch.cat([h, skip3], dim=1)              # (B, base_ch*8, 16, 16)
         h = self.dec3_reduce(h)                       # (B, base_ch*4, 16, 16)
         h = self.dec3(h, noise_emb)                   # (B, base_ch*4, 16, 16)
+        # Apply cross-attention conditioning with ChIP-seq
+        h = self.dec3_cross_attn(h, chip_1d)          # (B, base_ch*4, 16, 16)
         
         # Level 2: 16x16 -> 32x32
         h = self.dec2_up(h, noise_emb)                # (B, base_ch*2, 32, 32)
@@ -662,29 +797,45 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
     
+    # Holdout chromosome 2 for testing
+    HOLD_OUT_CHROMOSOME = "2"
+    
     cell_cycle_loader = CellCycleDataLoader(
         data_dir=data_dir,
         resolution=10000,
         region_size=640000,
-        normalization="VC"
+        normalization="VC",
+        hold_out_chromosome=HOLD_OUT_CHROMOSOME
     )
     
-    print(f"Number of regions: {len(cell_cycle_loader)}")
+    print(f"Training regions: {len(cell_cycle_loader)}")
+    print(f"Holdout regions (chr{HOLD_OUT_CHROMOSOME}): {len(cell_cycle_loader.get_holdout_regions())}")
     print(f"Available phases: {cell_cycle_loader.get_available_phases()}")
     
-    # Wrap in PyTorch Dataset
-    dataset = CellCycleDataset(cell_cycle_loader)
+    # Create training dataset (excludes holdout chromosome)
+    train_dataset = CellCycleDataset(cell_cycle_loader)
     
-    # Create train/test split (99% train, 1% test)
-    total_size = len(dataset)
-    test_size = max(20, int(0.01 * total_size))  # At least 20 samples for test
-    train_size = total_size - test_size
+    # Create test dataset from holdout chromosome
+    holdout_regions = cell_cycle_loader.get_holdout_regions()
+    if len(holdout_regions) == 0:
+        raise ValueError(f"No regions found for holdout chromosome '{HOLD_OUT_CHROMOSOME}'")
     
-    train_dataset, test_dataset = random_split(
-        dataset, 
-        [train_size, test_size],
-        generator=torch.Generator().manual_seed(42)  # Reproducible split
-    )
+    # Create a separate loader for holdout regions
+    # We'll create a custom dataset that indexes by region string
+    class HoldoutDataset(Dataset):
+        """Dataset for holdout chromosome regions."""
+        def __init__(self, loader, holdout_regions):
+            self.loader = loader
+            self.holdout_regions = holdout_regions
+        
+        def __len__(self):
+            return len(self.holdout_regions)
+        
+        def __getitem__(self, idx):
+            region_str = self.holdout_regions[idx]
+            return self.loader[region_str]
+    
+    test_dataset = HoldoutDataset(cell_cycle_loader, holdout_regions)
     
     print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
     
