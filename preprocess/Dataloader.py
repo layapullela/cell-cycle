@@ -35,6 +35,7 @@ class CellCycleDataLoader:
         region_size: int = 640000,  # 640kb regions (64 pixels at 10kb resolution)
         normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage.
         chipseq_file: Optional[str] = None,  # Path to ChIP-seq bigWig file
+        hold_out_chromosome: Optional[str] = None,  # Chromosome to hold out for testing (e.g., "2")
     ):
         """
         Initialize the DataLoader.
@@ -45,12 +46,14 @@ class CellCycleDataLoader:
             region_size: Size of square region to extract in base pairs (default: 640000 for 640kb = 64 pixels)
             normalization: Normalization method for Hi-C data (NONE, VC, VC_SQRT, KR)
             chipseq_file: Optional path to ChIP-seq bigWig file (if None, looks for default file)
+            hold_out_chromosome: Optional chromosome to exclude from training (e.g., "2" for chr2)
         """
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.region_size = region_size
         self.normalization = normalization
         self.image_size = region_size // resolution  # 50 pixels for 500kb at 10kb
+        self.hold_out_chromosome = hold_out_chromosome  # Chromosome to hold out for testing
         
         # Step size: sample every 10 pixels along the diagonal
         self.step_pixels = 10
@@ -94,37 +97,55 @@ class CellCycleDataLoader:
         # Generate regions by sliding along diagonal every 10 pixels
         # Skip first 3MB of each chromosome (typically no mappable data)
         self.min_start_position = 3000000  # 3MB
-        self.regions = self._generate_regions()
+        self.regions, self.holdout_regions = self._generate_regions()
         
         # Compute ChIP-seq statistics PER CHROMOSOME (after regions are generated)
         if self.chipseq_bw is not None:
             print(f"Loaded ChIP-seq from: {chipseq_file}")
             self._compute_chipseq_per_chromosome_stats()
     
-    def _generate_regions(self) -> List[str]:
+    def _generate_regions(self):
         """
         Generate all 64x64 regions by sliding every 10 pixels along the diagonal.
         Skips the beginning of chromosomes (typically no mappable Hi-C data at start of chromosome).
         Excludes sex chromosomes (X and Y).
+        Separates holdout chromosome regions if specified.
 
         Returns:
-            List of region strings like "1:10000000-10640000" (0-based coordinates, no chr prefix)
+            Tuple of (training_regions, holdout_regions):
+            - training_regions: List of region strings for training
+            - holdout_regions: List of region strings for holdout chromosome (empty if no holdout)
         """
-        regions = []
+        training_regions = []
+        holdout_regions = []
 
         for chrom, size in self.chromosome_sizes.items():
             # Skip sex chromosomes
             if chrom in ['X', 'Y']:
                 continue
             
+            # Check if this is the holdout chromosome
+            is_holdout = (self.hold_out_chromosome is not None and 
+                         str(chrom) == str(self.hold_out_chromosome))
+            
             # Start from min_start_position (skip beginning of chromosome)
             start = self.min_start_position
             while start + self.region_size <= size:
                 end = start + self.region_size
-                regions.append(f"{chrom}:{start}-{end}")
+                region_str = f"{chrom}:{start}-{end}"
+                
+                if is_holdout:
+                    holdout_regions.append(region_str)
+                else:
+                    training_regions.append(region_str)
+                
                 start += self.step_bp
 
-        return regions
+        if self.hold_out_chromosome:
+            print(f"Holdout chromosome '{self.hold_out_chromosome}': {len(holdout_regions)} regions")
+            print(f"Training regions: {len(training_regions)} regions")
+        
+        return training_regions, holdout_regions
     
     def _compute_chipseq_per_chromosome_stats(self):
         """
@@ -315,8 +336,17 @@ class CellCycleDataLoader:
             return np.zeros(self.image_size, dtype=np.float32)
     
     def __len__(self) -> int:
-        """Return number of regions."""
+        """Return number of training regions (excludes holdout chromosome)."""
         return len(self.regions)
+    
+    def get_holdout_regions(self) -> List[str]:
+        """
+        Get regions from the holdout chromosome (for testing).
+        
+        Returns:
+            List of region strings from holdout chromosome, empty list if no holdout specified
+        """
+        return self.holdout_regions if hasattr(self, 'holdout_regions') else []
     
     def __getitem__(self, idx: Union[int, str]) -> Dict[str, Union[str, np.ndarray]]:
         """
@@ -341,7 +371,11 @@ class CellCycleDataLoader:
         """
         # Handle region string indexing
         if isinstance(idx, str):
-            if idx not in self.regions:
+            # Check both training and holdout regions
+            all_regions = self.regions
+            if hasattr(self, 'holdout_regions'):
+                all_regions = self.regions + self.holdout_regions
+            if idx not in all_regions:
                 raise KeyError(f"Region {idx} not found in regions list")
             region = idx
         else:
