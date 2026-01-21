@@ -22,6 +22,7 @@ class CellCycleDataLoader:
     - earlyG1: numpy array (flattened upper triangular vector, shape: (2080,))
     - lateG1: numpy array (flattened upper triangular vector, shape: (2080,))
     - midG1: numpy array (flattened upper triangular vector, shape: (2080,))
+    - anatelo: numpy array (flattened upper triangular vector, shape: (2080,))
     - chip_seq: numpy array (shape: (64,)) - ChIP-seq signal for the region
     * dimention calculation: 64 x 65 x 0.5 = 2080
     
@@ -41,7 +42,7 @@ class CellCycleDataLoader:
         Initialize the DataLoader.
         
         Args:
-            data_dir: Directory containing .hic files (earlyG1.hic, lateG1.hic, midG1.hic)
+            data_dir: Directory containing .hic files (earlyG1.hic, lateG1.hic, midG1.hic, anatelo.hic)
             resolution: Bin size in base pairs (default: 10000 for 10kb)
             region_size: Size of square region to extract in base pairs (default: 640000 for 640kb = 64 pixels)
             normalization: Normalization method for Hi-C data (NONE, VC, VC_SQRT, KR)
@@ -63,7 +64,8 @@ class CellCycleDataLoader:
         self.chipseq_bw = None
         self.chipseq_chrom_stats = {}  # Per-chromosome mean and std
         if chipseq_file is None:
-            chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
+            #chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
+            chipseq_file = self.data_dir / "GSE129997_CTCF_asyn.bw"
         if chipseq_file.exists() if isinstance(chipseq_file, Path) else Path(chipseq_file).exists():
                 self.chipseq_bw = pyBigWig.open(str(chipseq_file))
         
@@ -72,6 +74,7 @@ class CellCycleDataLoader:
             'earlyG1': 'earlyG1.hic',
             'lateG1': 'lateG1.hic',
             'midG1': 'midG1.hic',
+            'anatelo': 'anatelo.hic',
         }
         
         # Load available phase files
@@ -311,14 +314,14 @@ class CellCycleDataLoader:
             
             for chrom_name in chrom_names:
                 try:
-                    # Get average signal per bin
+                    # Get max signal per bin
                     bin_size = self.resolution
                     signal = np.zeros(self.image_size, dtype=np.float32)
                     
                     for i in range(self.image_size):
                         bin_start = start + i * bin_size
                         bin_end = start + (i + 1) * bin_size
-                        values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="mean")
+                        values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
                         signal[i] = values[0] if values[0] is not None else 0.0
                     
                     # Apply log transformation (z-score normalization in __getitem__)
@@ -356,7 +359,7 @@ class CellCycleDataLoader:
             idx: Integer index or region string like "1:10000000-10640000"
         
         Returns:
-            Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'chip_seq'
+            Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'anatelo', 'chip_seq'
             
             Hi-C phases (shape: (2080,) each):
                 - Log-transformed: log1p(x)
