@@ -1,7 +1,7 @@
 """
 Cell-Cycle Hi-C Phase Decomposition via SR3-Style Iterative Refinement
 
-Train 3 separate conditional denoisers (one per phase: earlyG1/midG1/lateG1)
+Train 4 separate conditional denoisers (one per phase: earlyG1/midG1/lateG1/anatelo)
 Each denoiser iteratively refines noisy bulk Hi-C toward phase-specific data
 
 SR3 NOTATION (from "Image Super-Resolution via Iterative Refinement"):
@@ -125,11 +125,11 @@ class CellCycleDataset(Dataset):
 ############################################
 # 1) CONFIG
 ############################################
-PHASES = ["earlyG1", "midG1", "lateG1"]
+PHASES = ["earlyG1", "midG1", "lateG1", "anatelo"]
 
 # MEMORY OPTIMIZATION: Train one phase at a time
-# Change this to 'earlyG1', 'midG1', or 'lateG1' to train different phases
-CURRENT_PHASE = 'earlyG1'  # <-- CHANGE THIS to train different phases
+# Change this to 'earlyG1', 'midG1', 'lateG1', or 'anatelo' to train different phases
+CURRENT_PHASE = 'anatelo'  # <-- CHANGE THIS to train different phases
 
 T = 1000              # diffusion steps
 N = 64                # contact map size (64 x 64)
@@ -140,12 +140,16 @@ d_t = 256             # time embedding dimension
 
 BATCH_SIZE = 32       # Increased from 8 since we have more memory with single model
 LR = 1e-4
-NUM_EPOCHS = 2        # More epochs since we're training one at a time
+NUM_EPOCHS = 1        # More epochs since we're training one at a time
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Model checkpoints directory
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+# Resume training from checkpoint (set to None to start from scratch)
+# Example: RESUME_CHECKPOINT = "anatelo_epoch2_1-21.pth"
+RESUME_CHECKPOINT = None #"anatelo_epoch2_1-21.pth"
 
 
 
@@ -331,15 +335,15 @@ class CrossAttentionCond(nn.Module):
     
     Implements text-style cross-attention:
     - Q from spatial tokens of image features X
-    - K/V from ChIP-seq token embeddings
+    - K/V from pre-embedded ChIP-seq tokens (embedding computed once in SR3UNet)
     
     Args:
         d_model: Model dimension (should match feature map channels at 16x16)
-        d_cond: Hidden dimension for ChIP-seq embedding (default: 32)
+        d_cond: Hidden dimension for ChIP-seq embedding (default: 64)
         n_heads: Number of attention heads (default: 4)
         dropout: Dropout rate (default: 0.0)
     """
-    def __init__(self, d_model=128, d_cond=32, n_heads=4, dropout=0.0):
+    def __init__(self, d_model=128, d_cond=64, n_heads=4, dropout=0.0):
         super().__init__()
         self.d_model = d_model
         self.d_cond = d_cond
@@ -348,15 +352,7 @@ class CrossAttentionCond(nn.Module):
         
         assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
         
-        # ChIP-seq embedding path (conditioning)
-        # Tokenwise MLP: each ChIP-seq value -> d_cond embedding
-        self.chip_embed = nn.Sequential(
-            nn.Linear(1, d_cond),
-            nn.GELU(),
-            nn.Linear(d_cond, d_cond)
-        )
-        
-        # Project to K and V
+        # Project pre-embedded ChIP-seq to K and V
         self.k_proj = nn.Linear(d_cond, d_model)
         self.v_proj = nn.Linear(d_cond, d_model)
         
@@ -366,17 +362,21 @@ class CrossAttentionCond(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(d_model, d_model)
         
+        # Zero-initialize output projection for stability
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        
         # Dropout
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         
         # Layer normalization (pre-norm style)
         self.norm = nn.LayerNorm(d_model)
     
-    def forward(self, X, S):
+    def forward(self, X, chip_embedding):
         """
         Args:
             X: (B, C, 16, 16) feature map where C == d_model
-            S: (B, 64) or (B, 64, 1) ChIP-seq signal
+            chip_embedding: (B, 64, d_cond) pre-embedded ChIP-seq tokens
         
         Returns:
             X_out: (B, C, 16, 16) conditioned feature map
@@ -385,19 +385,13 @@ class CrossAttentionCond(nn.Module):
         assert H == 16 and W == 16, f"Expected 16x16, got {H}x{W}"
         assert C == self.d_model, f"Channel mismatch: X has {C}, expected {self.d_model}"
         
-        # Handle ChIP-seq input shape
-        if S.dim() == 3:
-            S = S.squeeze(-1)  # (B, 64, 1) -> (B, 64)
-        assert S.shape == (B, 64), f"Expected S shape (B, 64), got {S.shape}"
+        # chip_embedding should be (B, 64, d_cond)
+        assert chip_embedding.shape == (B, 64, self.d_cond), \
+            f"Expected chip_embedding shape (B, 64, {self.d_cond}), got {chip_embedding.shape}"
         
-        # 1) ChIP-seq embedding path
-        # Expand to (B, 64, 1) for tokenwise MLP
-        S_expanded = S.unsqueeze(-1)  # (B, 64, 1)
-        E = self.chip_embed(S_expanded)  # (B, 64, d_cond)
-        
-        # Project to K and V
-        K = self.k_proj(E)  # (B, 64, d_model)
-        V = self.v_proj(E)  # (B, 64, d_model)
+        # Project pre-embedded ChIP-seq to K and V
+        K = self.k_proj(chip_embedding)  # (B, 64, d_model)
+        V = self.v_proj(chip_embedding)  # (B, 64, d_model)
         
         # 2) Query path from image features
         # Reshape spatial map into tokens
@@ -461,6 +455,18 @@ class SR3UNet(nn.Module):
 
         noise_dim = self.noise_embed.mlp[-1].out_features
         
+        # ---- Shared ChIP-seq embedding (computed once, used by both cross-attention blocks) ----
+        d_cond = 64  # ChIP-seq embedding dimension
+        self.chip_embed = nn.Sequential(
+            nn.Linear(1, d_cond),
+            nn.LayerNorm(d_cond),  # Normalize ChIP-seq embeddings
+            nn.GELU(),
+            nn.Linear(d_cond, d_cond)
+        )
+        
+        # Learnable parameter to control ChIP-seq conditioning strength
+        self.chip_scale = nn.Parameter(torch.zeros(1))  # Start at 0 (exp(0) = 1.0 = full conditioning)
+        
         # ---- Input: Concatenate noisy + conditioning → (B, 2, 64, 64) ----
         self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
         
@@ -475,10 +481,10 @@ class SR3UNet(nn.Module):
         
         # Level 3: 16x16 @ base_ch*4
         self.enc3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
-        # Cross-attention conditioning at 16x16 (encoder)
+        # Cross-attention conditioning at 16x16 (encoder) - uses shared chip_embedding
         self.enc3_cross_attn = CrossAttentionCond(
             d_model=base_ch * 4,  # 256 when base_ch=64
-            d_cond=64,
+            d_cond=d_cond,  # 64
             n_heads=4,
             dropout=0.0
         )
@@ -495,12 +501,12 @@ class SR3UNet(nn.Module):
         self.dec3_up = BigGANResBlock(base_ch * 8, base_ch * 4, noise_dim, up=True)
         self.dec3_reduce = nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)  # After concat
         self.dec3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
-        # Cross-attention conditioning at 16x16 (decoder)
+        # Cross-attention conditioning at 16x16 (decoder) - uses shared chip_embedding
         self.dec3_cross_attn = CrossAttentionCond(
             d_model=base_ch * 4,  # 256 when base_ch=64
-            d_cond=64,
+            d_cond=d_cond,  # 64
             n_heads=4,
-            dropout=0.0
+            dropout=0.2
         )
         
         # Level 2: 16x16 -> 32x32 @ base_ch*2
@@ -558,6 +564,15 @@ class SR3UNet(nn.Module):
         # --- Input convolution ---
         h = self.input_conv(x_in)  # (B, base_ch, 64, 64)
         
+        # --- Compute ChIP-seq embedding once (shared by both cross-attention blocks) ---
+        # Handle ChIP-seq input shape: (B, 64) -> (B, 64, 1)
+        if chip_1d.dim() == 2:
+            chip_1d_expanded = chip_1d.unsqueeze(-1)  # (B, 64, 1)
+        else:
+            chip_1d_expanded = chip_1d  # Already (B, 64, 1)
+            print("chip_1d_expanded shape: ", chip_1d_expanded.shape)
+        chip_embedding = self.chip_embed(chip_1d_expanded)  # (B, 64, d_cond)
+        
         # ========== ENCODER ==========
         # Level 1: 64x64
         h = self.enc1(h, noise_emb)           # (B, base_ch, 64, 64)
@@ -571,8 +586,11 @@ class SR3UNet(nn.Module):
         
         # Level 3: 16x16
         h = self.enc3(h, noise_emb)           # (B, base_ch*4, 16, 16)
-        # Apply cross-attention conditioning with ChIP-seq
-        h = self.enc3_cross_attn(h, chip_1d)  # (B, base_ch*4, 16, 16)
+        skip3_before_attn = h                 # Save before cross-attention for scaling
+        # Apply cross-attention conditioning with shared ChIP-seq embedding
+        h = self.enc3_cross_attn(h, chip_embedding)  # (B, base_ch*4, 16, 16)
+        # Scale ChIP-seq conditioning contribution
+        h = skip3_before_attn + self.chip_scale.exp() * (h - skip3_before_attn)  # Exponential ensures positive, starts at 1.0
         skip3 = h                             # Save for skip connection
         h = self.enc3_down(h, noise_emb)      # (B, base_ch*8, 8, 8)
         
@@ -586,8 +604,11 @@ class SR3UNet(nn.Module):
         h = torch.cat([h, skip3], dim=1)              # (B, base_ch*8, 16, 16)
         h = self.dec3_reduce(h)                       # (B, base_ch*4, 16, 16)
         h = self.dec3(h, noise_emb)                   # (B, base_ch*4, 16, 16)
-        # Apply cross-attention conditioning with ChIP-seq
-        h = self.dec3_cross_attn(h, chip_1d)          # (B, base_ch*4, 16, 16)
+        skip3_before_attn = h                         # Save before cross-attention for scaling
+        # Apply cross-attention conditioning with shared ChIP-seq embedding
+        h = self.dec3_cross_attn(h, chip_embedding)          # (B, base_ch*4, 16, 16)
+        # Scale ChIP-seq conditioning contribution
+        h = skip3_before_attn + self.chip_scale.exp() * (h - skip3_before_attn)  # Exponential ensures positive, starts at 1.0
         
         # Level 2: 16x16 -> 32x32
         h = self.dec2_up(h, noise_emb)                # (B, base_ch*2, 32, 32)
@@ -618,6 +639,59 @@ class SR3UNet(nn.Module):
 
 
 ############################################
+# 5.5) CHECKPOINT LOADING
+############################################
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
+    """
+    Load checkpoint for resuming training.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file (relative to CHECKPOINT_DIR or absolute)
+        model: Model to load weights into
+        optimizer: Optimizer to load state into
+        device: Device to load checkpoint on
+    
+    Returns:
+        Tuple of (start_epoch, global_step, best_loss)
+        Returns (0, 0, float('inf')) if checkpoint not found
+    """
+    if checkpoint_path is None:
+        return 0, 0, float('inf')
+    
+    # Resolve checkpoint path
+    path = Path(checkpoint_path)
+    if not path.is_absolute():
+        if checkpoint_path.startswith("checkpoints/"):
+            path = CHECKPOINT_DIR / checkpoint_path.replace("checkpoints/", "")
+        else:
+            path = CHECKPOINT_DIR / checkpoint_path
+    
+    if not path.exists():
+        print(f"WARNING: Checkpoint not found: {path}")
+        return 0, 0, float('inf')
+    
+    print(f"\n{'='*80}")
+    print(f"Loading checkpoint: {path}")
+    print("="*80)
+    
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1
+    global_step = checkpoint.get('global_step', 0)
+    best_loss = checkpoint.get('loss', float('inf'))
+    
+    print(f"✓ Resuming from epoch {checkpoint['epoch'] + 1}")
+    print(f"  Loss: {checkpoint['loss']:.6f}, Global step: {global_step}")
+    print("="*80 + "\n")
+    
+    return start_epoch, global_step, best_loss
+
+
+############################################
 # 6) TRAINING LOOP
 ############################################
 def train_step(model, optimizer, batch, device, phase_name):
@@ -630,9 +704,9 @@ def train_step(model, optimizer, batch, device, phase_name):
     Args:
         model: SR3UNet for the current phase
         optimizer: optimizer for this model
-        batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'chip_seq'
+        batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'chip_seq'
         device: torch device
-        phase_name: 'earlyG1', 'midG1', or 'lateG1'
+        phase_name: 'earlyG1', 'midG1', 'lateG1', or 'anatelo'
     
     Returns:
         float: loss for this phase
@@ -641,17 +715,19 @@ def train_step(model, optimizer, batch, device, phase_name):
     x0_early = batch['earlyG1'].float().to(device)  # (batch_size, vec_dim)
     x0_mid = batch['midG1'].float().to(device)
     x0_late = batch['lateG1'].float().to(device)
+    x0_anatelo = batch['anatelo'].float().to(device)
     
     # Select the current phase's ground truth
     phase_data = {
         'earlyG1': x0_early,
         'midG1': x0_mid,
-        'lateG1': x0_late
+        'lateG1': x0_late,
+        'anatelo': x0_anatelo
     }
     x0_current = phase_data[phase_name]  # (batch_size, vec_dim)
     
-    # Compute bulk Hi-C (average of three phases) for conditioning
-    x0_bulk_normalized = (x0_early + x0_mid + x0_late) / 3  # (batch_size, vec_dim)
+    # Compute bulk Hi-C (average of four phases) for conditioning
+    x0_bulk_normalized = (x0_early + x0_mid + x0_late + x0_anatelo) / 4  # (batch_size, vec_dim)
     batch_size = x0_bulk_normalized.shape[0]
     
     # Get ChIP-seq conditioning (already batched - kept for compatibility but unused)
@@ -695,7 +771,7 @@ def test_training(model, batch, device, step, phase_name):
         batch: training batch
         device: torch device
         step: current training step number
-        phase_name: 'earlyG1', 'midG1', or 'lateG1'
+        phase_name: 'earlyG1', 'midG1', 'lateG1', or 'anatelo'
     
     Returns:
         Path to saved visualization
@@ -727,7 +803,7 @@ def run_test_inference(model, test_dataloader, device, phase_name, epoch, num_sa
         model: SR3UNet for the current phase
         test_dataloader: DataLoader for test set
         device: torch device
-        phase_name: 'earlyG1', 'midG1', or 'lateG1'
+        phase_name: 'earlyG1', 'midG1', 'lateG1', or 'anatelo'
         epoch: current epoch number
         num_samples: number of test samples to visualize (default: 20)
     """
@@ -764,6 +840,59 @@ def run_test_inference(model, test_dataloader, device, phase_name, epoch, num_sa
 
 
 ############################################
+# 6.5) CHECKPOINT LOADING
+############################################
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
+    """
+    Load checkpoint for resuming training.
+    
+    Args:
+        checkpoint_path: Path to checkpoint file (relative to CHECKPOINT_DIR or absolute)
+        model: Model to load weights into
+        optimizer: Optimizer to load state into
+        device: Device to load checkpoint on
+    
+    Returns:
+        Tuple of (start_epoch, global_step, best_loss)
+        Returns (0, 0, float('inf')) if checkpoint not found
+    """
+    if checkpoint_path is None:
+        return 0, 0, float('inf')
+    
+    # Resolve checkpoint path
+    path = Path(checkpoint_path)
+    if not path.is_absolute():
+        if checkpoint_path.startswith("checkpoints/"):
+            path = CHECKPOINT_DIR / checkpoint_path.replace("checkpoints/", "")
+        else:
+            path = CHECKPOINT_DIR / checkpoint_path
+    
+    if not path.exists():
+        print(f"WARNING: Checkpoint not found: {path}")
+        return 0, 0, float('inf')
+    
+    print(f"\n{'='*80}")
+    print(f"Loading checkpoint: {path}")
+    print("="*80)
+    
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1
+    global_step = checkpoint.get('global_step', 0)
+    best_loss = checkpoint.get('loss', float('inf'))
+    
+    print(f"✓ Resuming from epoch {checkpoint['epoch'] + 1}")
+    print(f"  Loss: {checkpoint['loss']:.6f}, Global step: {global_step}")
+    print("="*80 + "\n")
+    
+    return start_epoch, global_step, best_loss
+
+
+############################################
 # 7) MAIN TRAINING
 ############################################
 def main():
@@ -792,6 +921,11 @@ def main():
     
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    
+    # Load checkpoint if specified
+    start_epoch, global_step, best_loss = load_checkpoint_for_training(
+        RESUME_CHECKPOINT, model, optimizer, DEVICE
+    )
     
     # Load data
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
@@ -860,15 +994,13 @@ def main():
     print("="*80)
     
     # Training loop
-    global_step = 0
-    best_loss = float('inf')
-    
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
         epoch_losses = []
         model.train()
         
         # Iterate through training batches
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [{CURRENT_PHASE}]")
+        total_epochs = start_epoch + NUM_EPOCHS
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [{CURRENT_PHASE}]")
         for batch_idx, batch in enumerate(pbar):
             loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE)
             epoch_losses.append(loss)
@@ -888,7 +1020,8 @@ def main():
         
         # Epoch summary
         avg_loss = np.mean(epoch_losses)
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS} - Average Loss: {avg_loss:.6f}")
+        total_epochs = start_epoch + NUM_EPOCHS
+        print(f"\nEpoch {epoch+1}/{total_epochs} - Average Loss: {avg_loss:.6f}")
         
         # Save checkpoint if best
         if avg_loss < best_loss:
@@ -903,7 +1036,7 @@ def main():
             }, checkpoint_path)
             print(f"✓ Saved best checkpoint: {checkpoint_path}")
         
-        # Save epoch checkpoint
+        # Save epoch checkpoint (use absolute epoch number)
         checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_epoch{epoch+1}.pth"
         torch.save({
             'epoch': epoch,

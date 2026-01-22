@@ -72,11 +72,14 @@ class Inference:
             eps_pred = self.model(y_t, gamma_batch, chip_1d, bulk_vec)
 
             # SR3 Algorithm 2: z ~ N(0,I) if t > 1, else z = 0
-            if t_idx > 1:
-                z = torch.randn_like(y_t)
-            else:
-                z = torch.zeros_like(y_t)  # Final step: t=1→0, no noise
-            
+            # if t_idx > 1:
+            #     z = torch.randn_like(y_t)
+            # else:
+            #     z = torch.zeros_like(y_t)  # Final step: t=1→0, no noise
+
+            # for now, let's make z = 0 for all steps (hicDiff)
+            z = torch.zeros_like(y_t)
+
             # SR3 Algorithm 2 formula (same for all steps)
             y_prev = (1.0 / sqrt_alpha_t) * (y_t - ((1.0 - alpha_t) / sqrt_one_minus_gamma_t) * eps_pred) + sqrt_one_minus_alpha_t * z
             
@@ -90,8 +93,8 @@ class Inference:
         Run inference and visualize results.
         
         Args:
-            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'chip_seq', 'region'
-            phase_name: Which phase to visualize ('earlyG1', 'midG1', or 'lateG1')
+            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'chip_seq', 'region'
+            phase_name: Which phase to visualize ('earlyG1', 'midG1', 'lateG1', or 'anatelo')
             output_path: Where to save plot (if None, just display)
             n: Matrix size (default 64)
         
@@ -105,16 +108,18 @@ class Inference:
         x0_early = batch['earlyG1'].float().to(self.device)
         x0_mid = batch['midG1'].float().to(self.device)
         x0_late = batch['lateG1'].float().to(self.device)
+        x0_anatelo = batch['anatelo'].float().to(self.device)
         chip_1d = batch['chip_seq'].float().to(self.device)
         
-        # Compute bulk conditioning
-        bulk_vec = (x0_early + x0_mid + x0_late) / 3.0
+        # Compute bulk conditioning (average of four phases)
+        bulk_vec = (x0_early + x0_mid + x0_late + x0_anatelo) / 4.0
         
         # Get ground truth for current phase
         phase_to_gt = {
             'earlyG1': x0_early,
             'midG1': x0_mid,
-            'lateG1': x0_late
+            'lateG1': x0_late,
+            'anatelo': x0_anatelo
         }
         gt_vec = phase_to_gt[phase_name]
         
@@ -189,7 +194,7 @@ def run_inference_and_visualize(model, batch, phase_name, device, step, output_d
     Args:
         model: Trained SR3UNet model
         batch: Training batch
-        phase_name: Phase to sample ('earlyG1', 'midG1', or 'lateG1')
+        phase_name: Phase to sample ('earlyG1', 'midG1', 'lateG1', or 'anatelo')
         device: torch device
         step: Current training step (for filename)
         output_dir: Where to save visualization
