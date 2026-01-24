@@ -8,9 +8,8 @@ Includes ChIP-seq signal for each region.
 
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Union, Optional
+from typing import Dict, List, Union, Optional, Tuple
 import hicstraw as straw
-import pyBigWig
 
 
 class CellCycleDataLoader:
@@ -19,14 +18,10 @@ class CellCycleDataLoader:
     
     Each sample contains:
     - region: str, e.g., "1:10000000-10640000"
-    - earlyG1: numpy array (flattened upper triangular vector, shape: (2080,))
-    - lateG1: numpy array (flattened upper triangular vector, shape: (2080,))
-    - midG1: numpy array (flattened upper triangular vector, shape: (2080,))
-    - anatelo: numpy array (flattened upper triangular vector, shape: (2080,))
+    earlyG1, lateG1, midG1, anatelo: each a numpy array of shape (2080,)
+    note: for a 64x64 matrix, upper triangular has 64*65/2 = 2080 elements.
     - chip_seq: numpy array (shape: (64,)) - ChIP-seq signal for the region
-    * dimention calculation: 64 x 65 x 0.5 = 2080
-    
-    For a 64x64 matrix, upper triangular has 64*65/2 = 2080 elements.
+
     """
     
     def __init__(
@@ -34,8 +29,8 @@ class CellCycleDataLoader:
         data_dir: Union[str, Path],
         resolution: int = 10000,  # 10kb bins
         region_size: int = 640000,  # 640kb regions (64 pixels at 10kb resolution)
-        normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage.
-        chipseq_file: Optional[str] = None,  # Path to ChIP-seq bigWig file
+        normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage. #TODO: VC or KR? epiphany paper uses KR
+        chipseq_file: Optional[str] = None,  # Path to ChIP-seq bedGraph file
         hold_out_chromosome: Optional[str] = None,  # Chromosome to hold out for testing (e.g., "2")
     ):
         """
@@ -46,28 +41,28 @@ class CellCycleDataLoader:
             resolution: Bin size in base pairs (default: 10000 for 10kb)
             region_size: Size of square region to extract in base pairs (default: 640000 for 640kb = 64 pixels)
             normalization: Normalization method for Hi-C data (NONE, VC, VC_SQRT, KR)
-            chipseq_file: Optional path to ChIP-seq bigWig file (if None, looks for default file)
+            chipseq_file: Optional path to ChIP-seq bedGraph file (if None, looks for default file)
             hold_out_chromosome: Optional chromosome to exclude from training (e.g., "2" for chr2)
         """
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.region_size = region_size
         self.normalization = normalization
-        self.image_size = region_size // resolution  # 50 pixels for 500kb at 10kb
+        self.image_size = region_size // resolution  # 64 pixels for 640kb at 10kb
         self.hold_out_chromosome = hold_out_chromosome  # Chromosome to hold out for testing
         
         # Step size: sample every 10 pixels along the diagonal
         self.step_pixels = 10
         self.step_bp = self.step_pixels * resolution  # 100kb step
         
-        # Load ChIP-seq file
-        self.chipseq_bw = None
-        self.chipseq_chrom_stats = {}  # Per-chromosome mean and std
+        # Load ChIP-seq bedGraph file
+        # Store as dict: chrom -> list of (start, end, value) tuples
+        self.chipseq_data: Dict[str, List[Tuple[int, int, float]]] = {}
         if chipseq_file is None:
-            #chipseq_file = self.data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
-            chipseq_file = self.data_dir / "GSE129997_CTCF_asyn.bw"
-        if chipseq_file.exists() if isinstance(chipseq_file, Path) else Path(chipseq_file).exists():
-                self.chipseq_bw = pyBigWig.open(str(chipseq_file))
+            chipseq_file = self.data_dir / "GSE129997_CTCF_asyn.bedGraph"
+        chipseq_path = Path(chipseq_file) if not isinstance(chipseq_file, Path) else chipseq_file
+        if chipseq_path.exists():
+            self._load_bedgraph(chipseq_path)
         
         # Phase files
         self.phase_files = {
@@ -87,14 +82,20 @@ class CellCycleDataLoader:
         if not self.phase_paths:
             raise ValueError(f"No .hic files found in {self.data_dir}")
         
-        # mm39 chromosome sizes (no "chr" prefix in .hic files)
+        # Load mm9 chromosome sizes (no "chr" prefix in .hic files)
+        chrom_sizes_file = self.data_dir.parent / "mm9.chrom.sizes"
+        if not chrom_sizes_file.exists():
+            # Fallback: try in raw_data directory
+            chrom_sizes_file = self.data_dir.parent.parent / "raw_data" / "mm9.chrom.sizes"
+        
+        # using chromosome sizes from mm9.chrom.sizes file
         self.chromosome_sizes = {
-            "1": 195154279, "2": 181755017, "3": 159745316, "4": 156860686,
-            "5": 151758149, "6": 149588044, "7": 144995196, "8": 130127694,
-            "9": 124359700, "10": 130530862, "11": 121973369, "12": 120092757,
-            "13": 120883175, "14": 125139656, "15": 104073951, "16": 98008968,
-            "17": 95294699, "18": 90720763, "19": 61420004,
-            "X": 169476592, "Y": 91455967,
+            "1": 197195432, "2": 181748087, "3": 159599783, "4": 155630120,
+            "5": 152537259, "6": 149517037, "7": 152524553, "8": 131738871,
+            "9": 124076172, "10": 129993255, "11": 121843856, "12": 121257530,
+            "13": 120284312, "14": 125194864, "15": 103494974, "16": 98319150,
+            "17": 95272651, "18": 90772031, "19": 61342430,
+            "X": 166650296, "Y": 15902555,
         }
         
         # Generate regions by sliding along diagonal every 10 pixels
@@ -102,10 +103,7 @@ class CellCycleDataLoader:
         self.min_start_position = 3000000  # 3MB
         self.regions, self.holdout_regions = self._generate_regions()
         
-        # Compute ChIP-seq statistics PER CHROMOSOME (after regions are generated)
-        if self.chipseq_bw is not None:
-            print(f"Loaded ChIP-seq from: {chipseq_file}")
-            self._compute_chipseq_per_chromosome_stats()
+        # we normalize chip-seq signal by layer norm in the model.
     
     def _generate_regions(self):
         """
@@ -123,8 +121,7 @@ class CellCycleDataLoader:
         holdout_regions = []
 
         for chrom, size in self.chromosome_sizes.items():
-            # Skip sex chromosomes
-            if chrom in ['X', 'Y']:
+            if chrom in ['X', 'Y']: # for now, skip sex chromosomes
                 continue
             
             # Check if this is the holdout chromosome
@@ -150,71 +147,44 @@ class CellCycleDataLoader:
         
         return training_regions, holdout_regions
     
-    def _compute_chipseq_per_chromosome_stats(self):
+    # _compute_chipseq_per_chromosome_stats() removed - no longer needed
+    # new will normalize chip-seq signal by layer norm in the model.
+    
+    # convert bigwig to bedgraph using bigWigToBedGraph ucsc tool
+    def _load_bedgraph(self, bedgraph_path: Path):
         """
-        Compute per-chromosome mean and std for ChIP-seq signal.
-        Normalization: log1p → z-score (per chromosome) → clip ±3σ → scale to [-1, 1]
-        
-        Samples regions for efficiency (~100 regions per chromosome).
+        Load bedGraph file into memory.
+        Format: chr1\tstart\tend\tvalue
+        Stores as dict: chrom -> list of (start, end, value) tuples
         """
-        if self.chipseq_bw is None:
-            return
+        print(f"Loading ChIP-seq bedGraph from {bedgraph_path}...")
+        self.chipseq_data = {}
         
-        print("Computing per-chromosome ChIP-seq statistics (z-score)...")
-        
-        # Group regions by chromosome
-        chrom_regions = {}
-        for region in self.regions:
-            chrom = region.split(':')[0]
-            if chrom not in chrom_regions:
-                chrom_regions[chrom] = []
-            chrom_regions[chrom].append(region)
-        
-        # Compute mean/std for each chromosome
-        for chrom, regions in chrom_regions.items():
-            # Sample ~100 regions per chromosome for efficiency
-            sample_step = max(1, len(regions) // 100)
-            sampled = regions[::sample_step]
-            
-            chrom_signals = []
-            for region in sampled:
-                _, coords = region.split(':')
-                start, end = map(int, coords.split('-'))
+        with open(bedgraph_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
                 
-                # Try with and without 'chr' prefix
-                chrom_names = [chrom, f"chr{chrom}"]
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
                 
-                for chrom_name in chrom_names:
-                    try:
-                        signal = np.zeros(self.image_size, dtype=np.float32)
-                        
-                        for i in range(self.image_size):
-                            bin_start = start + i * self.resolution
-                            bin_end = start + (i + 1) * self.resolution
-                            values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="mean")
-                            signal[i] = values[0] if values[0] is not None else 0.0
-                        
-                        # Log transformation
-                        signal = np.log1p(signal)
-                        chrom_signals.extend(signal.tolist())
-                        break
-                    except:
-                        continue
-            
-            # Compute and store per-chromosome statistics
-            if chrom_signals:
-                self.chipseq_chrom_stats[chrom] = {
-                    'mean': float(np.mean(chrom_signals)),
-                    'std': float(np.std(chrom_signals))
-                }
-                print(f"  Chr {chrom}: mean={self.chipseq_chrom_stats[chrom]['mean']:.4f}, "
-                      f"std={self.chipseq_chrom_stats[chrom]['std']:.4f}")
-            else:
-                # Fallback
-                self.chipseq_chrom_stats[chrom] = {'mean': 0.0, 'std': 1.0}
-                print(f"  Chr {chrom}: Using default stats (no data)")
+                chrom = parts[0]  # it will be like "chr1"
+                start = int(parts[1])
+                end = int(parts[2])
+                value = float(parts[3])
+                
+                if chrom not in self.chipseq_data:
+                    self.chipseq_data[chrom] = []
+                self.chipseq_data[chrom].append((start, end, value))
         
-        print(f"Computed statistics for {len(self.chipseq_chrom_stats)} chromosomes")
+        # Sort intervals by start position for each chromosome
+        for chrom in self.chipseq_data:
+            self.chipseq_data[chrom].sort(key=lambda x: x[0])
+        
+        total_intervals = sum(len(intervals) for intervals in self.chipseq_data.values())
+        print(f"  Loaded {total_intervals:,} intervals across {len(self.chipseq_data)} chromosomes")
     
     def _extract_upper_triangular_vector(self, matrix: np.ndarray) -> np.ndarray:
         """
@@ -290,53 +260,63 @@ class CellCycleDataLoader:
     
     def _extract_chipseq_signal(self, region: str) -> np.ndarray:
         """
-        Extract ChIP-seq signal for a genomic region.
-        Returns log-transformed signal (normalization happens in __getitem__ using per-chromosome stats).
+        Extract ChIP-seq signal for a genomic region from bedGraph data.
+        Returns max-per-bin signal (no log transformation applied).
         
         Args:
-            region: Region string like "1:10000000-10500000"
+            region: example input region "1:10000000-10500000" means chr1 from start base pair 10000000 to end base pair 10500000
         
         Returns:
-            1D numpy array of shape (image_size,) with log-transformed ChIP-seq signal
+            1d numpy array of shape (image_size,) with max-per-bin ChIP-seq signal
         """
-        if self.chipseq_bw is None:
-            # Return zeros if ChIP-seq not available
-            return np.zeros(self.image_size, dtype=np.float32)
+        if not self.chipseq_data:
+            return np.zeros(self.image_size, dtype=np.float32)  # return zeros if chip-seq not available
         
         # Parse region
         chrom, coords = region.split(':')
         start, end = map(int, coords.split('-'))
         
-        try:
-            # Try with and without 'chr' prefix
-            chrom_names = [chrom, f"chr{chrom}"]
-            signal = None
+        # bedGraph files use chr{#} format
+        chrom_name = f"chr{chrom}"
+        
+        signal = np.zeros(self.image_size, dtype=np.float32)
+        bin_size = self.resolution
+        
+        # Get chromosome data
+        if chrom_name not in self.chipseq_data:
+            return signal  # No data for this chromosome
+        
+        intervals = self.chipseq_data[chrom_name]
+        
+        # For each bin, find max value from overlapping intervals
+        # Since intervals are sorted by start, we can break early
+        interval_idx = 0
+        for i in range(self.image_size):
+            bin_start = start + i * bin_size
+            bin_end = start + (i + 1) * bin_size
             
-            for chrom_name in chrom_names:
-                try:
-                    # Get max signal per bin
-                    bin_size = self.resolution
-                    signal = np.zeros(self.image_size, dtype=np.float32)
-                    
-                    for i in range(self.image_size):
-                        bin_start = start + i * bin_size
-                        bin_end = start + (i + 1) * bin_size
-                        values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
-                        signal[i] = values[0] if values[0] is not None else 0.0
-                    
-                    # Apply log transformation (z-score normalization in __getitem__)
-                    signal = np.log1p(signal)
-                    
-                    return signal
-                except:
+            # Find all intervals that overlap with this bin
+            max_val = 0.0
+            # Start from where we left off (intervals are sorted)
+            for j in range(interval_idx, len(intervals)):
+                interval_start, interval_end, value = intervals[j]
+                
+                # If interval starts after bin ends, we're done with this bin
+                if interval_start >= bin_end:
+                    break
+                
+                # If interval ends before bin starts, skip it (but update start index)
+                if interval_end <= bin_start:
+                    interval_idx = j + 1
                     continue
+                
+                # Interval overlaps with bin
+                if interval_end > bin_start and interval_start < bin_end:
+                    max_val = max(max_val, value)
             
-            # If all attempts failed, return zeros
-            return np.zeros(self.image_size, dtype=np.float32)
-            
-        except Exception as e:
-            # Return zeros on error
-            return np.zeros(self.image_size, dtype=np.float32)
+            signal[i] = max_val
+        
+        return signal
     
     def __len__(self) -> int:
         """Return number of training regions (excludes holdout chromosome)."""
@@ -367,10 +347,8 @@ class CellCycleDataLoader:
                   (log1p(x) - phase_min) / (phase_max - phase_min) * 2 - 1
             
             ChIP-seq (shape: (64,)):
-                - Log-transformed: log1p(x)
-                - Per-chromosome z-score: (x - chrom_mean) / chrom_std
-                - Clipped to ±3 sigma
-                - Rescaled to [-1, 1]: x / 3.0
+                - Max signal per bin (10kb bins)
+                - No normalization (normalization handled by LayerNorm in model)
         """
         # Handle region string indexing
         if isinstance(idx, str):
@@ -409,27 +387,8 @@ class CellCycleDataLoader:
             
             sample[phase] = normalized.astype(np.float32)
         
-        # Load ChIP-seq signal and normalize to [-1, 1]
-        chip_seq = self._extract_chipseq_signal(region)  # Log-transformed
-        
-        # Get chromosome for per-chromosome z-score normalization
-        chrom = region.split(':')[0]
-        
-        # Per-chromosome z-score normalization with clipping
-        if chrom in self.chipseq_chrom_stats and self.chipseq_chrom_stats[chrom]['std'] > 0:
-            # Step 1: z-score using per-chromosome mean/std
-            mean = self.chipseq_chrom_stats[chrom]['mean']
-            std = self.chipseq_chrom_stats[chrom]['std']
-            chip_seq = (chip_seq - mean) / std
-            
-            # Step 2: Clip to ±3 sigma
-            chip_seq = np.clip(chip_seq, -3.0, 3.0)
-            
-            # Step 3: Rescale to [-1, 1]
-            chip_seq = chip_seq / 3.0  # Maps [-3, 3] → [-1, 1]
-        else:
-            # Fallback: map to zeros
-            chip_seq = np.zeros_like(chip_seq, dtype=np.float32)
+        # Load ChIP-seq signal (max per bin, no additioanl normalization)
+        chip_seq = self._extract_chipseq_signal(region)  # Max per bin, no log transformation
         
         sample['chip_seq'] = chip_seq.astype(np.float32)
         
@@ -449,9 +408,8 @@ class CellCycleDataLoader:
         return list(self.phase_paths.keys())
     
     def close(self):
-        """Close ChIP-seq bigWig file if open."""
-        if self.chipseq_bw is not None:
-            self.chipseq_bw.close()
+        """Cleanup ChIP-seq data (no-op for bedGraph, kept for compatibility)."""
+        pass
     
     def __del__(self):
         """Cleanup when object is deleted."""
