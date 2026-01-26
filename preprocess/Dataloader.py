@@ -10,6 +10,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Union, Optional, Tuple
 import hicstraw as straw
+import pyBigWig
 
 
 class CellCycleDataLoader:
@@ -30,7 +31,7 @@ class CellCycleDataLoader:
         resolution: int = 10000,  # 10kb bins
         region_size: int = 640000,  # 640kb regions (64 pixels at 10kb resolution)
         normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage. #TODO: VC or KR? epiphany paper uses KR
-        chipseq_file: Optional[str] = None,  # Path to ChIP-seq bedGraph file
+        chipseq_file: Optional[str] = None,  # Path to ChIP-seq bigWig file
         hold_out_chromosome: Optional[str] = None,  # Chromosome to hold out for testing (e.g., "2")
     ):
         """
@@ -41,7 +42,7 @@ class CellCycleDataLoader:
             resolution: Bin size in base pairs (default: 10000 for 10kb)
             region_size: Size of square region to extract in base pairs (default: 640000 for 640kb = 64 pixels)
             normalization: Normalization method for Hi-C data (NONE, VC, VC_SQRT, KR)
-            chipseq_file: Optional path to ChIP-seq bedGraph file (if None, looks for default file)
+            chipseq_file: Optional path to ChIP-seq bigWig file (if None, looks for default file)
             hold_out_chromosome: Optional chromosome to exclude from training (e.g., "2" for chr2)
         """
         self.data_dir = Path(data_dir)
@@ -55,14 +56,18 @@ class CellCycleDataLoader:
         self.step_pixels = 10
         self.step_bp = self.step_pixels * resolution  # 100kb step
         
-        # Load ChIP-seq bedGraph file
-        # Store as dict: chrom -> list of (start, end, value) tuples
-        self.chipseq_data: Dict[str, List[Tuple[int, int, float]]] = {}
+        # Load ChIP-seq bigWig file
+        self.chipseq_bw = None
         if chipseq_file is None:
-            chipseq_file = self.data_dir / "GSE129997_CTCF_asyn.bedGraph"
+            chipseq_file = self.data_dir / "GSE129997_CTCF_asyn.bw"
         chipseq_path = Path(chipseq_file) if not isinstance(chipseq_file, Path) else chipseq_file
         if chipseq_path.exists():
-            self._load_bedgraph(chipseq_path)
+            try:
+                self.chipseq_bw = pyBigWig.open(str(chipseq_path))
+                print(f"Loaded ChIP-seq bigWig from: {chipseq_path}")
+            except Exception as e:
+                print(f"Warning: Failed to load bigWig file {chipseq_path}: {e}")
+                self.chipseq_bw = None
         
         # Phase files
         self.phase_files = {
@@ -147,44 +152,7 @@ class CellCycleDataLoader:
         
         return training_regions, holdout_regions
     
-    # _compute_chipseq_per_chromosome_stats() removed - no longer needed
-    # new will normalize chip-seq signal by layer norm in the model.
-    
-    # convert bigwig to bedgraph using bigWigToBedGraph ucsc tool
-    def _load_bedgraph(self, bedgraph_path: Path):
-        """
-        Load bedGraph file into memory.
-        Format: chr1\tstart\tend\tvalue
-        Stores as dict: chrom -> list of (start, end, value) tuples
-        """
-        print(f"Loading ChIP-seq bedGraph from {bedgraph_path}...")
-        self.chipseq_data = {}
-        
-        with open(bedgraph_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                
-                parts = line.split('\t')
-                if len(parts) < 4:
-                    continue
-                
-                chrom = parts[0]  # it will be like "chr1"
-                start = int(parts[1])
-                end = int(parts[2])
-                value = float(parts[3])
-                
-                if chrom not in self.chipseq_data:
-                    self.chipseq_data[chrom] = []
-                self.chipseq_data[chrom].append((start, end, value))
-        
-        # Sort intervals by start position for each chromosome
-        for chrom in self.chipseq_data:
-            self.chipseq_data[chrom].sort(key=lambda x: x[0])
-        
-        total_intervals = sum(len(intervals) for intervals in self.chipseq_data.values())
-        print(f"  Loaded {total_intervals:,} intervals across {len(self.chipseq_data)} chromosomes")
+    # ChIP-seq normalization handled by LayerNorm in the model embedding
     
     def _extract_upper_triangular_vector(self, matrix: np.ndarray) -> np.ndarray:
         """
@@ -260,63 +228,42 @@ class CellCycleDataLoader:
     
     def _extract_chipseq_signal(self, region: str) -> np.ndarray:
         """
-        Extract ChIP-seq signal for a genomic region from bedGraph data.
-        Returns max-per-bin signal (no log transformation applied).
+        Extract ChIP-seq signal for a genomic region from bigWig data.
+        Returns max-per-bin signal with log transformation applied.
         
         Args:
             region: example input region "1:10000000-10500000" means chr1 from start base pair 10000000 to end base pair 10500000
         
         Returns:
-            1d numpy array of shape (image_size,) with max-per-bin ChIP-seq signal
+            1d numpy array of shape (image_size,) with log-transformed max-per-bin ChIP-seq signal
         """
-        if not self.chipseq_data:
+        if self.chipseq_bw is None:
             return np.zeros(self.image_size, dtype=np.float32)  # return zeros if chip-seq not available
         
         # Parse region
         chrom, coords = region.split(':')
         start, end = map(int, coords.split('-'))
         
-        # bedGraph files use chr{#} format
-        chrom_name = f"chr{chrom}"
-        
         signal = np.zeros(self.image_size, dtype=np.float32)
         bin_size = self.resolution
-        
-        # Get chromosome data
-        if chrom_name not in self.chipseq_data:
-            return signal  # No data for this chromosome
-        
-        intervals = self.chipseq_data[chrom_name]
-        
-        # For each bin, find max value from overlapping intervals
-        # Since intervals are sorted by start, we can break early
-        interval_idx = 0
-        for i in range(self.image_size):
-            bin_start = start + i * bin_size
-            bin_end = start + (i + 1) * bin_size
+    
+        chrom_name = "chr" + chrom # see bedGraph chr{number} is the format
+        try:
+            # get max signal using bigWig
+            for i in range(self.image_size):
+                bin_start = start + i * bin_size
+                bin_end = start + (i + 1) * bin_size
+                # Use 'max' to get maximum value in bin (matching bedGraph behavior)
+                values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
+                max_val = values[0] if values[0] is not None else 0.0
+                # Log transform the signal
+                signal[i] = np.log1p(max_val) # oragami uses log1p(x). consider also not using this.
             
-            # Find all intervals that overlap with this bin
-            max_val = 0.0
-            # Start from where we left off (intervals are sorted)
-            for j in range(interval_idx, len(intervals)):
-                interval_start, interval_end, value = intervals[j]
-                
-                # If interval starts after bin ends, we're done with this bin
-                if interval_start >= bin_end:
-                    break
-                
-                # If interval ends before bin starts, skip it (but update start index)
-                if interval_end <= bin_start:
-                    interval_idx = j + 1
-                    continue
-                
-                # Interval overlaps with bin
-                if interval_end > bin_start and interval_start < bin_end:
-                    max_val = max(max_val, value)
+            return signal
             
-            signal[i] = max_val
-        
-        return signal
+        except Exception as e: 
+            raise ValueError(f"Error extracting ChIP-seq signal for region {region}: {e}")
+
     
     def __len__(self) -> int:
         """Return number of training regions (excludes holdout chromosome)."""
@@ -370,10 +317,13 @@ class CellCycleDataLoader:
             vector = self._extract_region_matrix(filepath, region)
             
             # Apply log transformation (standard for Hi-C data)
-            # log1p = log(1 + x) handles zeros gracefully
             vector = np.log1p(vector)
+
+            # remove outliers using 99.9th percentile (from HiCDiff and DeepHiC papers)
+            threshold = np.percentile(vector, 99.9)
+            vector = np.where(vector > threshold, threshold, vector)
             
-            # Find min/max for THIS phase
+            # Use min/max normalization which is from HiCDiff and DeepHiC papers
             phase_min = vector.min()
             phase_max = vector.max()
             
@@ -408,9 +358,35 @@ class CellCycleDataLoader:
         return list(self.phase_paths.keys())
     
     def close(self):
-        """Cleanup ChIP-seq data (no-op for bedGraph, kept for compatibility)."""
-        pass
+        """Close ChIP-seq bigWig file if open."""
+        if self.chipseq_bw is not None:
+            try:
+                self.chipseq_bw.close()
+            except:
+                pass
     
     def __del__(self):
         """Cleanup when object is deleted."""
         self.close()
+
+
+
+# consider a similar previously used normalization for hic
+# from the DeepHiC paper: 
+# For Hi-C matrices in training, outliers 
+# are set to the allowed maximum by setting
+# the threshold be the 99.9-th percentile. 
+# For example, 255 is about the average of
+# 99.9-th percentiles for 10-kb Hi-C data, so 
+# all values greater than 255 are set to 255 
+# for 10-kb Hi-C data. Then all Hi-C matrices 
+# are rescaled to values ranging from 0 to 1 by 
+# min-max normalization [45] to ensure the training
+# stability and efficiency. Besides, cutoff values
+# for downsampled inputs of our model were 125,
+# 100, 80, 50, and 25 for 1/10, 1/16, 1/25, 
+# 1/50, and 1/100 downsampled ratios.
+
+# procedure is used in DeepHiC and HicDiff papers
+# https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1007287
+# HicDiff paper
