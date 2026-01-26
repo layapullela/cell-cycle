@@ -129,7 +129,7 @@ PHASES = ["earlyG1", "midG1", "lateG1", "anatelo"]
 
 # MEMORY OPTIMIZATION: Train one phase at a time
 # Change this to 'earlyG1', 'midG1', 'lateG1', or 'anatelo' to train different phases
-CURRENT_PHASE = 'anatelo'  # <-- CHANGE THIS to train different phases
+CURRENT_PHASE = 'earlyG1'  # <-- CHANGE THIS to train different phases
 
 T = 1000              # diffusion steps
 N = 64                # contact map size (64 x 64)
@@ -456,13 +456,24 @@ class SR3UNet(nn.Module):
         noise_dim = self.noise_embed.mlp[-1].out_features
         
         # ---- Shared ChIP-seq embedding (computed once, used by both cross-attention blocks) ----
-        d_cond = 64  # ChIP-seq embedding dimension
-        self.chip_embed = nn.Sequential(
-            nn.Linear(1, d_cond),
-            nn.LayerNorm(d_cond),  # Normalize ChIP-seq embeddings
-            nn.GELU(),
-            nn.Linear(d_cond, d_cond)
-        )
+        # adaptation of the paper Oragami feature embedding of chip data.
+        # https://www.nature.com/articles/s41587-022-01612-8
+        # Convolutional ResNet-style embedding: (B, 64, 1) -> (B, 64, 64)
+        d_cond = 64  # Final ChIP-seq embedding dimension
+        
+        # ResNet Block 1: (B, 64, 1) -> (B, 64, 32)
+        self.chip_block1_conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
+        self.chip_block1_bn1 = nn.BatchNorm1d(32)
+        self.chip_block1_conv2 = nn.Conv1d(32, 32, kernel_size=3, padding=1)
+        self.chip_block1_bn2 = nn.BatchNorm1d(32)
+        self.chip_block1_skip = nn.Conv1d(1, 32, kernel_size=1)  # Skip connection projection
+        
+        # ResNet Block 2: (B, 64, 32) -> (B, 64, 64)
+        self.chip_block2_conv1 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.chip_block2_bn1 = nn.BatchNorm1d(64)
+        self.chip_block2_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.chip_block2_bn2 = nn.BatchNorm1d(64)
+        self.chip_block2_skip = nn.Conv1d(32, 64, kernel_size=1)  # Skip connection projection
         
         # Learnable parameter to control ChIP-seq conditioning strength
         self.chip_scale = nn.Parameter(torch.zeros(1))  # Start at 0 (exp(0) = 1.0 = full conditioning)
@@ -565,13 +576,29 @@ class SR3UNet(nn.Module):
         h = self.input_conv(x_in)  # (B, base_ch, 64, 64)
         
         # --- Compute ChIP-seq embedding once (shared by both cross-attention blocks) ---
-        # Handle ChIP-seq input shape: (B, 64) -> (B, 64, 1)
-        if chip_1d.dim() == 2:
-            chip_1d_expanded = chip_1d.unsqueeze(-1)  # (B, 64, 1)
-        else:
-            chip_1d_expanded = chip_1d  # Already (B, 64, 1)
-            print("chip_1d_expanded shape: ", chip_1d_expanded.shape)
-        chip_embedding = self.chip_embed(chip_1d_expanded)  # (B, 64, d_cond)
+        # Handle ChIP-seq input shape: (B, 64) -> (B, 1, 64) for Conv1d
+        chip_1d_expanded = chip_1d.unsqueeze(1)  # (B, 1, 64) - Conv1d expects (B, C, L)
+        
+        # ResNet Block 1: (B, 1, 64) -> (B, 32, 64)
+        x = self.chip_block1_conv1(chip_1d_expanded)  # (B, 32, 64)
+        x = self.chip_block1_bn1(x)
+        x = F.relu(x)
+        x = self.chip_block1_conv2(x)  # (B, 32, 64)
+        x = self.chip_block1_bn2(x)
+        skip1 = self.chip_block1_skip(chip_1d_expanded)  # (B, 32, 64)
+        x = F.relu(x + skip1)  # Residual connection
+        
+        # ResNet Block 2: (B, 32, 64) -> (B, 64, 64)
+        y = self.chip_block2_conv1(x)  # (B, 64, 64)
+        y = self.chip_block2_bn1(y)
+        y = F.relu(y)
+        y = self.chip_block2_conv2(y)  # (B, 64, 64)
+        y = self.chip_block2_bn2(y)
+        skip2 = self.chip_block2_skip(x)  # (B, 64, 64)
+        chip_embedding = F.relu(y + skip2)  # Residual connection
+        
+        # Transpose to (B, 64, 64) for cross-attention: (sequence_length, embedding_dim)
+        chip_embedding = chip_embedding.transpose(1, 2)  # (B, 64, 64)
         
         # ========== ENCODER ==========
         # Level 1: 64x64
@@ -590,7 +617,7 @@ class SR3UNet(nn.Module):
         # Apply cross-attention conditioning with shared ChIP-seq embedding
         h = self.enc3_cross_attn(h, chip_embedding)  # (B, base_ch*4, 16, 16)
         # Scale ChIP-seq conditioning contribution
-        h = skip3_before_attn + self.chip_scale.exp() * (h - skip3_before_attn)  # Exponential ensures positive, starts at 1.0
+        #h = skip3_before_attn + self.chip_scale.exp() * (h - skip3_before_attn)  # Exponential ensures positive, starts at 1.0
         skip3 = h                             # Save for skip connection
         h = self.enc3_down(h, noise_emb)      # (B, base_ch*8, 8, 8)
         
@@ -608,7 +635,7 @@ class SR3UNet(nn.Module):
         # Apply cross-attention conditioning with shared ChIP-seq embedding
         h = self.dec3_cross_attn(h, chip_embedding)          # (B, base_ch*4, 16, 16)
         # Scale ChIP-seq conditioning contribution
-        h = skip3_before_attn + self.chip_scale.exp() * (h - skip3_before_attn)  # Exponential ensures positive, starts at 1.0
+        #h = skip3_before_attn + self.chip_scale.exp() * (h - skip3_before_attn)  # Exponential ensures positive, starts at 1.0
         
         # Level 2: 16x16 -> 32x32
         h = self.dec2_up(h, noise_emb)                # (B, base_ch*2, 32, 32)
