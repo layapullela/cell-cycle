@@ -40,13 +40,14 @@ class Inference:
         self.model.eval()
     
     @torch.no_grad()
-    def sample(self, bulk_vec, chip_1d):
+    def sample(self, bulk_vec, chip_ctcf, chip_histone):
         """
         SR3 sampling: Generate phase-specific Hi-C from bulk using iterative refinement.
         
         Args:
             bulk_vec: (B, vec_dim) bulk Hi-C conditioning
-            chip_1d: (B, N) ChIP-seq conditioning
+            chip_ctcf: (B, N) CTCF ChIP-seq conditioning
+            chip_histone: (B, N) H3K4me1 ChIP-seq conditioning
         
         Returns:
             y_0: (B, vec_dim) sampled phase-specific Hi-C
@@ -69,7 +70,7 @@ class Inference:
 
             # Predict noise ε - pass gamma directly to model
             gamma_batch = torch.full((batch_size,), gamma_t, device=self.device)
-            eps_pred = self.model(y_t, gamma_batch, chip_1d, bulk_vec)
+            eps_pred = self.model(y_t, gamma_batch, chip_ctcf, chip_histone, bulk_vec)
 
             # SR3 Algorithm 2: z ~ N(0,I) if t > 1, else z = 0
             # if t_idx > 1:
@@ -93,7 +94,7 @@ class Inference:
         Run inference and visualize results.
         
         Args:
-            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'chip_seq', 'region'
+            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'chip_seq_ctcf', 'chip_seq_hac', 'region'
             phase_name: Which phase to visualize ('earlyG1', 'midG1', 'lateG1', or 'anatelo')
             output_path: Where to save plot (if None, just display)
             n: Matrix size (default 64)
@@ -109,7 +110,8 @@ class Inference:
         x0_mid = batch['midG1'].float().to(self.device)
         x0_late = batch['lateG1'].float().to(self.device)
         x0_anatelo = batch['anatelo'].float().to(self.device)
-        chip_1d = batch['chip_seq'].float().to(self.device)
+        chip_ctcf = batch['chip_seq_ctcf'].float().to(self.device)
+        chip_histone = batch['chip_seq_hac'].float().to(self.device)
         
         # Compute bulk conditioning (average of four phases)
         bulk_vec = (x0_early + x0_mid + x0_late + x0_anatelo) / 4.0
@@ -124,7 +126,7 @@ class Inference:
         gt_vec = phase_to_gt[phase_name]
         
         # Run sampling
-        sampled_vec = self.sample(bulk_vec, chip_1d)
+        sampled_vec = self.sample(bulk_vec, chip_ctcf, chip_histone)
         
         # Convert to matrices for visualization (use first sample in batch)
         gt_matrix = upper_tri_vec_to_matrix(gt_vec[0:1], n)[0].cpu().numpy()

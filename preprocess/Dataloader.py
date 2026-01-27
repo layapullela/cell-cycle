@@ -56,18 +56,37 @@ class CellCycleDataLoader:
         self.step_pixels = 10
         self.step_bp = self.step_pixels * resolution  # 100kb step
         
-        # Load ChIP-seq bigWig file
-        self.chipseq_bw = None
-        if chipseq_file is None:
-            chipseq_file = self.data_dir / "GSE129997_CTCF_asyn.bw"
-        chipseq_path = Path(chipseq_file) if not isinstance(chipseq_file, Path) else chipseq_file
-        if chipseq_path.exists():
+        # Load multiple ChIP-seq bigWig files
+        # Default paths: look in data_dir first, then in raw_data/zhang_4dn
+        raw_data_dir = self.data_dir.parent.parent / "raw_data" / "zhang_4dn"
+        
+        # Dictionary to store multiple ChIP-seq files
+        self.chipseq_files = {}
+        
+        # Load CTCF file (default)
+        ctcf_file = self.data_dir / "GSE129997_CTCF_asyn.bw"
+        if not ctcf_file.exists():
+            ctcf_file = raw_data_dir / "GSE129997_CTCF_asyn.bw"
+        if ctcf_file.exists():
             try:
-                self.chipseq_bw = pyBigWig.open(str(chipseq_path))
-                print(f"Loaded ChIP-seq bigWig from: {chipseq_path}")
+                self.chipseq_files['ctcf'] = pyBigWig.open(str(ctcf_file))
+                print(f"Loaded CTCF ChIP-seq from: {ctcf_file}")
             except Exception as e:
-                print(f"Warning: Failed to load bigWig file {chipseq_path}: {e}")
-                self.chipseq_bw = None
+                print(f"Warning: Failed to load CTCF bigWig file {ctcf_file}: {e}")
+                self.chipseq_files['ctcf'] = None
+        
+        # Load HAC (H3K4me1) - using GSM1502751_534.bigWig
+        hac_file = raw_data_dir / "GSM1502751_534.bigWig"
+        if hac_file.exists():
+            try:
+                self.chipseq_files['hac'] = pyBigWig.open(str(hac_file))
+                print(f"Loaded HAC (H3K4me1) ChIP-seq from: {hac_file}")
+            except Exception as e:
+                print(f"Warning: Failed to load HAC bigWig file {hac_file}: {e}")
+                self.chipseq_files['hac'] = None
+        
+        # Keep backward compatibility: use CTCF as default chipseq_bw
+        self.chipseq_bw = self.chipseq_files.get('ctcf', None)
         
         # Phase files
         self.phase_files = {
@@ -226,18 +245,22 @@ class CellCycleDataLoader:
         # Return upper triangular portion as flattened vector
         return self._extract_upper_triangular_vector(matrix)
     
-    def _extract_chipseq_signal(self, region: str) -> np.ndarray:
+    def _extract_chipseq_signal(self, region: str, chipseq_bw=None) -> np.ndarray:
         """
         Extract ChIP-seq signal for a genomic region from bigWig data.
         Returns max-per-bin signal with log transformation applied.
         
         Args:
             region: example input region "1:10000000-10500000" means chr1 from start base pair 10000000 to end base pair 10500000
+            chipseq_bw: Optional pyBigWig object to use (if None, uses self.chipseq_bw for backward compatibility)
         
         Returns:
             1d numpy array of shape (image_size,) with log-transformed max-per-bin ChIP-seq signal
         """
-        if self.chipseq_bw is None:
+        if chipseq_bw is None:
+            chipseq_bw = self.chipseq_bw
+        
+        if chipseq_bw is None:
             return np.zeros(self.image_size, dtype=np.float32)  # return zeros if chip-seq not available
         
         # Parse region
@@ -254,7 +277,7 @@ class CellCycleDataLoader:
                 bin_start = start + i * bin_size
                 bin_end = start + (i + 1) * bin_size
                 # Use 'max' to get maximum value in bin (matching bedGraph behavior)
-                values = self.chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
+                values = chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
                 max_val = values[0] if values[0] is not None else 0.0
                 # Log transform the signal
                 signal[i] = np.log1p(max_val) # oragami uses log1p(x). consider also not using this.
@@ -286,16 +309,19 @@ class CellCycleDataLoader:
             idx: Integer index or region string like "1:10000000-10640000"
         
         Returns:
-            Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'anatelo', 'chip_seq'
+            Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'anatelo', 
+                                  'chip_seq_ctcf', 'chip_seq_hac'
             
             Hi-C phases (shape: (2080,) each):
                 - Log-transformed: log1p(x)
                 - Normalized INDEPENDENTLY per phase to [-1, 1]:
                   (log1p(x) - phase_min) / (phase_max - phase_min) * 2 - 1
             
-            ChIP-seq (shape: (64,)):
-                - Max signal per bin (10kb bins)
-                - No normalization (normalization handled by LayerNorm in model)
+            ChIP-seq tracks (shape: (64,) each):
+                - chip_seq_ctcf: CTCF ChIP-seq signal
+                - chip_seq_hac: H3K4me1 ChIP-seq signal (from GSM1502751_534.bigWig)
+                - Max signal per bin (10kb bins) with log1p transformation
+                - No additional normalization (normalization handled by LayerNorm in model)
         """
         # Handle region string indexing
         if isinstance(idx, str):
@@ -337,10 +363,14 @@ class CellCycleDataLoader:
             
             sample[phase] = normalized.astype(np.float32)
         
-        # Load ChIP-seq signal (max per bin, no additioanl normalization)
-        chip_seq = self._extract_chipseq_signal(region)  # Max per bin, no log transformation
+        # Load ChIP-seq signals from multiple tracks (max per bin, log1p transformation)
+        # Extract CTCF signal
+        chip_seq_ctcf = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('ctcf'))
+        sample['chip_seq_ctcf'] = chip_seq_ctcf.astype(np.float32)
         
-        sample['chip_seq'] = chip_seq.astype(np.float32)
+        # Extract HAC (H3K4me1) signal from GSM1502751_534.bigWig
+        chip_seq_hac = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('hac'))
+        sample['chip_seq_hac'] = chip_seq_hac.astype(np.float32)
         
         return sample
     
@@ -358,7 +388,15 @@ class CellCycleDataLoader:
         return list(self.phase_paths.keys())
     
     def close(self):
-        """Close ChIP-seq bigWig file if open."""
+        """Close all ChIP-seq bigWig files if open."""
+        # Close all ChIP-seq files
+        for key, bw in self.chipseq_files.items():
+            if bw is not None:
+                try:
+                    bw.close()
+                except:
+                    pass
+        # Also close legacy chipseq_bw if it exists
         if self.chipseq_bw is not None:
             try:
                 self.chipseq_bw.close()

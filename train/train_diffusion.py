@@ -129,7 +129,7 @@ PHASES = ["earlyG1", "midG1", "lateG1", "anatelo"]
 
 # MEMORY OPTIMIZATION: Train one phase at a time
 # Change this to 'earlyG1', 'midG1', 'lateG1', or 'anatelo' to train different phases
-CURRENT_PHASE = 'earlyG1'  # <-- CHANGE THIS to train different phases
+CURRENT_PHASE = 'anatelo'  # <-- CHANGE THIS to train different phases
 
 T = 1000              # diffusion steps
 N = 64                # contact map size (64 x 64)
@@ -327,6 +327,78 @@ class BigGANResBlock(nn.Module):
 
 
 ############################################
+# 3.4) CHIP-SEQ EMBEDDING (ResNet-style)
+############################################
+class ChIPSeqEmbedding(nn.Module):
+    """
+    ResNet-style embedding for ChIP-seq 1D signals.
+    
+    Based on the Oragami feature embedding approach:
+    https://www.nature.com/articles/s41587-022-01612-8
+    
+    Architecture:
+        - Input: (B, 64) ChIP-seq signal
+        - ResNet Block 1: (B, 1, 64) -> (B, 32, 64)
+        - ResNet Block 2: (B, 32, 64) -> (B, 64, 64)
+        - Output: (B, 64, 64) transposed to (B, 64, 64) for cross-attention
+    
+    Args:
+        d_cond: Final embedding dimension (default: 64)
+    """
+    def __init__(self, d_cond=64):
+        super().__init__()
+        self.d_cond = d_cond
+        
+        # ResNet Block 1: (B, 1, 64) -> (B, 32, 64)
+        self.chip_block1_conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
+        self.chip_block1_bn1 = nn.BatchNorm1d(32)
+        self.chip_block1_conv2 = nn.Conv1d(32, 32, kernel_size=3, padding=1)
+        self.chip_block1_bn2 = nn.BatchNorm1d(32)
+        self.chip_block1_skip = nn.Conv1d(1, 32, kernel_size=1)  # Skip connection projection
+        
+        # ResNet Block 2: (B, 32, 64) -> (B, 64, 64)
+        self.chip_block2_conv1 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.chip_block2_bn1 = nn.BatchNorm1d(64)
+        self.chip_block2_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
+        self.chip_block2_bn2 = nn.BatchNorm1d(64)
+        self.chip_block2_skip = nn.Conv1d(32, 64, kernel_size=1)  # Skip connection projection
+    
+    def forward(self, chip_1d):
+        """
+        Args:
+            chip_1d: (B, 64) ChIP-seq signal
+        
+        Returns:
+            chip_embedding: (B, 64, 64) embedded ChIP-seq tokens for cross-attention
+        """
+        # Handle ChIP-seq input shape: (B, 64) -> (B, 1, 64) for Conv1d
+        chip_1d_expanded = chip_1d.unsqueeze(1)  # (B, 1, 64) - Conv1d expects (B, C, L)
+        
+        # ResNet Block 1: (B, 1, 64) -> (B, 32, 64)
+        x = self.chip_block1_conv1(chip_1d_expanded)  # (B, 32, 64)
+        x = self.chip_block1_bn1(x)
+        x = F.relu(x)
+        x = self.chip_block1_conv2(x)  # (B, 32, 64)
+        x = self.chip_block1_bn2(x)
+        skip1 = self.chip_block1_skip(chip_1d_expanded)  # (B, 32, 64)
+        x = F.relu(x + skip1)  # Residual connection
+        
+        # ResNet Block 2: (B, 32, 64) -> (B, 64, 64)
+        y = self.chip_block2_conv1(x)  # (B, 64, 64)
+        y = self.chip_block2_bn1(y)
+        y = F.relu(y)
+        y = self.chip_block2_conv2(y)  # (B, 64, 64)
+        y = self.chip_block2_bn2(y)
+        skip2 = self.chip_block2_skip(x)  # (B, 64, 64)
+        chip_embedding = F.relu(y + skip2)  # Residual connection
+        
+        # Transpose to (B, 64, 64) for cross-attention: (sequence_length, embedding_dim)
+        chip_embedding = chip_embedding.transpose(1, 2)  # (B, 64, 64)
+        
+        return chip_embedding
+
+
+############################################
 # 3.5) CROSS-ATTENTION CONDITIONING BLOCK
 ############################################
 class CrossAttentionCond(nn.Module):
@@ -456,24 +528,9 @@ class SR3UNet(nn.Module):
         noise_dim = self.noise_embed.mlp[-1].out_features
         
         # ---- Shared ChIP-seq embedding (computed once, used by both cross-attention blocks) ----
-        # adaptation of the paper Oragami feature embedding of chip data.
-        # https://www.nature.com/articles/s41587-022-01612-8
-        # Convolutional ResNet-style embedding: (B, 64, 1) -> (B, 64, 64)
-        d_cond = 64  # Final ChIP-seq embedding dimension
-        
-        # ResNet Block 1: (B, 64, 1) -> (B, 64, 32)
-        self.chip_block1_conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
-        self.chip_block1_bn1 = nn.BatchNorm1d(32)
-        self.chip_block1_conv2 = nn.Conv1d(32, 32, kernel_size=3, padding=1)
-        self.chip_block1_bn2 = nn.BatchNorm1d(32)
-        self.chip_block1_skip = nn.Conv1d(1, 32, kernel_size=1)  # Skip connection projection
-        
-        # ResNet Block 2: (B, 64, 32) -> (B, 64, 64)
-        self.chip_block2_conv1 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.chip_block2_bn1 = nn.BatchNorm1d(64)
-        self.chip_block2_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
-        self.chip_block2_bn2 = nn.BatchNorm1d(64)
-        self.chip_block2_skip = nn.Conv1d(32, 64, kernel_size=1)  # Skip connection projection
+        # Each track produces (B, 64, 64), concatenated to (B, 64, 128)
+        d_cond = 128  # Final ChIP-seq embedding dimension (64 per track, concatenated)
+        self.chip_embedding = ChIPSeqEmbedding(d_cond=64)  # Each track has 64-dim embedding
         
         # Learnable parameter to control ChIP-seq conditioning strength
         self.chip_scale = nn.Parameter(torch.zeros(1))  # Start at 0 (exp(0) = 1.0 = full conditioning)
@@ -495,7 +552,7 @@ class SR3UNet(nn.Module):
         # Cross-attention conditioning at 16x16 (encoder) - uses shared chip_embedding
         self.enc3_cross_attn = CrossAttentionCond(
             d_model=base_ch * 4,  # 256 when base_ch=64
-            d_cond=d_cond,  # 64
+            d_cond=d_cond,  # 128 (concatenated from two 64-dim tracks)
             n_heads=4,
             dropout=0.0
         )
@@ -515,7 +572,7 @@ class SR3UNet(nn.Module):
         # Cross-attention conditioning at 16x16 (decoder) - uses shared chip_embedding
         self.dec3_cross_attn = CrossAttentionCond(
             d_model=base_ch * 4,  # 256 when base_ch=64
-            d_cond=d_cond,  # 64
+            d_cond=d_cond,  # 128 (concatenated from two 64-dim tracks)
             n_heads=4,
             dropout=0.2
         )
@@ -541,15 +598,16 @@ class SR3UNet(nn.Module):
         nn.init.zeros_(self.output_block[-1].weight)
         nn.init.zeros_(self.output_block[-1].bias)
     
-    def forward(self, x_t_vec, gamma, chip_1d, bulk_vec):
+    def forward(self, x_t_vec, gamma, chip_ctcf, chip_histone, bulk_vec):
         """
         SR3 forward pass: Predict noise ε given noisy input y_γ.
         
         Args:
-            x_t_vec:  (B, vec_dim) noisy Hi-C vector y_γ
-            gamma:    (B,) or (B, 1) noise level γ ∈ [0, 1]
-            chip_1d:  (B, 64) ChIP-seq signal (used in cross-attention at 16x16)
-            bulk_vec: (B, vec_dim) bulk Hi-C vector (conditioning)
+            x_t_vec:      (B, vec_dim) noisy Hi-C vector y_γ
+            gamma:        (B,) or (B, 1) noise level γ ∈ [0, 1]
+            chip_ctcf:    (B, 64) CTCF ChIP-seq signal (used in cross-attention at 16x16)
+            chip_histone: (B, 64) H3K4me1 ChIP-seq signal (used in cross-attention at 16x16)
+            bulk_vec:     (B, vec_dim) bulk Hi-C vector (conditioning)
         
         Returns:
             eps_vec: (B, vec_dim) predicted noise ε
@@ -576,29 +634,12 @@ class SR3UNet(nn.Module):
         h = self.input_conv(x_in)  # (B, base_ch, 64, 64)
         
         # --- Compute ChIP-seq embedding once (shared by both cross-attention blocks) ---
-        # Handle ChIP-seq input shape: (B, 64) -> (B, 1, 64) for Conv1d
-        chip_1d_expanded = chip_1d.unsqueeze(1)  # (B, 1, 64) - Conv1d expects (B, C, L)
-        
-        # ResNet Block 1: (B, 1, 64) -> (B, 32, 64)
-        x = self.chip_block1_conv1(chip_1d_expanded)  # (B, 32, 64)
-        x = self.chip_block1_bn1(x)
-        x = F.relu(x)
-        x = self.chip_block1_conv2(x)  # (B, 32, 64)
-        x = self.chip_block1_bn2(x)
-        skip1 = self.chip_block1_skip(chip_1d_expanded)  # (B, 32, 64)
-        x = F.relu(x + skip1)  # Residual connection
-        
-        # ResNet Block 2: (B, 32, 64) -> (B, 64, 64)
-        y = self.chip_block2_conv1(x)  # (B, 64, 64)
-        y = self.chip_block2_bn1(y)
-        y = F.relu(y)
-        y = self.chip_block2_conv2(y)  # (B, 64, 64)
-        y = self.chip_block2_bn2(y)
-        skip2 = self.chip_block2_skip(x)  # (B, 64, 64)
-        chip_embedding = F.relu(y + skip2)  # Residual connection
-        
-        # Transpose to (B, 64, 64) for cross-attention: (sequence_length, embedding_dim)
-        chip_embedding = chip_embedding.transpose(1, 2)  # (B, 64, 64)
+        chip_embedding_ctcf = self.chip_embedding(chip_ctcf)  # (B, 64, 64)
+        chip_embedding_histone = self.chip_embedding(chip_histone)  # (B, 64, 64)
+
+        # Concatenate along the embedding dimension (dim=2) to combine both tracks
+        # Result: (B, 64, 128) where 64 is sequence length and 128 is embedding dimension
+        chip_embedding = torch.cat([chip_embedding_ctcf, chip_embedding_histone], dim=2)  # (B, 64, 128)
         
         # ========== ENCODER ==========
         # Level 1: 64x64
@@ -757,8 +798,9 @@ def train_step(model, optimizer, batch, device, phase_name):
     x0_bulk_normalized = (x0_early + x0_mid + x0_late + x0_anatelo) / 4  # (batch_size, vec_dim)
     batch_size = x0_bulk_normalized.shape[0]
     
-    # Get ChIP-seq conditioning (already batched - kept for compatibility but unused)
-    chip_1d = batch['chip_seq'].float().to(device)  # (batch_size, N)
+    # Get ChIP-seq conditioning (both CTCF and H3K4me1 tracks)
+    chip_ctcf = batch['chip_seq_ctcf'].float().to(device)  # (batch_size, N)
+    chip_histone = batch['chip_seq_hac'].float().to(device)  # (batch_size, N)
     
     # SR3 TRAINING (Algorithm 1): Sample random noise level γ ~ Uniform(0, 1)
     # γ represents the noise variance: 0 = clean, 1 = pure noise
@@ -775,7 +817,7 @@ def train_step(model, optimizer, batch, device, phase_name):
     
     # SR3 MODEL: Predicts noise ε given (y_γ, γ, conditioning)
     # No timesteps in training - γ is passed directly!
-    eps_pred = model(y_gamma, gamma_t.squeeze(), chip_1d, x0_bulk_normalized)
+    eps_pred = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_histone, x0_bulk_normalized)
     
     # SR3 LOSS: MSE between predicted noise and true noise
     # Algorithm 1 line 5: minimize ||f_θ(x, √γ y_0 + √(1-γ)ε, γ) - ε||²
