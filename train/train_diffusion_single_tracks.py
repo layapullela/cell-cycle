@@ -130,7 +130,7 @@ PHASES = ["earlyG1", "midG1", "lateG1", "anatelo"]
 
 # MEMORY OPTIMIZATION: Train one phase at a time
 # Change this to 'earlyG1', 'midG1', 'lateG1', or 'anatelo' to train different phases
-CURRENT_PHASE = 'anatelo'  # <-- CHANGE THIS to train different phases
+CURRENT_PHASE = 'lateG1'  # <-- CHANGE THIS to train different phases
 
 T = 1000              # diffusion steps
 N = 64                # contact map size (64 x 64)
@@ -141,7 +141,7 @@ d_t = 256             # time embedding dimension
 
 BATCH_SIZE = 32       # Increased from 8 since we have more memory with single model
 LR = 1e-4
-NUM_EPOCHS = 1        # More epochs since we're training one at a time
+NUM_EPOCHS = 2        # More epochs since we're training one at a time
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Model checkpoints directory
@@ -625,8 +625,7 @@ class SR3UNet(nn.Module):
 
     Architecture:
         - Input: noisy (1) + bulk Hi-C (1) only → (B, 2, 64, 64); ChIP is supplemental
-        - ChIP-seq: pairwise maps at multiple resolutions (64/32/16/8), converted to FiLM (scale/shift)
-          and applied at each U-Net depth in both encoder and decoder
+        - ChIP-seq: CTCF + histone, each as pairwise (i,j) at 64/32/16/8 → 4 ch total, FiLM at each depth
         - Four downsampling stages: 64 → 32 → 16 → 8
         - BigGAN residual blocks + self-attention at 16×16 (encoder/decoder) and 8×8 (bottleneck)
         - Standard U-Net skip connections (concatenation)
@@ -644,31 +643,31 @@ class SR3UNet(nn.Module):
         # Input: noisy + bulk ONLY (foundation)
         self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
 
-        # ChIP → FiLM parameters at each U-Net depth
+        # ChIP → FiLM parameters at each U-Net depth (4 channels: CTCF i,j + histone i,j)
         # 64×64, C = base_ch
         self.chip_to_film_64 = nn.Sequential(
-            nn.Conv2d(2, base_ch * 2, kernel_size=1),   # scale + shift
+            nn.Conv2d(4, base_ch * 2, kernel_size=1),   # scale + shift
             nn.GroupNorm(8, base_ch * 2),
             nn.SiLU()
         )
 
         # 32×32, C = base_ch * 2
         self.chip_to_film_32 = nn.Sequential(
-            nn.Conv2d(2, base_ch * 2 * 2, kernel_size=1),
+            nn.Conv2d(4, base_ch * 2 * 2, kernel_size=1),
             nn.GroupNorm(8, base_ch * 2 * 2),
             nn.SiLU()
         )
 
         # 16×16, C = base_ch * 4
         self.chip_to_film_16 = nn.Sequential(
-            nn.Conv2d(2, base_ch * 4 * 2, kernel_size=1),
+            nn.Conv2d(4, base_ch * 4 * 2, kernel_size=1),
             nn.GroupNorm(8, base_ch * 4 * 2),
             nn.SiLU()
         )
 
         # 8×8, C = base_ch * 8
         self.chip_to_film_8 = nn.Sequential(
-            nn.Conv2d(2, base_ch * 8 * 2, kernel_size=1),
+            nn.Conv2d(4, base_ch * 8 * 2, kernel_size=1),
             nn.GroupNorm(8, base_ch * 8 * 2),
             nn.SiLU()
         )
@@ -739,8 +738,7 @@ class SR3UNet(nn.Module):
         """
         SR3 forward pass: Predict noise ε given noisy input y_γ.
 
-        ChIP-seq: pairwise maps at multiple resolutions → FiLM (scale/shift) gating at each U-Net depth;
-        single track (chip_histone) for testing.
+        ChIP-seq: CTCF + histone, each pairwise (i,j) at multiple resolutions → FiLM at each U-Net depth.
 
         Args:
             x_t_vec:      (B, vec_dim) noisy Hi-C vector y_γ
@@ -768,11 +766,19 @@ class SR3UNet(nn.Module):
         x_in = torch.cat([x_t_map, bulk_map], dim=1)                    # (B, 2, 64, 64)
         h = self.input_conv(x_in)                                       # (B, base_ch, 64, 64)
 
-        # Precompute ChIP pairwise maps at all needed resolutions
-        chip_64 = self.create_chip_pairwise(chip_ctcf, 64)           # (B, 2, 64, 64)
-        chip_32 = self.create_chip_pairwise(chip_ctcf, 32)           # (B, 2, 32, 32)
-        chip_16 = self.create_chip_pairwise(chip_ctcf, 16)           # (B, 2, 16, 16)
-        chip_8  = self.create_chip_pairwise(chip_ctcf, 8)            # (B, 2, 8, 8)
+        # Precompute ChIP pairwise maps at all needed resolutions (CTCF + histone, each 2 ch → 4 ch total)
+        chip_ctcf_64 = self.create_chip_pairwise(chip_ctcf, 64)       # (B, 2, 64, 64)
+        chip_histone_64 = self.create_chip_pairwise(chip_histone, 64)
+        chip_64 = torch.cat([chip_ctcf_64, chip_histone_64], dim=1)   # (B, 4, 64, 64)
+        chip_ctcf_32 = self.create_chip_pairwise(chip_ctcf, 32)
+        chip_histone_32 = self.create_chip_pairwise(chip_histone, 32)
+        chip_32 = torch.cat([chip_ctcf_32, chip_histone_32], dim=1)   # (B, 4, 32, 32)
+        chip_ctcf_16 = self.create_chip_pairwise(chip_ctcf, 16)
+        chip_histone_16 = self.create_chip_pairwise(chip_histone, 16)
+        chip_16 = torch.cat([chip_ctcf_16, chip_histone_16], dim=1)   # (B, 4, 16, 16)
+        chip_ctcf_8 = self.create_chip_pairwise(chip_ctcf, 8)
+        chip_histone_8 = self.create_chip_pairwise(chip_histone, 8)
+        chip_8 = torch.cat([chip_ctcf_8, chip_histone_8], dim=1)      # (B, 4, 8, 8)
 
         # Chip strength: exp(-gamma) so ChIP conditioning is strongest at low noise (small gamma)
         chip_strength = torch.exp(-gamma).view(-1, 1, 1, 1)
@@ -902,7 +908,7 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
 ############################################
 # 6) TRAINING LOOP
 ############################################
-def train_step(model, optimizer, batch, device, phase_name):
+def train_step(model, optimizer, batch, device, phase_name, global_step=0):
     """
     Single training step for SR3-style iterative refinement.
     
@@ -915,6 +921,7 @@ def train_step(model, optimizer, batch, device, phase_name):
         batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'chip_seq'
         device: torch device
         phase_name: 'earlyG1', 'midG1', 'lateG1', or 'anatelo'
+        global_step: current training step (used to determine bulk corruption rate)
     
     Returns:
         float: loss for this phase
@@ -938,14 +945,20 @@ def train_step(model, optimizer, batch, device, phase_name):
     x0_bulk_normalized = (x0_early + x0_mid + x0_late + x0_anatelo) / 4  # (batch_size, vec_dim)
     batch_size = x0_bulk_normalized.shape[0]
 
-    # 20% of the time: replace bulk with random noise to force model to rely on ChIP/FiLM
+    # Bulk corruption: first 100 iterations = 100% corruption (force ChIP-only learning)
+    # After 100 iterations = 10% corruption (normal training)
     bulk_for_model = x0_bulk_normalized.clone()
-    corrupt_mask = torch.rand(batch_size, device=device) < 0.20
-    n_corrupt = corrupt_mask.sum().item()
-    if n_corrupt > 0:
-        bulk_for_model[corrupt_mask] = torch.randn(
-            n_corrupt, x0_bulk_normalized.shape[1], device=device, dtype=x0_bulk_normalized.dtype
-        )
+    if global_step < 60:
+        # First 100 iterations: corrupt all bulk data to force model to use ChIP/FiLM
+        bulk_for_model = torch.randn_like(x0_bulk_normalized)
+    else:
+        # After 100 iterations: 10% corruption rate
+        corrupt_mask = torch.rand(batch_size, device=device) < 0.10
+        n_corrupt = corrupt_mask.sum().item()
+        if n_corrupt > 0:
+            bulk_for_model[corrupt_mask] = torch.randn(
+                n_corrupt, x0_bulk_normalized.shape[1], device=device, dtype=x0_bulk_normalized.dtype
+            )
     
     # Get ChIP-seq conditioning (both CTCF and H3K4me1 tracks)
     chip_ctcf = batch['chip_seq_ctcf'].float().to(device)  # (batch_size, N)
@@ -966,7 +979,8 @@ def train_step(model, optimizer, batch, device, phase_name):
     y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
     
     # SR3 MODEL: Predicts noise ε given (y_γ, γ, conditioning)
-    # No timesteps in training - γ is passed directly! (bulk_for_model may be corrupted for 10% of batch)
+    # No timesteps in training - γ is passed directly!
+    # bulk_for_model: 100% corrupted for first 100 steps (ChIP-only), then 10% corrupted
     eps_pred = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_histone, chi_rad21, bulk_for_model)
     
     # SR3 LOSS: MSE between predicted noise and true noise
@@ -1221,7 +1235,7 @@ def main():
         total_epochs = start_epoch + NUM_EPOCHS
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [{CURRENT_PHASE}]")
         for batch_idx, batch in enumerate(pbar):
-            loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE)
+            loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE, global_step)
             epoch_losses.append(loss)
             global_step += 1
             
@@ -1242,21 +1256,21 @@ def main():
         total_epochs = start_epoch + NUM_EPOCHS
         print(f"\nEpoch {epoch+1}/{total_epochs} - Average Loss: {avg_loss:.6f}")
         
-        # Save checkpoint if best
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_best_histone_ac_no_cross_attention_film_chip_at_16x16_try4_ctcf.pth"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-                'global_step': global_step,
-            }, checkpoint_path)
-            print(f"✓ Saved best checkpoint: {checkpoint_path}")
+        # # Save checkpoint if best
+        # if avg_loss < best_loss:
+        #     best_loss = avg_loss
+        #     checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_best_histone_ac_no_cross_attention_film_chip_at_16x16_try5_ctcf_and_histone.pth"
+        #     torch.save({
+        #         'epoch': epoch,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'loss': avg_loss,
+        #         'global_step': global_step,
+        #     }, checkpoint_path)
+        #     print(f"✓ Saved best checkpoint: {checkpoint_path}")
         
         # Save epoch checkpoint (use absolute epoch number)
-        checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_epoch{epoch+1}_histone_ac_no_cross_attention_film_chip_at_16x16_try4_ctcf.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_epoch{epoch+1}_final_feb_3_2026_1.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
