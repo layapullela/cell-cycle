@@ -130,7 +130,7 @@ PHASES = ["earlyG1", "midG1", "lateG1", "anatelo"]
 
 # MEMORY OPTIMIZATION: Train one phase at a time
 # Change this to 'earlyG1', 'midG1', 'lateG1', or 'anatelo' to train different phases
-CURRENT_PHASE = 'lateG1'  # <-- CHANGE THIS to train different phases
+CURRENT_PHASE = 'anatelo'  # <-- CHANGE THIS to train different phases
 
 T = 1000              # diffusion steps
 N = 64                # contact map size (64 x 64)
@@ -150,8 +150,7 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 # Resume training from checkpoint (set to None to start from scratch)
 # Example: RESUME_CHECKPOINT = "anatelo_epoch2_1-21.pth"
-#RESUME_CHECKPOINT = "anatelo_best_histone_ac_no_cross_attention_film_chip_at_16x16.pth"
-RESUME_CHECKPOINT = None
+RESUME_CHECKPOINT = "anatelo_epoch4_final_feb_3_2026_3.pth"
 
 
 
@@ -326,227 +325,6 @@ class BigGANResBlock(nn.Module):
         h = self.conv2(h)
         
         return h + residual
-
-
-############################################
-# 3.4) CHIP-SEQ EMBEDDING (ResNet-style)
-############################################
-class ChIPSeqEmbedding(nn.Module):
-    """
-    ResNet-style embedding for ChIP-seq 1D signals.
-    
-    Based on the Oragami feature embedding approach:
-    https://www.nature.com/articles/s41587-022-01612-8
-    
-    Architecture:
-        - Input: (B, 64) ChIP-seq signal
-        - ResNet Block 1: (B, 1, 64) -> (B, 64, 64)
-        - 1×1 projection: (B, 64, 64) -> (B, d_cond, 64)  (default d_cond=32)
-        - ResNet Block 2: (B, d_cond, 64) -> (B, d_cond, 64)
-        - Output: (B, 64, d_cond) after transpose, for cross-attention
-    
-    Args:
-        d_cond: Final embedding dimension (default: 64)
-    """
-    def __init__(self, d_cond=32):
-        super().__init__()
-        self.d_cond = d_cond
-        
-        # ResNet Block 1: (B, 1, 64) -> (B, 64, 64)
-        self.chip_block1_conv1 = nn.Conv1d(1, 64, kernel_size=3, padding=1)
-        self.chip_block1_bn1 = nn.BatchNorm1d(64)
-        self.chip_block1_conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
-        self.chip_block1_bn2 = nn.BatchNorm1d(64)
-        self.chip_block1_skip = nn.Conv1d(1, 64, kernel_size=1)  # Skip connection projection
-
-        # 1x1 projection to reduce feature size for second block: (B, 64, 64) -> (B, d_cond, 64)
-        self.chip_proj1x1 = nn.Conv1d(64, d_cond, kernel_size=1)
-        self.chip_proj_bn = nn.BatchNorm1d(d_cond)
-        
-        # ResNet Block 2: (B, d_cond, 64) -> (B, d_cond, 64)
-        self.chip_block2_conv1 = nn.Conv1d(d_cond, d_cond, kernel_size=3, padding=1)
-        self.chip_block2_bn1 = nn.BatchNorm1d(d_cond)
-        self.chip_block2_conv2 = nn.Conv1d(d_cond, d_cond, kernel_size=3, padding=1)
-        self.chip_block2_bn2 = nn.BatchNorm1d(d_cond)
-        self.chip_block2_skip = nn.Conv1d(d_cond, d_cond, kernel_size=1)  # Skip connection projection
-
-        # Fixed sinusoidal positional encoding for 64 genomic bins
-        # Shape: (64, d_cond), added to final (B, 64, d_cond) embedding
-        self.register_buffer(
-            "pos_encoding",
-            self._build_positional_encoding(seq_len=64, d_model=d_cond),
-            persistent=False,
-        )
-
-    @staticmethod
-    def _build_positional_encoding(seq_len: int, d_model: int) -> torch.Tensor:
-        """
-        Standard Transformer-style sinusoidal positional encoding.
-
-        Returns:
-            pe: (seq_len, d_model) tensor
-        """
-        position = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)  # (L, 1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32)
-            * (-math.log(10000.0) / max(1, d_model))
-        )  # (d_model/2,)
-
-        pe = torch.zeros(seq_len, d_model, dtype=torch.float32)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe  # (L, d_model)
-    
-    def forward(self, chip_1d):
-        """
-        Args:
-            chip_1d: (B, 64) ChIP-seq signal
-        
-        Returns:
-            chip_embedding: (B, 64, 64) embedded ChIP-seq tokens for cross-attention
-        """
-        # Handle ChIP-seq input shape: (B, 64) -> (B, 1, 64) for Conv1d
-        chip_1d_expanded = chip_1d.unsqueeze(1)  # (B, 1, 64) - Conv1d expects (B, C, L)
-        
-        # ResNet Block 1: (B, 1, 64) -> (B, 64, 64)
-        x = self.chip_block1_conv1(chip_1d_expanded)  # (B, 64, 64)
-        x = self.chip_block1_bn1(x)
-        x = F.relu(x)
-        x = self.chip_block1_conv2(x)  # (B, 64, 64)
-        x = self.chip_block1_bn2(x)
-        skip1 = self.chip_block1_skip(chip_1d_expanded)  # (B, 64, 64)
-        x = F.relu(x + skip1)  # Residual connection
-
-        # 1x1 projection to reduced feature size for second block: (B, 64, 64) -> (B, d_cond, 64)
-        x = self.chip_proj1x1(x)  # (B, d_cond, 64)
-        x = self.chip_proj_bn(x)
-        x = F.relu(x)
-        
-        # ResNet Block 2: (B, d_cond, 64) -> (B, d_cond, 64)
-        y = self.chip_block2_conv1(x)  # (B, d_cond, 64)
-        y = self.chip_block2_bn1(y)
-        y = F.relu(y)
-        y = self.chip_block2_conv2(y)  # (B, d_cond, 64)
-        y = self.chip_block2_bn2(y)
-        skip2 = self.chip_block2_skip(x)  # (B, d_cond, 64)
-        chip_embedding = F.relu(y + skip2)  # Residual connection
-        
-        # Transpose to (B, 64, d_cond) for cross-attention: (sequence_length, embedding_dim)
-        chip_embedding = chip_embedding.transpose(1, 2)  # (B, 64, d_cond)
-
-        # Add positional encoding along the sequence dimension (broadcast over batch)
-        # pos_encoding: (64, d_cond) -> (1, 64, d_cond) to match (B, 64, d_cond)
-        chip_embedding = chip_embedding + self.pos_encoding.unsqueeze(0)
-        
-        return chip_embedding
-
-
-############################################
-# 3.5) CROSS-ATTENTION CONDITIONING BLOCK
-############################################
-class CrossAttentionCond(nn.Module):
-    """
-    Cross-attention conditioning block for injecting ChIP-seq signals into U-Net features.
-    
-    Implements text-style cross-attention:
-    - Q from spatial tokens of image features X
-    - K/V from pre-embedded ChIP-seq tokens (embedding computed once in SR3UNet)
-    
-    Args:
-        d_model: Model dimension (should match feature map channels at 16x16)
-        d_cond: Hidden dimension for ChIP-seq embedding (default: 64)
-        n_heads: Number of attention heads (default: 4)
-        dropout: Dropout rate (default: 0.0)
-    """
-    def __init__(self, d_model=128, d_cond=64, n_heads=4, dropout=0.0):
-        super().__init__()
-        self.d_model = d_model
-        self.d_cond = d_cond
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        
-        assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
-        
-        # Project pre-embedded ChIP-seq to K and V
-        self.k_proj = nn.Linear(d_cond, d_model)
-        self.v_proj = nn.Linear(d_cond, d_model)
-        
-        # Query projection from image features
-        self.q_proj = nn.Linear(d_model, d_model)
-        
-        # Output projection
-        self.out_proj = nn.Linear(d_model, d_model)
-        
-        # Zero-initialize output projection for stability
-        #nn.init.zeros_(self.out_proj.weight)
-        #nn.init.zeros_(self.out_proj.bias)
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        
-        # Layer normalization (pre-norm style)
-        self.norm = nn.LayerNorm(d_model)
-    
-    def forward(self, X, chip_embedding):
-        """
-        Args:
-            X: (B, C, 16, 16) feature map where C == d_model
-            chip_embedding: (B, 64, d_cond) pre-embedded ChIP-seq tokens
-        
-        Returns:
-            X_out: (B, C, 16, 16) conditioned feature map
-        """
-        B, C, H, W = X.shape
-        assert H == 16 and W == 16, f"Expected 16x16, got {H}x{W}"
-        assert C == self.d_model, f"Channel mismatch: X has {C}, expected {self.d_model}"
-        
-        # chip_embedding should be (B, 64, d_cond)
-        assert chip_embedding.shape == (B, 64, self.d_cond), \
-            f"Expected chip_embedding shape (B, 64, {self.d_cond}), got {chip_embedding.shape}"
-        
-        # Project pre-embedded ChIP-seq to K and V
-        K = self.k_proj(chip_embedding)  # (B, 64, d_model)
-        V = self.v_proj(chip_embedding)  # (B, 64, d_model)
-        
-        # 2) Query path from image features
-        # Reshape spatial map into tokens
-        X_tokens = X.permute(0, 2, 3, 1).reshape(B, H * W, self.d_model)  # (B, 256, d_model)
-        
-        # Apply pre-norm
-        X_tokens_norm = self.norm(X_tokens)
-        
-        # Project to Q
-        Q = self.q_proj(X_tokens_norm)  # (B, 256, d_model)
-        
-        # 3) Multi-head cross-attention
-        # Reshape for multi-head: (B, n_heads, seq_len, d_head)
-        Q = Q.view(B, H * W, self.n_heads, self.d_head).transpose(1, 2)  # (B, n_heads, 256, d_head)
-        K = K.view(B, 64, self.n_heads, self.d_head).transpose(1, 2)     # (B, n_heads, 64, d_head)
-        V = V.view(B, 64, self.n_heads, self.d_head).transpose(1, 2)     # (B, n_heads, 64, d_head)
-        
-        # Compute attention scores
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_head ** 0.5)  # (B, n_heads, 256, 64)
-        attn_weights = F.softmax(scores, dim=-1)  # (B, n_heads, 256, 64)
-        
-        # Apply attention to values
-        M_heads = torch.matmul(attn_weights, V)  # (B, n_heads, 256, d_head)
-        
-        # Merge heads
-        M_tokens = M_heads.transpose(1, 2).contiguous().view(B, H * W, self.d_model)  # (B, 256, d_model)
-        
-        # Output projection
-        M_tokens = self.out_proj(M_tokens)  # (B, 256, d_model)
-        
-        # 4) Reshape and residual fuse
-        M = M_tokens.reshape(B, H, W, self.d_model).permute(0, 3, 1, 2)  # (B, d_model, 16, 16)
-        M = self.dropout(M)
-        
-        # Residual connection
-        X_out = X + M  # (B, C, 16, 16)
-        
-        return X_out
-
-
 ############################################
 # 3.6) SELF-ATTENTION BLOCK
 ############################################
@@ -617,6 +395,69 @@ class SelfAttentionBlock(nn.Module):
 
 
 ############################################
+# 3.7) ChIP-SEQ ENCODER (per-bin MLP + 1D conv contextualizer over 64 bins)
+############################################
+class ChIPSeqEncoder(nn.Module):
+    """
+    Encode two 1D ChIP tracks into contextualized per-bin embeddings, then form
+    pairwise 2D map for FiLM. Lightweight: per-bin MLP + 1D conv contextualizer (no attention).
+    """
+    def __init__(self, d_chip: int = 16, n_bins: int = 64):
+        super().__init__()
+        self.d_chip = d_chip
+        self.n_bins = n_bins
+
+        # Per-bin MLP: (CTCF_bin, histone_bin) → d_chip
+        self.per_bin_mlp = nn.Sequential(
+            nn.Linear(2, d_chip * 2),
+            nn.LayerNorm(d_chip * 2),
+            nn.SiLU(),
+            nn.Linear(d_chip * 2, d_chip),
+            nn.LayerNorm(d_chip)
+        )
+
+        # Contextualizer: 1D conv instead of self-attention (faster, simpler)
+        # BatchNorm1d over (B, C, L) normalizes per channel; LayerNorm would need (B, L, C)
+        self.contextualizer = nn.Sequential(
+            nn.Conv1d(d_chip, d_chip * 2, kernel_size=5, padding=2, groups=1),
+            nn.BatchNorm1d(d_chip * 2),
+            nn.SiLU(),
+            nn.Conv1d(d_chip * 2, d_chip, kernel_size=5, padding=2, groups=1),
+            nn.BatchNorm1d(d_chip)
+        )
+
+    def forward(self, chip_ctcf, chip_histone):
+        """
+        Args:
+            chip_ctcf:   (B, 64) CTCF ChIP
+            chip_histone: (B, 64) histone ChIP
+        Returns:
+            chip_map: (B, 2*d_chip, 64, 64) pairwise contextualized embeddings for 64×64
+        """
+        B = chip_ctcf.shape[0]
+
+        # Per-bin MLP: combine CTCF + histone
+        x = torch.stack([chip_ctcf.float(), chip_histone.float()], dim=-1)  # (B, 64, 2)
+        h = self.per_bin_mlp(x)  # (B, 64, d_chip)
+
+        # Contextualize with 1D conv (allow bins to see neighbors)
+        h_t = h.transpose(1, 2)  # (B, d_chip, 64) for conv1d
+        h_t = h_t + self.contextualizer(h_t)  # Residual connection
+        h = h_t.transpose(1, 2)  # (B, 64, d_chip)
+
+        # Normalize embeddings
+        h = F.normalize(h, dim=-1, eps=1e-6)
+
+        # Pairwise concatenation
+        embed_i = h.unsqueeze(2).expand(B, self.n_bins, self.n_bins, self.d_chip)
+        embed_j = h.unsqueeze(1).expand(B, self.n_bins, self.n_bins, self.d_chip)
+        pair = torch.cat([embed_i, embed_j], dim=-1)  # (B, 64, 64, 2*d_chip)
+        chip_map = pair.permute(0, 3, 1, 2)  # (B, 2*d_chip, 64, 64)
+
+        return chip_map
+
+
+############################################
 # 4) SR3-STYLE U-NET (Denoised Image Predictor)
 ############################################
 class SR3UNet(nn.Module):
@@ -625,52 +466,56 @@ class SR3UNet(nn.Module):
 
     Architecture:
         - Input: noisy (1) + bulk Hi-C (1) only → (B, 2, 64, 64); ChIP is supplemental
-        - ChIP-seq: CTCF + histone, each as pairwise (i,j) at 64/32/16/8 → 4 ch total, FiLM at each depth
+        - ChIP-seq: two tracks encoded per-bin (MLP 2→d) + 1D conv contextualizer over 64 bins,
+          pairwise (i,j) contextualized embeddings → 2d-channel map, FiLM at 64×64
         - Four downsampling stages: 64 → 32 → 16 → 8
         - BigGAN residual blocks + self-attention at 16×16 (encoder/decoder) and 8×8 (bottleneck)
         - Standard U-Net skip connections (concatenation)
         - Output: Predicted noise ε
     """
-    def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64):
+    def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64, d_chip: int = 16):
         super().__init__()
         self.vec_dim = vec_dim
         self.n = n
         self.noise_embed = noise_embed_module
         self.base_ch = base_ch
+        self.d_chip = d_chip
+        chip_ch = 2 * d_chip  # pairwise concat -> 2d channels
 
         noise_dim = self.noise_embed.mlp[-1].out_features
 
         # Input: noisy + bulk ONLY (foundation)
         self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
 
-        # ChIP → FiLM parameters at each U-Net depth (4 channels: CTCF i,j + histone i,j)
-        # 64×64, C = base_ch
+        # ChIP: per-bin MLP + 1D conv contextualizer → pairwise 2D map (B, 2d, 64, 64)
+        self.chip_encoder = ChIPSeqEncoder(d_chip=d_chip, n_bins=64)
+
+        # ChIP → FiLM only at 64×64 (no downsampling of ChIP to avoid extra noise)
         self.chip_to_film_64 = nn.Sequential(
-            nn.Conv2d(4, base_ch * 2, kernel_size=1),   # scale + shift
+            nn.Conv2d(chip_ch, base_ch * 2, kernel_size=1),
             nn.GroupNorm(8, base_ch * 2),
             nn.SiLU()
         )
-
-        # 32×32, C = base_ch * 2
-        self.chip_to_film_32 = nn.Sequential(
-            nn.Conv2d(4, base_ch * 2 * 2, kernel_size=1),
-            nn.GroupNorm(8, base_ch * 2 * 2),
-            nn.SiLU()
+        # Learnable chip strength as function of noise embedding
+        self.noise_to_strength = nn.Sequential(
+            nn.Linear(noise_dim, 1),
+            nn.Sigmoid()  # Forces strength to be between 0 (off) and 1 (on)
         )
-
-        # 16×16, C = base_ch * 4
-        self.chip_to_film_16 = nn.Sequential(
-            nn.Conv2d(4, base_ch * 4 * 2, kernel_size=1),
-            nn.GroupNorm(8, base_ch * 4 * 2),
-            nn.SiLU()
-        )
-
-        # 8×8, C = base_ch * 8
-        self.chip_to_film_8 = nn.Sequential(
-            nn.Conv2d(4, base_ch * 8 * 2, kernel_size=1),
-            nn.GroupNorm(8, base_ch * 8 * 2),
-            nn.SiLU()
-        )
+        # self.chip_to_film_32 = nn.Sequential(
+        #     nn.Conv2d(chip_ch, base_ch * 2 * 2, kernel_size=1),
+        #     nn.GroupNorm(8, base_ch * 2 * 2),
+        #     nn.SiLU()
+        # )
+        # self.chip_to_film_16 = nn.Sequential(
+        #     nn.Conv2d(chip_ch, base_ch * 4 * 2, kernel_size=1),
+        #     nn.GroupNorm(8, base_ch * 4 * 2),
+        #     nn.SiLU()
+        # )
+        # self.chip_to_film_8 = nn.Sequential(
+        #     nn.Conv2d(chip_ch, base_ch * 8 * 2, kernel_size=1),
+        #     nn.GroupNorm(8, base_ch * 8 * 2),
+        #     nn.SiLU()
+        # )
 
         # ---- ENCODER ----
         self.enc1 = BigGANResBlock(base_ch, base_ch, noise_dim)
@@ -713,27 +558,6 @@ class SR3UNet(nn.Module):
         nn.init.zeros_(self.output_block[-1].weight)
         nn.init.zeros_(self.output_block[-1].bias)
 
-    def create_chip_pairwise(self, chip_1d, n_bins: int):
-        """
-        Create pairwise ChIP at n_bins×n_bins resolution for FiLM gating.
-        Downsample 64 → n_bins with adaptive max-pooling, then build (i,j) pairwise map.
-
-        Args:
-            chip_1d: (B, 64) ChIP-seq signal
-            n_bins:  number of bins along each axis (e.g., 64, 32, 16, 8)
-
-        Returns:
-            chip_map: (B, 2, n_bins, n_bins) - two channels for row i and col j
-        """
-        B = chip_1d.shape[0]
-        chip_1d = chip_1d.float().unsqueeze(1)                 # (B, 1, 64)
-        chip_n = F.adaptive_max_pool1d(chip_1d, n_bins)        # (B, 1, n_bins)
-        chip_n = chip_n.squeeze(1)                             # (B, n_bins)
-        chip_i = chip_n.unsqueeze(2).expand(B, n_bins, n_bins) # (B, n_bins, n_bins) row-wise
-        chip_j = chip_n.unsqueeze(1).expand(B, n_bins, n_bins) # (B, n_bins, n_bins) col-wise
-        chip_map = torch.stack([chip_i, chip_j], dim=1)        # (B, 2, n_bins, n_bins)
-        return chip_map
-
     def forward(self, x_t_vec, gamma, chip_ctcf, chip_histone, chi_rad21, bulk_vec):
         """
         SR3 forward pass: Predict noise ε given noisy input y_γ.
@@ -766,22 +590,11 @@ class SR3UNet(nn.Module):
         x_in = torch.cat([x_t_map, bulk_map], dim=1)                    # (B, 2, 64, 64)
         h = self.input_conv(x_in)                                       # (B, base_ch, 64, 64)
 
-        # Precompute ChIP pairwise maps at all needed resolutions (CTCF + histone, each 2 ch → 4 ch total)
-        chip_ctcf_64 = self.create_chip_pairwise(chip_ctcf, 64)       # (B, 2, 64, 64)
-        chip_histone_64 = self.create_chip_pairwise(chip_histone, 64)
-        chip_64 = torch.cat([chip_ctcf_64, chip_histone_64], dim=1)   # (B, 4, 64, 64)
-        chip_ctcf_32 = self.create_chip_pairwise(chip_ctcf, 32)
-        chip_histone_32 = self.create_chip_pairwise(chip_histone, 32)
-        chip_32 = torch.cat([chip_ctcf_32, chip_histone_32], dim=1)   # (B, 4, 32, 32)
-        chip_ctcf_16 = self.create_chip_pairwise(chip_ctcf, 16)
-        chip_histone_16 = self.create_chip_pairwise(chip_histone, 16)
-        chip_16 = torch.cat([chip_ctcf_16, chip_histone_16], dim=1)   # (B, 4, 16, 16)
-        chip_ctcf_8 = self.create_chip_pairwise(chip_ctcf, 8)
-        chip_histone_8 = self.create_chip_pairwise(chip_histone, 8)
-        chip_8 = torch.cat([chip_ctcf_8, chip_histone_8], dim=1)      # (B, 4, 8, 8)
+        # ChIP: encode two tracks → pairwise (B, 2*d_chip, 64, 64); only at 64×64, no downsampling
+        chip_64 = self.chip_encoder(chip_ctcf, chip_histone)           # (B, 2*d_chip, 64, 64)
 
-        # Chip strength: exp(-gamma) so ChIP conditioning is strongest at low noise (small gamma)
-        chip_strength = torch.exp(-gamma).view(-1, 1, 1, 1)
+        # Chip strength: learned function of noise embedding (B, noise_dim) -> (B, 1) -> (B, 1, 1, 1)
+        chip_strength = self.noise_to_strength(noise_emb).view(-1, 1, 1, 1)
 
         # Helper: apply FiLM given a chip_to_film module matched to h's channels; scale by chip_strength
         def apply_film(h_feat, chip_map, chip_to_film_module):
@@ -793,20 +606,18 @@ class SR3UNet(nn.Module):
 
         # ========== ENCODER ==========
         # 64×64, C = base_ch
-        h = self.enc1(h, noise_emb)
         h = apply_film(h, chip_64, self.chip_to_film_64)
+        h = self.enc1(h, noise_emb)
         skip1 = h
         h = self.enc1_down(h, noise_emb)                                # (B, base_ch*2, 32, 32)
 
         # 32×32, C = base_ch*2
         h = self.enc2(h, noise_emb)
-        h = apply_film(h, chip_32, self.chip_to_film_32)
         skip2 = h
         h = self.enc2_down(h, noise_emb)                                # (B, base_ch*4, 16, 16)
 
         # 16×16, C = base_ch*4
         h = self.enc3(h, noise_emb)
-        h = apply_film(h, chip_16, self.chip_to_film_16)
         h = self.enc3_self_attn(h)
         skip3 = h
         h = self.enc3_down(h, noise_emb)                                # (B, base_ch*8, 8, 8)
@@ -814,12 +625,10 @@ class SR3UNet(nn.Module):
         # ========== BOTTLENECK: 8x8 ==========
         for block in self.bottleneck:
             h = block(h, noise_emb) if isinstance(block, BigGANResBlock) else block(h)
-        h = apply_film(h, chip_8, self.chip_to_film_8)                  # (B, base_ch*8, 8, 8)
 
         # ========== DECODER ==========
         # 16×16, C = base_ch*4
         h = self.dec3_up(h, noise_emb)                                  # (B, base_ch*4, 16, 16)
-        h = apply_film(h, chip_16, self.chip_to_film_16)
         h = torch.cat([h, skip3], dim=1)                                # (B, base_ch*8, 16, 16)
         h = self.dec3_reduce(h)
         h = self.dec3(h, noise_emb)
@@ -827,16 +636,15 @@ class SR3UNet(nn.Module):
 
         # 32×32, C = base_ch*2
         h = self.dec2_up(h, noise_emb)                                  # (B, base_ch*2, 32, 32)
-        h = apply_film(h, chip_32, self.chip_to_film_32)
         h = torch.cat([h, skip2], dim=1)
         h = self.dec2_reduce(h)
         h = self.dec2(h, noise_emb)
 
-        # 64×64, C = base_ch
+        # 64×64, C = base_ch (ChIP FiLM only here)
         h = self.dec1_up(h, noise_emb)                                  # (B, base_ch, 64, 64)
-        h = apply_film(h, chip_64, self.chip_to_film_64)
         h = torch.cat([h, skip1], dim=1)
         h = self.dec1_reduce(h)
+        h = apply_film(h, chip_64, self.chip_to_film_64)
         h = self.dec1(h, noise_emb)
 
         eps_map = self.output_block(h).squeeze(1)
@@ -906,23 +714,112 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
 
 
 ############################################
+# 5.7) VALIDATION SET (chr2, excluding test-eval regions)
+############################################
+# Ranges used by run_test_evaluation_chromosome2.sh – we exclude these so validation ≠ test eval
+TEST_EVAL_TARGET_RANGES_CHR2 = [
+    (44700000, 45100000),   # chr2:44.7Mb-45.1Mb
+    (18400000, 19400000),   # chr2:18.4Mb-19.4Mb
+]
+
+
+def _parse_region(region_str):
+    """Parse 'chrom:start-end' -> (chrom, start, end)."""
+    chrom, coords = region_str.split(":")
+    start, end = coords.split("-")
+    return chrom, int(start), int(end)
+
+
+def _region_overlaps_any(region_str, ranges):
+    """True if region (start, end) overlaps any (t_start, t_end) in ranges."""
+    _, start, end = _parse_region(region_str)
+    for t_start, t_end in ranges:
+        if start < t_end and end > t_start:
+            return True
+    return False
+
+
+def get_validation_regions_chr2(holdout_regions, n=10, seed=42):
+    """
+    From chr2 holdout regions, exclude those used in run_test_evaluation_chromosome2
+    (44.7–45.1 Mb and 18.4–19.4 Mb), then return n regions for validation.
+    """
+    rng = np.random.default_rng(seed)
+    # Exclude regions that overlap test-eval target ranges
+    valid = [r for r in holdout_regions if not _region_overlaps_any(r, TEST_EVAL_TARGET_RANGES_CHR2)]
+    if len(valid) <= n:
+        return valid
+    indices = rng.choice(len(valid), size=n, replace=False)
+    return [valid[i] for i in indices]
+
+
+############################################
 # 6) TRAINING LOOP
 ############################################
+def eval_batch_loss(model, batch, device, phase_name, generator: torch.Generator | None = None):
+    """
+    Compute SR3 MSE loss for one batch (no backward). Uses clean bulk (no corruption).
+    """
+    x0_early = batch["earlyG1"].float().to(device)
+    x0_mid = batch["midG1"].float().to(device)
+    x0_late = batch["lateG1"].float().to(device)
+    x0_anatelo = batch["anatelo"].float().to(device)
+    phase_data = {"earlyG1": x0_early, "midG1": x0_mid, "lateG1": x0_late, "anatelo": x0_anatelo}
+    x0_current = phase_data[phase_name]
+    x0_bulk_normalized = (x0_early + x0_mid + x0_late + x0_anatelo) / 4
+    batch_size = x0_bulk_normalized.shape[0]
+    bulk_for_model = x0_bulk_normalized
+
+    chip_ctcf = batch["chip_seq_ctcf"].float().to(device)
+    chip_histone = batch["chip_seq_hac"].float().to(device)
+    chi_rad21 = batch["chip_seq_rad21"].float().to(device)
+
+    # Use a local generator if provided so validation gamma/eps are deterministic
+    if generator is not None:
+        gamma_t = torch.rand(batch_size, 1, device=device, generator=generator)
+        eps_true = torch.randn(x0_current.shape, device=device, generator=generator)
+    else:
+        gamma_t = torch.rand(batch_size, 1, device=device)
+        eps_true = torch.randn_like(x0_current)
+    sqrt_gamma_t = torch.sqrt(gamma_t)
+    sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
+    y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
+
+    eps_pred = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_histone, chi_rad21, bulk_for_model)
+    return F.mse_loss(eps_pred, eps_true).item()
+
+
+def compute_validation_loss(model, val_dataloader, device, phase_name):
+    """Average loss over validation set (model in eval mode, no grad)."""
+    model.eval()
+    # Local RNG for validation so gamma/eps are the same every validation call
+    gen = torch.Generator(device=device)
+    gen.manual_seed(12345)
+    total_loss = 0.0
+    n_batches = 0
+    with torch.no_grad():
+        for batch in val_dataloader:
+            total_loss += eval_batch_loss(model, batch, device, phase_name, generator=gen)
+            n_batches += 1
+    model.train()
+    return total_loss / n_batches if n_batches else 0.0
+
+
 def train_step(model, optimizer, batch, device, phase_name, global_step=0):
     """
     Single training step for SR3-style iterative refinement.
-    
+
     Model learns to predict x_{t-1} (less noisy image) from x_t (current noisy image).
     This is the core of SR3: iteratively refining from bulk Hi-C to phase-specific data.
-    
+
     Args:
         model: SR3UNet for the current phase
         optimizer: optimizer for this model
         batch: dict with keys 'region', 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'chip_seq'
         device: torch device
         phase_name: 'earlyG1', 'midG1', 'lateG1', or 'anatelo'
-        global_step: current training step (used to determine bulk corruption rate)
-    
+        global_step: current training step
+
     Returns:
         float: loss for this phase
     """
@@ -931,7 +828,7 @@ def train_step(model, optimizer, batch, device, phase_name, global_step=0):
     x0_mid = batch['midG1'].float().to(device)
     x0_late = batch['lateG1'].float().to(device)
     x0_anatelo = batch['anatelo'].float().to(device)
-    
+
     # Select the current phase's ground truth
     phase_data = {
         'earlyG1': x0_early,
@@ -940,26 +837,17 @@ def train_step(model, optimizer, batch, device, phase_name, global_step=0):
         'anatelo': x0_anatelo
     }
     x0_current = phase_data[phase_name]  # (batch_size, vec_dim)
-    
+
     # Compute bulk Hi-C (average of four phases) for conditioning
     x0_bulk_normalized = (x0_early + x0_mid + x0_late + x0_anatelo) / 4  # (batch_size, vec_dim)
     batch_size = x0_bulk_normalized.shape[0]
+    bulk_for_model = x0_bulk_normalized
+    # if global_step < 600:
+    #     bulk_noise_std = 0.3 * (1 - global_step / 600)
+    #     bulk_for_model = x0_bulk_normalized + torch.randn_like(x0_bulk_normalized) * bulk_noise_std
+    # else:
+    #     bulk_for_model = x0_bulk_normalized
 
-    # Bulk corruption: first 100 iterations = 100% corruption (force ChIP-only learning)
-    # After 100 iterations = 10% corruption (normal training)
-    bulk_for_model = x0_bulk_normalized.clone()
-    if global_step < 60:
-        # First 100 iterations: corrupt all bulk data to force model to use ChIP/FiLM
-        bulk_for_model = torch.randn_like(x0_bulk_normalized)
-    else:
-        # After 100 iterations: 10% corruption rate
-        corrupt_mask = torch.rand(batch_size, device=device) < 0.10
-        n_corrupt = corrupt_mask.sum().item()
-        if n_corrupt > 0:
-            bulk_for_model[corrupt_mask] = torch.randn(
-                n_corrupt, x0_bulk_normalized.shape[1], device=device, dtype=x0_bulk_normalized.dtype
-            )
-    
     # Get ChIP-seq conditioning (both CTCF and H3K4me1 tracks)
     chip_ctcf = batch['chip_seq_ctcf'].float().to(device)  # (batch_size, N)
     chip_histone = batch['chip_seq_hac'].float().to(device)  # (batch_size, N)
@@ -1203,9 +1091,24 @@ def main():
             return self.loader[region_str]
     
     test_dataset = HoldoutDataset(cell_cycle_loader, holdout_regions)
-    
-    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
-    
+
+    # Validation set: 30 chr2 samples, excluding regions used in run_test_evaluation_chromosome2
+    NUM_VAL_SAMPLES = 30
+    validation_regions = get_validation_regions_chr2(holdout_regions, n=NUM_VAL_SAMPLES)
+    if len(validation_regions) == 0:
+        raise ValueError("No chr2 regions left for validation after excluding test-eval targets")
+    val_dataset = HoldoutDataset(cell_cycle_loader, validation_regions)
+    val_dataloader = TorchDataLoader(
+        val_dataset,
+        batch_size=min(5, len(validation_regions)),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False,
+    )
+    print(f"Validation regions (chr2, excluding test-eval): {validation_regions[:3]}{'...' if len(validation_regions) > 3 else ''} (n={len(validation_regions)})")
+
+    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}, Val samples: {len(val_dataset)}")
+
     # Create dataloaders
     train_dataloader = TorchDataLoader(
         train_dataset,
@@ -1225,12 +1128,12 @@ def main():
     
     print(f"Number of batches per epoch: {len(train_dataloader)}")
     print("="*80)
-    
+
     # Training loop
     for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
         epoch_losses = []
         model.train()
-        
+
         # Iterate through training batches
         total_epochs = start_epoch + NUM_EPOCHS
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [{CURRENT_PHASE}]")
@@ -1238,7 +1141,12 @@ def main():
             loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE, global_step)
             epoch_losses.append(loss)
             global_step += 1
-            
+
+            # Validation loss every 100 iterations
+            if global_step % 100 == 0:
+                val_loss = compute_validation_loss(model, val_dataloader, DEVICE, CURRENT_PHASE)
+                print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
+
             # Update progress bar
             pbar.set_postfix({'loss': f"{loss:.4f}"})
             
@@ -1270,7 +1178,7 @@ def main():
         #     print(f"✓ Saved best checkpoint: {checkpoint_path}")
         
         # Save epoch checkpoint (use absolute epoch number)
-        checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_epoch{epoch+1}_final_feb_3_2026_1.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{CURRENT_PHASE}_epoch{epoch+1}_final_feb_3_2026_3.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
