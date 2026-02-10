@@ -77,6 +77,7 @@ class CellCycleDataLoader:
         
         # Load HAC (H3K4me1) - using GSM1502751_534.bigWig
         hac_file = raw_data_dir / "GSM1502751_534.bigWig"
+        #hac_file = raw_data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
         if hac_file.exists():
             try:
                 self.chipseq_files['hac'] = pyBigWig.open(str(hac_file))
@@ -84,6 +85,16 @@ class CellCycleDataLoader:
             except Exception as e:
                 print(f"Warning: Failed to load HAC bigWig file {hac_file}: {e}")
                 self.chipseq_files['hac'] = None
+
+        # Load RAD21 file 
+        rad21_file = raw_data_dir / "GSE129997_Rad21_asyn.bw"
+        if rad21_file.exists():
+            try:
+                self.chipseq_files['rad21'] = pyBigWig.open(str(rad21_file))
+                print(f"Loaded Rad21 ChIP-seq from: {rad21_file}")
+            except Exception as e:
+                print(f"Warning: Failed to load Rad21 bigWig file {rad21_file}: {e}")
+                self.chipseq_files['rad21'] = None
         
         # Keep backward compatibility: use CTCF as default chipseq_bw
         self.chipseq_bw = self.chipseq_files.get('ctcf', None)
@@ -281,6 +292,7 @@ class CellCycleDataLoader:
                 max_val = values[0] if values[0] is not None else 0.0
                 # Log transform the signal
                 signal[i] = np.log1p(max_val) # oragami uses log1p(x). consider also not using this.
+                #signal[i] = max_val
             
             return signal
             
@@ -310,7 +322,7 @@ class CellCycleDataLoader:
         
         Returns:
             Dictionary with keys: 'region', 'earlyG1', 'lateG1', 'midG1', 'anatelo', 
-                                  'chip_seq_ctcf', 'chip_seq_hac'
+                                  'chip_seq_ctcf', 'chip_seq_rad21', 'chip_seq_hac'
             
             Hi-C phases (shape: (2080,) each):
                 - Log-transformed: log1p(x)
@@ -319,6 +331,7 @@ class CellCycleDataLoader:
             
             ChIP-seq tracks (shape: (64,) each):
                 - chip_seq_ctcf: CTCF ChIP-seq signal
+                - chip_seq_rad21: RAD21 ChIP-seq signal
                 - chip_seq_hac: H3K4me1 ChIP-seq signal (from GSM1502751_534.bigWig)
                 - Max signal per bin (10kb bins) with log1p transformation
                 - No additional normalization (normalization handled by LayerNorm in model)
@@ -371,6 +384,10 @@ class CellCycleDataLoader:
         # Extract HAC (H3K4me1) signal from GSM1502751_534.bigWig
         chip_seq_hac = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('hac'))
         sample['chip_seq_hac'] = chip_seq_hac.astype(np.float32)
+
+        # Extract RAD21 signal
+        chip_seq_rad21 = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('rad21'))
+        sample['chip_seq_rad21'] = chip_seq_rad21.astype(np.float32)
         
         return sample
     
