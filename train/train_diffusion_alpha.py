@@ -133,13 +133,13 @@ PHASES = ["earlyG1", "midG1", "lateG1", "anatelo"]
 # Change this to 'earlyG1', 'midG1', 'lateG1', or 'anatelo' to train different phases
 CURRENT_PHASE = 'anatelo'  # <-- CHANGE THIS to train different phases
 
-T = 1000              # diffusion steps
-N = 64                # contact map size (64 x 64)
-VEC_DIM = 2080        # upper triangular vector dimension (64*65/2)
+T = 1000               # diffusion steps
+N = 64                 # contact map size (64 x 64)
+VEC_DIM = 2080         # upper triangular vector dimension (64*65/2)
 
 # Genomic resolution and region size (in base pairs)
 # Keeping N fixed at 64 ensures VEC_DIM stays 2080 independent of resolution.
-RESOLUTION_BP = 10000          # bin size in base pairs (25kb; must match .hic expected vectors)
+RESOLUTION_BP = 10000           # bin size in base pairs (10kb; must match .hic expected vectors)
 REGION_SIZE_BP = RESOLUTION_BP * N  # total region size in bp (64 bins)
 L = 2                 # number of bottleneck blocks in U-Net
 HIDDEN_DIM = 128      # base channel dimension for U-Net (reduced from 256)
@@ -307,7 +307,9 @@ class BigGANResBlock(nn.Module):
         if self.up:
             residual = F.interpolate(residual, scale_factor=2, mode='nearest')
         elif self.down:
-            residual = F.avg_pool2d(residual, kernel_size=2, stride=2)
+            #residual = F.avg_pool2d(residual, kernel_size=2, stride=2)
+            # lets do max pooling instead
+            residual = F.max_pool2d(residual, kernel_size=2, stride=2)
         
         residual = self.residual_conv(residual)
         
@@ -319,7 +321,9 @@ class BigGANResBlock(nn.Module):
         if self.up:
             h = F.interpolate(h, scale_factor=2, mode='nearest')
         elif self.down:
-            h = F.avg_pool2d(h, kernel_size=2, stride=2)
+            #h = F.avg_pool2d(h, kernel_size=2, stride=2)
+            # lets do max pooling instead
+            h = F.max_pool2d(h, kernel_size=2, stride=2)
         
         h = self.conv1(h)
         
@@ -458,6 +462,7 @@ class ChipPairEncoderAlpha(nn.Module):
         Returns:
             pair_map: (B, c_pair, 64, 64) pairwise features to concatenate with h
         """
+        #breakpoint()
         B = chip_ctcf.shape[0]
 
         # Stack 4 tracks → (B, s=4, r=64) "MSA" (no channel dim yet)
@@ -473,7 +478,7 @@ class ChipPairEncoderAlpha(nn.Module):
         msa = msa + self.pos_embed   # broadcast over batch and tracks
 
         # ----- Row-wise attention over residues (axis r) -----
-        B, S, L, C = msa.shape  # S=4, L=n_bins, C=c_msa
+        B, S, L, C = msa.shape  # S=4, L=n_bins, C=c_msa, B = 32, S = 64, L = 128, C = 16
         x = msa.view(B * S, L, C)                     # (B*S, L, C)
         row_out, _ = self.row_attn(x, x, x)           # self-attention over L
         x = self.row_norm(x + row_out)                # (B*S, L, C)
@@ -488,7 +493,7 @@ class ChipPairEncoderAlpha(nn.Module):
 
         # ----- Outer-product mean over MSA (AlphaFold-style) -----
         # Mean over tracks (sequences) → (B, 64, C)
-        msa_mean = msa.mean(dim=1)  # (B, L, C)
+        msa_mean = msa.max(dim=1).values  # (B, L, C) # this is different than the Alpha Fold paper 
 
         # For each (i,j): outer product of feature vectors at bins i and j
         pair_2d = torch.einsum("bic,bjd->bijcd", msa_mean, msa_mean)  # (B, L, L, C, C)
@@ -532,8 +537,9 @@ class SR3UNet(nn.Module):
         # Input: noisy + bulk ONLY (foundation)
         self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
 
-        # ChIP: AlphaFold-style 4 tracks → outer product 4×4 per (i,j) → (B, c_pair, 64, 64)
-        self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=64, c_pair=c_pair)
+        # ChIP: AlphaFold-style 4 tracks → outer product 4×4 per (i,j) → (B, c_pair, N, N)
+        # Use n (self.n) so this stays consistent when we change resolution (e.g. 64×64).
+        self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=c_pair)
         # Concat h (base_ch) + pair_map (c_pair) then project back to base_ch
         self.chip_combine_64 = nn.Sequential(
             nn.Conv2d(base_ch + c_pair, base_ch, kernel_size=1),
@@ -647,7 +653,7 @@ class SR3UNet(nn.Module):
         h = torch.cat([h, skip3], dim=1)                                # (B, base_ch*8, 16, 16)
         h = self.dec3_reduce(h)
         h = self.dec3(h, noise_emb)
-        #h = self.dec3_self_attn(h)
+        h = self.dec3_self_attn(h)
 
         # 32×32, C = base_ch*2
         h = self.dec2_up(h, noise_emb)                                  # (B, base_ch*2, 32, 32)
@@ -981,7 +987,7 @@ def main():
         vec_dim=VEC_DIM,
         n=N,
         noise_embed_module=noise_embed_module,
-        base_ch=48            # Base channels for U-Net (64 -> 128 -> 256 -> 512)
+        base_ch=64            # Base channels for U-Net (64 -> 128 -> 256 -> 512)
     ).to(DEVICE)
     
     # Count parameters
@@ -1123,7 +1129,7 @@ def main():
         # save checkpoint with data type and log transform info
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-2_alpha.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-3_alpha64_maxpool.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
