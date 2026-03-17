@@ -411,6 +411,113 @@ class SelfAttentionBlock(nn.Module):
 ############################################
 # 3.7) ChIP-SEQ PAIR ENCODER (AlphaFold-style: 4 tracks → outer product 4×4 per (i,j))
 ############################################
+class AdaNorm(nn.Module):
+    """
+    Simple AdaNorm-style normalization:
+        y = x + α * LayerNorm(x)
+    where α is a learned scalar. This keeps the residual path while allowing
+    the normalized path to be adaptively scaled.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim, eps=eps)
+        self.alpha = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.alpha * self.ln(x)
+
+
+class RowSelfAttentionWithBulkBias(nn.Module):
+    """
+    Custom multi-head self-attention over a length-L sequence with a per-head
+    bias matrix derived from the bulk Hi-C map.
+
+    Shapes:
+        x:        (B*S, L, C)    # B=batch, S=tracks, L=bins, C=c_msa
+        bulk_map: (B, 1, L, L)   # bulk Hi-C contact map per sample
+
+    Internally:
+        - Q,K,V: (B*S, n_heads, L, d_head)
+        - bias:  (B*S, n_heads, L, L) from a Conv2d(1 → n_heads) on bulk_map
+        - scores = QK^T / sqrt(d_head) + bias
+        - output: (B*S, L, C)
+    """
+
+    def __init__(self, c_msa: int, n_heads: int):
+        super().__init__()
+        assert c_msa % n_heads == 0, "c_msa must be divisible by n_heads"
+        self.c_msa = c_msa
+        self.n_heads = n_heads
+        self.d_head = c_msa // n_heads
+
+        self.q_proj = nn.Linear(c_msa, c_msa)
+        self.k_proj = nn.Linear(c_msa, c_msa)
+        self.v_proj = nn.Linear(c_msa, c_msa)
+        # Project concatenated per-head outputs (already multiplied by gates)
+        # back to the original channel dimension C for the residual addition.
+        self.out_proj = nn.Linear(c_msa, c_msa)
+        self.norm = nn.LayerNorm(c_msa)
+
+        # One learned linear projection per head from bulk_map → bias matrix
+        self.bias_from_bulk = nn.Conv2d(1, n_heads, kernel_size=1)
+
+        # Gating parameters for gated self-attention.
+        # One separate projection per head:
+        #   gate_h(d) = W_h * out_h(d) + b_h
+        self.gate_weight = nn.Parameter(
+            torch.empty(n_heads, self.d_head, self.d_head)
+        )  # (n_heads, d_head, d_head)
+        self.gate_bias = nn.Parameter(torch.zeros(n_heads, self.d_head))  # (n_heads, d_head)
+        nn.init.xavier_uniform_(self.gate_weight)
+
+    def forward(self, x, bulk_map, B, S, L):
+        """
+        x:        (B*S, L, C)
+        bulk_map: (B, 1, L, L)
+        """
+        BS, L_in, C = x.shape
+        assert BS == B * S
+        assert L_in == L
+        assert C == self.c_msa
+
+        # Project to Q, K, V
+        q = self.q_proj(x)  # (B*S, L, C)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape to (B*S, n_heads, L, d_head)
+        q = q.view(B * S, L, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B * S, L, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B * S, L, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Scaled dot-product attention logits: (B*S, n_heads, L, L)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5)
+
+        # Per-head bias from bulk_map: (B, n_heads, L, L)
+        bias = self.bias_from_bulk(bulk_map)  # (B, n_heads, L, L)
+        bias = bias.unsqueeze(1).repeat(1, S, 1, 1, 1)  # (B, S, n_heads, L, L)
+        bias = bias.view(B * S, self.n_heads, L, L)     # (B*S, n_heads, L, L)
+
+        scores = scores + bias
+        attn = torch.softmax(scores, dim=-1)
+
+        out = torch.matmul(attn, v)  # (B*S, n_heads, L, d_head)
+
+        # Gated self-attention: per-head, per-position gate in [0,1].
+        # Apply a distinct linear projection per head using gate_weight, gate_bias,
+        # then multiply values by the gate along the channel dimension.
+        gate = torch.einsum("hcd,bhld->bhlc", self.gate_weight, out) + self.gate_bias.unsqueeze(0).unsqueeze(2)
+        gate = torch.sigmoid(gate)
+        out = out * gate  # (B*S, n_heads, L, d_head)
+
+        # Concatenate heads along the channel dimension and project back to C.
+        out = out.transpose(1, 2).contiguous().view(B * S, L, C)  # (B*S, L, C)
+        out = self.out_proj(out)
+        out = self.norm(x + out)
+        return out
+
+
 class ChipPairEncoderAlpha(nn.Module):
     """
     AlphaFold-style encoder for 4 ChIP tracks.
@@ -430,29 +537,32 @@ class ChipPairEncoderAlpha(nn.Module):
         self.n_bins = n_bins
         self.c_msa = c_msa
         self.c_pair = c_pair
+        self.n_heads = n_heads
+        self.num_tracks = 4
 
         # Embed scalar ChIP signal at each (track, bin) into c_msa channels
         self.msa_embed = nn.Linear(1, c_msa)
         # Learnable positional encoding over residues (columns 0..n_bins-1), shared across tracks
         # Shape: (1, 1, n_bins, c_msa) → broadcast over batch and 4 tracks
         self.pos_embed = nn.Parameter(torch.zeros(1, 1, n_bins, c_msa))
+        # Normalize per-token features across channels before attention
+        self.msa_norm = nn.LayerNorm(c_msa)
 
-        # Row-wise self-attention over residues (length 64) for each track
-        self.row_attn = nn.MultiheadAttention(embed_dim=c_msa, num_heads=n_heads, batch_first=True)
-        self.row_norm = nn.LayerNorm(c_msa)
+        # Row-wise self-attention over residues (length 64) for each track, with per-head bulk bias
+        self.row_attn = RowSelfAttentionWithBulkBias(c_msa=c_msa, n_heads=n_heads)
 
-        # Column-wise self-attention over tracks (4) for each residue
-        self.col_attn = nn.MultiheadAttention(embed_dim=c_msa, num_heads=min(n_heads, 4), batch_first=True)
-        self.col_norm = nn.LayerNorm(c_msa)
+        # Column-wise self-attention over tracks removed; we only do row-wise attention.
 
         #  (c_msa × c_msa) flattened → project to c_pair
+        #  Use AdaNorm instead of plain LayerNorm:
+        #      y = x + α * LayerNorm(x)
         self.pair_proj = nn.Sequential(
             nn.Linear(c_msa * c_msa, c_pair),
-            nn.LayerNorm(c_pair),
+            AdaNorm(c_pair),
             nn.SiLU(),
         )
 
-    def forward(self, chip_ctcf, chip_hac, chip_me1, chip_me3):
+    def forward(self, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_map):
         """
         Args:
             chip_ctcf: (B, 64) CTCF
@@ -476,20 +586,15 @@ class ChipPairEncoderAlpha(nn.Module):
         msa = self.msa_embed(msa)    # (B, 4, 64, c_msa)
         # Add residue positional encoding along columns (bins)
         msa = msa + self.pos_embed   # broadcast over batch and tracks
+        msa = self.msa_norm(msa)
 
-        # ----- Row-wise attention over residues (axis r) -----
-        B, S, L, C = msa.shape  # S=4, L=n_bins, C=c_msa, B = 32, S = 64, L = 128, C = 16
+        # ----- Row-wise attention over residues (axis r) with bulk Hi-C bias -----
+        B, S, L, C = msa.shape  # S=4, L=n_bins, C=c_msa
         x = msa.view(B * S, L, C)                     # (B*S, L, C)
-        row_out, _ = self.row_attn(x, x, x)           # self-attention over L
-        x = self.row_norm(x + row_out)                # (B*S, L, C)
+        x = self.row_attn(x, bulk_map, B=B, S=S, L=L)
         msa = x.view(B, S, L, C)                      # (B, 4, 64, C)
 
-        # ----- Column-wise attention over tracks (axis s) -----
-        # Treat each residue independently, attend over 4 tracks
-        x = msa.permute(0, 2, 1, 3).reshape(B * L, S, C)  # (B*L, 4, C)
-        col_out, _ = self.col_attn(x, x, x)
-        x = self.col_norm(x + col_out)                    # (B*L, 4, C)
-        msa = x.view(B, L, S, C).permute(0, 2, 1, 3)      # (B, 4, 64, C)
+        #breakpoint()
 
         # ----- Outer-product mean over MSA (AlphaFold-style) -----
         # Mean over tracks (sequences) → (B, 64, C)
@@ -524,28 +629,24 @@ class SR3UNet(nn.Module):
         - Standard U-Net skip connections (concatenation)
         - Output: Predicted noise ε
     """
-    def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64, c_pair: int = 16):
+    def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64, c_pair: int | None = None):
         super().__init__()
         self.vec_dim = vec_dim
         self.n = n
         self.noise_embed = noise_embed_module
         self.base_ch = base_ch
-        self.c_pair = c_pair
+        assert base_ch % 2 == 0, "base_ch must be divisible by 2 for bulk/chip split"
+        # If not provided, set c_pair to base_ch//2 so channels line up naturally.
+        self.c_pair = base_ch // 2
 
         noise_dim = self.noise_embed.mlp[-1].out_features
 
-        # Input: noisy + bulk ONLY (foundation)
-        self.input_conv = nn.Conv2d(2, base_ch, kernel_size=3, padding=1)
+        # Input: noisy + bulk → half of base_ch channels
+        self.input_conv = nn.Conv2d(2, base_ch // 2, kernel_size=3, padding=1)
 
         # ChIP: AlphaFold-style 4 tracks → outer product 4×4 per (i,j) → (B, c_pair, N, N)
         # Use n (self.n) so this stays consistent when we change resolution (e.g. 64×64).
-        self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=c_pair)
-        # Concat h (base_ch) + pair_map (c_pair) then project back to base_ch
-        self.chip_combine_64 = nn.Sequential(
-            nn.Conv2d(base_ch + c_pair, base_ch, kernel_size=1),
-            nn.GroupNorm(min(8, base_ch), base_ch),
-            nn.SiLU(),
-        )
+        self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=self.c_pair)
 
         # ---- ENCODER ----
         self.enc1 = BigGANResBlock(base_ch, base_ch, noise_dim)
@@ -618,13 +719,15 @@ class SR3UNet(nn.Module):
         x_t_map = upper_tri_vec_to_matrix(x_t_vec, N).unsqueeze(1)     # (B, 1, 64, 64)
         bulk_map = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)   # (B, 1, 64, 64)
 
-        # Foundation: noisy + bulk only
+        # Foundation: noisy + bulk → half of base_ch features
         x_in = torch.cat([x_t_map, bulk_map], dim=1)                    # (B, 2, 64, 64)
-        h = self.input_conv(x_in)                                       # (B, base_ch, 64, 64)
+        h_bulk = self.input_conv(x_in)                                  # (B, base_ch//2, 64, 64)
 
-        # ChIP: 4 tracks → outer product 4×4 per (i,j) → (B, c_pair, 64, 64); concat with h and project
-        chip_pair_64 = self.chip_pair_encoder(chip_ctcf, chip_hac, chip_me1, chip_me3)
-        h = self.chip_combine_64(torch.cat([h, chip_pair_64], dim=1))
+        # ChIP: 4 tracks → outer product 4×4 per (i,j) → (B, c_pair, 64, 64)
+        h_chip = self.chip_pair_encoder(chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_map)  # (B, c_pair, 64, 64)                       # (B, base_ch//2, 64, 64)
+
+        # Combine bulk/noisy and chip-derived features into base_ch channels
+        h = torch.cat([h_bulk, h_chip], dim=1)                           # (B, base_ch, 64, 64)
 
         # ========== ENCODER ==========
         # 64×64, C = base_ch
@@ -661,11 +764,10 @@ class SR3UNet(nn.Module):
         h = self.dec2_reduce(h)
         h = self.dec2(h, noise_emb)
 
-        # 64×64, C = base_ch (ChIP pair concat only here)
+        # 64×64, C = base_ch
         h = self.dec1_up(h, noise_emb)                                  # (B, base_ch, 64, 64)
         h = torch.cat([h, skip1], dim=1)
         h = self.dec1_reduce(h)
-        h = self.chip_combine_64(torch.cat([h, chip_pair_64], dim=1))
         h = self.dec1(h, noise_emb)
 
         eps_map = self.output_block(h).squeeze(1)
@@ -1129,7 +1231,7 @@ def main():
         # save checkpoint with data type and log transform info
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-3_alpha64_maxpool.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-5_alpha64_maxpool.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
