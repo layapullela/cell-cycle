@@ -1,9 +1,9 @@
 """
-Simple DataLoader for cell cycle Hi-C contact maps.
+dataloader for cell cycle Hi-C contact maps and chip seq signals.
 
-Extracts 64x64 pixel (640kb) regions along the diagonal with sliding window.
-Only stores upper triangular portion of symmetric Hi-C matrices.
-Includes ChIP-seq signal for each region.
+Extracts 64x64 pixel (640kb if 10kb resolution) regions along the diagonal with sliding window.
+we only need to store upper triangular portion of symmetric hic.
+we should have chip seq tracks for ctcf, hac, h3k4me1, h3k4me3 corresponding to hic.
 """
 
 import numpy as np
@@ -30,12 +30,15 @@ class CellCycleDataLoader:
         data_dir: Union[str, Path],
         resolution: int = 10000,  # 10kb bins
         region_size: int = 640000,  # 640kb regions (64 pixels at 10kb resolution)
-        normalization: str = "VC",  # or "NONE", "KR", etc. we use vanilla coverage. #TODO: VC or KR? epiphany paper uses KR, so does HiCDiff paper
+        normalization: str = "KR",  # or "NONE", "KR", etc. we use vanilla coverage. #TODO: VC or KR? epiphany paper uses KR, so does HiCDiff paper
         chipseq_file: Optional[str] = None,  # Path to ChIP-seq bigWig file
         hold_out_chromosome: Optional[str] = None,  # Chromosome to hold out for testing (e.g., "2")
         cluster3_loops_file: Optional[str] = None,  # Path to cluster_id == 3 loop coordinates file
         save_normalization_stats: bool = False,  # Whether to save min/max values to file
         normalization_stats_file: Optional[str] = None,  # Path to save normalization stats
+        hic_data_type: str = "oe",  # experimenting with observed vs oe for predictions of ep loops.
+        use_log_transform: bool = True,  # typically we want log transform on hic and chip seq signals
+        augment: Union[int, float] = 50,  # data agumentation rotate hic 180 degrees and flip chip seq.
     ):
         """
         Initialize the DataLoader.
@@ -52,10 +55,13 @@ class CellCycleDataLoader:
         self.resolution = resolution
         self.region_size = region_size
         self.normalization = normalization
-        self.image_size = region_size // resolution  # 64 pixels for 640kb at 10kb
-        self.hold_out_chromosome = hold_out_chromosome  # chromosome to hold out for testing
+        self.image_size = region_size // resolution 
+        self.hold_out_chromosome = hold_out_chromosome  
+        self.hic_data_type = hic_data_type 
+        self.use_log_transform = use_log_transform
+        self.augment = float(augment) 
 
-        # setup normalization stats saving
+        # setup normalization stats saving (this is incase we want to undo normalization to original observed values.)
         self.save_normalization_stats = save_normalization_stats
         if normalization_stats_file is None:
             self.normalization_stats_file = self.data_dir / "normalization_stats.csv"
@@ -72,48 +78,34 @@ class CellCycleDataLoader:
         self.step_pixels = 10
         self.step_bp = self.step_pixels * resolution  # 100kb step
         
-        # Load multiple ChIP-seq bigWig files
-        # Default paths: look in data_dir first, then in raw_data/zhang_4dn
+        # load chip seq mm10 files (async)
+        # data is in raw_data/zhang_4dn from zhang et al paper
         raw_data_dir = self.data_dir.parent.parent / "raw_data" / "zhang_4dn"
-        
+
         # Dictionary to store multiple ChIP-seq files
         self.chipseq_files = {}
-        
-        # Load CTCF file (default)
-        ctcf_file = self.data_dir / "GSE129997_CTCF_asyn.bw"
-        if not ctcf_file.exists():
-            ctcf_file = raw_data_dir / "GSE129997_CTCF_asyn.bw"
-        if ctcf_file.exists():
-            try:
-                self.chipseq_files['ctcf'] = pyBigWig.open(str(ctcf_file))
-                print(f"Loaded CTCF ChIP-seq from: {ctcf_file}")
-            except Exception as e:
-                print(f"Warning: Failed to load CTCF bigWig file {ctcf_file}: {e}")
-                self.chipseq_files['ctcf'] = None
-        
-        # Load HAC (H3K4me1) - using GSM1502751_534.bigWig
-        hac_file = raw_data_dir / "GSM1502751_534.bigWig"
-        #hac_file = raw_data_dir / "GSM946535_mm9_wgEncodePsuHistoneG1eH3k04me1ME0S129InputSig.bigWig"
-        if hac_file.exists():
-            try:
-                self.chipseq_files['hac'] = pyBigWig.open(str(hac_file))
-                print(f"Loaded HAC (H3K4me1) ChIP-seq from: {hac_file}")
-            except Exception as e:
-                print(f"Warning: Failed to load HAC bigWig file {hac_file}: {e}")
-                self.chipseq_files['hac'] = None
 
-        # Load RAD21 file 
-        rad21_file = raw_data_dir / "GSE129997_Rad21_asyn.bw"
-        if rad21_file.exists():
-            try:
-                self.chipseq_files['rad21'] = pyBigWig.open(str(rad21_file))
-                print(f"Loaded Rad21 ChIP-seq from: {rad21_file}")
-            except Exception as e:
-                print(f"Warning: Failed to load Rad21 bigWig file {rad21_file}: {e}")
-                self.chipseq_files['rad21'] = None
-        
-        # Keep backward compatibility: use CTCF as default chipseq_bw
-        self.chipseq_bw = self.chipseq_files.get('ctcf', None)
+        # Small helper to DRY up bigWig loading + logging
+        def _load_chip(key: str, filename: str, label: str):
+            chip_path = raw_data_dir / filename
+            if chip_path.exists():
+                try:
+                    self.chipseq_files[key] = pyBigWig.open(str(chip_path))
+                    print(f"Loaded {label} ChIP-seq from: {chip_path}")
+                except Exception as e:
+                    print(f"Warning: Failed to load {label} bigWig file {chip_path}: {e}")
+                    self.chipseq_files[key] = None
+            else:
+                print(f"Warning: {label} bigWig file not found at expected path: {chip_path}")
+                self.chipseq_files[key] = None
+
+        # CTCF, H3K27ac, H3K4me1, H3K4me3
+        _load_chip('ctcf',    "GSE129997_CTCF_asyn_mm10.bw",    "CTCF")
+        _load_chip('hac',     "GSM1502751_534.mm10.bigWig",     "H3K27ac (HAC)")
+        _load_chip('h3k4me1', "h3k04me1.mm10.bigWig",           "H3K4me1")
+        _load_chip('h3k4me3', "G1eH3k04me3.mm10.bigWig",        "H3K4me3")
+
+        self.chipseq_files['rad21'] = None  # Dummy object - returns zeros when used
         
         # Phase files
         self.phase_files = {
@@ -133,30 +125,23 @@ class CellCycleDataLoader:
         if not self.phase_paths:
             raise ValueError(f"No .hic files found in {self.data_dir}")
         
-        # Load mm9 chromosome sizes 
-        # using chromosome sizes from mm9.chrom.sizes file
+        # Load mm10 chromosome sizes 
+        # using chromosome sizes from mm10.chrom.sizes file
         self.chromosome_sizes = {
-            "1": 197195432, "2": 181748087, "3": 159599783, "4": 155630120,
-            "5": 152537259, "6": 149517037, "7": 152524553, "8": 131738871,
-            "9": 124076172, "10": 129993255, "11": 121843856, "12": 121257530,
-            "13": 120284312, "14": 125194864, "15": 103494974, "16": 98319150,
-            "17": 95272651, "18": 90772031, "19": 61342430,
-            "X": 166650296, "Y": 15902555,
+            "1": 195471971, "2": 182113224, "3": 160039680, "4": 156508116,
+            "5": 151834684, "6": 149736546, "7": 145441459, "8": 129401213,
+            "9": 124595110, "10": 130694993, "11": 122082543, "12": 120129022,
+            "13": 120421639, "14": 124902244, "15": 104043685, "16": 98207768,
+            "17": 94987271, "18": 90702639, "19": 61431566,
+            "X": 171031299, "Y": 91744698,
         }
 
         # Load cluster_id == 3 loop coordinates for special handling from zhang et al paper
         self.cluster3_loop_regions = self._load_cluster3_loops(cluster3_loops_file)
 
-        # Track which regions should be flipped (cluster_id == 3 regions)
-        # Initialize before _generate_regions() since it's used there
-        self.flip_regions = set()
-
-        # generate regions by sliding along diagonal every 10 pixels
-        # Skip first 3MB of each chromosome (typically no mappable data)
+        # theres no mappable data before 3MB of each chromosome.
         self.min_start_position = 3000000  # 3MB
         self.regions, self.holdout_regions = self._generate_regions()
-        
-        # no longer doing special normalization of chip seq, oragami feeds in just log transformed raw signal.
 
     def _load_cluster3_loops(self, cluster3_loops_file: Optional[str] = None) -> List[Tuple[str, int, int, int, int]]:
         """
@@ -171,7 +156,7 @@ class CellCycleDataLoader:
         cluster3_regions = []
 
         if cluster3_loops_file is None:
-            # Default path
+            # using excel file from zhang et al supp
             cluster3_loops_file = self.data_dir.parent.parent / "raw_data" / "zhang_4dn" / "cluster3_loop_coordinates.txt"
         else:
             cluster3_loops_file = Path(cluster3_loops_file)
@@ -221,7 +206,7 @@ class CellCycleDataLoader:
     def _generate_regions(self):
         """
         generate all 64x64 regions by sliding every 10 pixels along the diagonal.
-        skip the beginning of chromosomes (typically no mappable Hi-C data at start of chromosome).
+        skip the beginning of chromosomes (no contacts here).
         exclude y chromosome.
         for now, holding out chr2 for testing.
 
@@ -240,34 +225,21 @@ class CellCycleDataLoader:
             if chrom in ['Y']: # for now, skip Y chrom
                 continue
 
-            # Check if this is the holdout chromosome
             is_holdout = (self.hold_out_chromosome is not None and
                          str(chrom) == str(self.hold_out_chromosome))
 
-            # Get cluster3 loop anchors for this chromosome
-            # Each tuple has (chrom, anchor1_start, anchor1_end, anchor2_start, anchor2_end)
+            # Get cluster 3 anchors (for eval mostly, these are transient loops)
             chrom_cluster3_loops = [
                 (a1_start, a1_end, a2_start, a2_end)
                 for loop_chrom, a1_start, a1_end, a2_start, a2_end in self.cluster3_loop_regions
                 if loop_chrom == chrom
             ]
 
-            # Start from min_start_position (skip beginning of chromosome)
+            # start from 3MB
             start = self.min_start_position
             while start + self.region_size <= size:
                 end = start + self.region_size
                 region_str = f"{chrom}:{start}-{end}"
-
-                # Check if this region actually contains both anchors of a cluster3 loop
-                # Both anchors must be fully within the region for the loop to be visible
-                for a1_start, a1_end, a2_start, a2_end in chrom_cluster3_loops:
-                    # Check if both anchors are within the region boundaries
-                    anchor1_contained = (start <= a1_start and a1_end <= end)
-                    anchor2_contained = (start <= a2_start and a2_end <= end)
-
-                    if anchor1_contained and anchor2_contained:
-                        self.flip_regions.add(region_str)
-                        break
 
                 if is_holdout:
                     holdout_regions.append(region_str)
@@ -281,11 +253,7 @@ class CellCycleDataLoader:
             print(f"Holdout chromosome '{self.hold_out_chromosome}': {len(holdout_regions)} regions")
             print(f"Training regions: {len(training_regions)} regions")
 
-        print(f"Total regions marked for flipping (cluster_id == 3): {len(self.flip_regions)}")
-
         return training_regions, holdout_regions
-    
-    # chip seq normalization is just log transformation (oragami)
 
     def _save_normalization_stat(self, region: str, phase: str, min_val: float, max_val: float):
         """
@@ -294,8 +262,8 @@ class CellCycleDataLoader:
         Args:
             region: Region string (e.g., "1:10000000-10640000")
             phase: Phase name (e.g., "earlyG1", "midG1", etc.)
-            min_val: Minimum value used for normalization
-            max_val: Maximum value used for normalization
+            min_val: min contact count in given region
+            max_val: max count count in given region
         """
         if not self.save_normalization_stats:
             return
@@ -307,7 +275,7 @@ class CellCycleDataLoader:
     @staticmethod
     def load_normalization_stats(stats_file: Union[str, Path]) -> Dict[Tuple[str, str], Tuple[float, float]]:
         """
-        Load normalization statistics from a CSV file.
+        when we normalize, we should save min and max contact counts so that we may reverse post eval.
 
         Args:
             stats_file: Path to normalization stats CSV file
@@ -423,11 +391,12 @@ class CellCycleDataLoader:
         # Parse region
         chrom, coords = region.split(':')
         start, end = map(int, coords.split('-'))
-        
+
         # Extract contact matrix using hicstraw
+        # Use self.hic_data_type ("oe" for observed/expected or "observed" for raw counts)
         try:
             result = straw.straw(
-                "oe", # trying observed over expected to balance the data a little bit better
+                self.hic_data_type,
                 self.normalization,
                 str(hic_file),
                 f"{chrom}:{start}:{end}",
@@ -454,13 +423,13 @@ class CellCycleDataLoader:
             # Ensure indices are within bounds
             if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
                 matrix[x_idx, y_idx] = float(count)
-                # Matrix is symmetric, so also set the transpose
+                # matrix is symmetric, so also set the transpose
                 if x_idx != y_idx:
                     matrix[y_idx, x_idx] = float(count)
         
-        # Return upper triangular portion as flattened vector
+        # return upper tri flattened vec (this is the bulk hic vec)
         return self._extract_upper_triangular_vector(matrix)
-    
+
     def _extract_chipseq_signal(self, region: str, chipseq_bw=None) -> np.ndarray:
         """
         Extract ChIP-seq signal for a genomic region from bigWig data.
@@ -468,14 +437,11 @@ class CellCycleDataLoader:
         
         Args:
             region: example input region "1:10000000-10500000" means chr1 from start base pair 10000000 to end base pair 10500000
-            chipseq_bw: Optional pyBigWig object to use (if None, uses self.chipseq_bw for backward compatibility)
+            chipseq_bw: Optional pyBigWig object to use (must be provided; if None, returns zeros)
         
         Returns:
             1d numpy array of shape (image_size,) with log-transformed max-per-bin ChIP-seq signal
         """
-        if chipseq_bw is None:
-            chipseq_bw = self.chipseq_bw
-        
         if chipseq_bw is None:
             return np.zeros(self.image_size, dtype=np.float32)  # return zeros if chip-seq not available
         
@@ -488,15 +454,13 @@ class CellCycleDataLoader:
     
         chrom_name = "chr" + chrom # see bedGraph chr{number} is the format
         try:
-            # get max signal using bigWig
             for i in range(self.image_size):
                 bin_start = start + i * bin_size
                 bin_end = start + (i + 1) * bin_size
-                # Use 'max' to get maximum value in bin (matching bedGraph behavior)
+                # Use 'max' to get maximum value in bin 
                 values = chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
                 max_val = values[0] if values[0] is not None else 0.0
-                # Log transform the signal
-                signal[i] = np.log1p(max_val) # oragami uses log1p(x). 
+                signal[i] = np.log1p(max_val) # oragami uses log1p(x).
             
             return signal
             
@@ -516,7 +480,7 @@ class CellCycleDataLoader:
             List of region strings from holdout chromosome, empty list if no holdout specified
         """
         return self.holdout_regions if hasattr(self, 'holdout_regions') else []
-    
+
     def __getitem__(self, idx: Union[int, str]) -> Dict[str, Union[str, np.ndarray]]:
         """
         Get a sample by index or region string.
@@ -529,38 +493,57 @@ class CellCycleDataLoader:
                                   'chip_seq_ctcf', 'chip_seq_rad21', 'chip_seq_hac'
             
             Hi-C phases (shape: (2080,) each):
-                - Log-transformed: log1p(x) (TODO: no log transformation if using observed over expected)
+                - Log-transformed: log1p(x) 
                 - Normalized independently per sample (from each phase) to [-1, 1]:
                   (log1p(x) - phase_min) / (phase_max - phase_min) * 2 - 1
             
             ChIP-seq tracks (shape: (64,) each):
                 - chip_seq_ctcf: CTCF ChIP-seq signal
-                - chip_seq_rad21: RAD21 ChIP-seq signal
-                - chip_seq_hac: H3K4me1 ChIP-seq signal (from GSM1502751_534.bigWig)
+                - chip_seq_rad21: RAD21 ChIP-seq signal (unused)
+                - chip_seq_hac: H3k27ac ChIP-seq signal
+                - chip_seq_h3k4me1: H3k4me1 ChIP-seq signal
+                - chip_seq_h3k4me3: H3k4me3 ChIP-seq signal
                 - Max signal per bin (10kb bins) with log1p transformation
                 - No additional normalization (normalization handled by LayerNorm in model)
         """
         # Handle region string indexing
         if isinstance(idx, str):
-            # Check both training and holdout regions
+            # Check both training and holdout regions, or allow user-specified region if size matches
             all_regions = self.regions
             if hasattr(self, 'holdout_regions'):
                 all_regions = self.regions + self.holdout_regions
             if idx not in all_regions:
-                raise KeyError(f"Region {idx} not found in regions list")
+                # Allow user-specified region (e.g. --regions 2:18170000-18810000) if length matches
+                try:
+                    chrom, coords = idx.split(':')
+                    start, end = map(int, coords.split('-'))
+                    if end - start != self.region_size:
+                        raise KeyError(
+                            f"Region {idx} not in regions list and size {end - start} != region_size {self.region_size}"
+                        )
+                except ValueError:
+                    raise KeyError(f"Region {idx} not found in regions list and could not parse as chrom:start-end")
             region = idx
         else:
             region = self.regions[idx]
         
-        # Build sample dictionary
+        # build sample dict
         sample = {'region': region}
-        
+        do_flip = (self.augment > 0) and (np.random.rand() < (self.augment / 100.0))
+
+        # chip seq helper + flip if this is on.
+        def _chip_track(key: str) -> np.ndarray:
+            track = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get(key))
+            if do_flip:
+                track = self._flip_chipseq_signal(track)
+            return track.astype(np.float32)
+
         # Load and normalize each phase INDEPENDENTLY using its own min/max
         for phase, filepath in self.phase_paths.items():
             vector = self._extract_region_matrix(filepath, region)
             
-            # Apply log transformation (standard for Hi-C data)
-            #vector = np.log1p(vector) TODO: no log transformation if using observed over expected
+            if self.use_log_transform:
+                vector = np.log1p(vector)
 
             # remove outliers using 99.9th percentile (from HiCDiff and DeepHiC papers)
             threshold = np.percentile(vector, 99.9)
@@ -570,7 +553,7 @@ class CellCycleDataLoader:
             phase_min = vector.min()
             phase_max = vector.max()
 
-            # Save normalization stats if enabled
+            # save normalization if you want
             self._save_normalization_stat(region, phase, float(phase_min), float(phase_max))
 
             # Normalize to [-1, 1] using phase's own statistics
@@ -581,20 +564,16 @@ class CellCycleDataLoader:
                 # Linear transformation: (x - min) / (max - min) * 2 - 1
                 normalized = (vector - phase_min) / (phase_max - phase_min) * 2.0 - 1.0
 
+            if do_flip:
+                normalized = self._flip_hic_matrix(normalized)
             sample[phase] = normalized.astype(np.float32)
-        
-        # Load ChIP-seq signals from multiple tracks (max per bin, log1p transformation)
-        # Extract CTCF signal
-        chip_seq_ctcf = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('ctcf'))
-        sample['chip_seq_ctcf'] = chip_seq_ctcf.astype(np.float32)
-        
-        # Extract HAC (H3K4me1) signal from GSM1502751_534.bigWig
-        chip_seq_hac = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('hac'))
-        sample['chip_seq_hac'] = chip_seq_hac.astype(np.float32)
 
-        # Extract RAD21 signal
-        chip_seq_rad21 = self._extract_chipseq_signal(region, chipseq_bw=self.chipseq_files.get('rad21'))
-        sample['chip_seq_rad21'] = chip_seq_rad21.astype(np.float32)
+        # Load ChIP-seq signals from multiple tracks (max per bin, log1p transformation)
+        sample['chip_seq_ctcf']    = _chip_track('ctcf')
+        sample['chip_seq_hac']     = _chip_track('hac')        # H3K27ac
+        sample['chip_seq_h3k4me1'] = _chip_track('h3k4me1')
+        sample['chip_seq_h3k4me3'] = _chip_track('h3k4me3')
+        # for now no rad21.
         
         return sample
     
@@ -620,12 +599,6 @@ class CellCycleDataLoader:
                     bw.close()
                 except:
                     pass
-        # Also close legacy chipseq_bw if it exists
-        if self.chipseq_bw is not None:
-            try:
-                self.chipseq_bw.close()
-            except:
-                pass
     
     def __del__(self):
         """Cleanup when object is deleted."""
