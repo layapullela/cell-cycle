@@ -4,27 +4,34 @@ Cell-Cycle Hi-C Phase Decomposition via SR3-Style Iterative Refinement
 Train 4 separate conditional denoisers (one per phase: earlyG1/midG1/lateG1/anatelo)
 Each denoiser iteratively refines noisy bulk Hi-C toward phase-specific data
 
-SR3 NOTATION (from "Image Super-Resolution via Iterative Refinement"):
-    γ_t: Noise level at timestep t (linearly spaced: 1e-4 → 1.0)
-    α_t: Step size = γ_{t-1} / γ_t (relates consecutive noise levels)
-    ᾱ_t: Cumulative product = ∏_{s=1}^t α_s
+NOTATION (γ = signal fraction, NOT noise variance):
+    γ_t: Signal fraction at timestep t  (γ≈1 → clean, γ≈0 → pure noise)
+    α_t: Step ratio = γ_t / γ_{t-1}    (ratio of adjacent signal levels)
 
 FORWARD PROCESS:
-    y_t = √(1-γ_t) · y_0 + √γ_t · ϵ,  where ϵ ~ N(0, I)
-    As t increases, γ_t increases (more noise)
+    y_γ = √γ · y_0 + √(1-γ) · ϵ,  where ϵ ~ N(0, I)
+    γ→1: y_γ ≈ y_0 (clean);  γ→0: y_γ ≈ ϵ (pure noise)
 
-TRAINING (Algorithm 1):
-    - Sample noise level γ ~ Uniform(γ_min, γ_max)
+NOISE SCHEDULE:
+    Cosine schedule (Improved DDPM, Nichol & Dhariwal 2021).
+    gammas[0] ≈ 1.0 (clean), gammas[T-1] ≈ 0.0 (noisy).
+    Concentrates training signal in the mid-noise regime where Hi-C
+    structure (loops, TADs) is partially visible.
+
+TRAINING:
+    - Sample t ~ Uniform(0, T-1); look up γ_t from cosine schedule
     - Sample noise ϵ ~ N(0, I)
-    - Create noisy: y_γ = √γ · y_0 + √(1-γ) · ϵ
-    - Train: loss = MSE(model(y_γ, γ), ϵ)  ← Model predicts NOISE!
-    - Model learns to predict the noise that was added
+    - Create noisy: y_γ = √γ_t · y_0 + √(1-γ_t) · ϵ
+    - Train: loss = MSE(model(y_γ, γ_t, conditioning), y_0)  ← Model predicts x_0!
+    - Predicting x_0 directly yields sharper, less blurry outputs than
+      predicting noise, which is important for sparse Hi-C loop structure.
 
-SAMPLING (Algorithm 2):
-    - Start with pure noise y_T ~ N(0, I)
-    - For t = T-1, T-2, ..., 0:
-        ε_pred = model(y_t, t, conditioning)  ← Predict noise
-        y_{t-1} = 1/√α_t * (y_t - (1-α_t)/√(1-γ_t) * ε_pred)  ← Remove noise
+SAMPLING:
+    - Start from pure noise y_{T-1} ~ N(0, I)
+    - For t = T-1, T-2, ..., 1:
+        x̂_0      = model(y_t, γ_t, conditioning)          ← Predict clean image
+        ε_implied = (y_t - √γ_t · x̂_0) / √(1-γ_t)        ← Recover implied noise
+        y_{t-1}  = (1/√α_t)(y_t - (1-α_t)/√(1-γ_t) · ε_implied) + √(1-α_t) · z
     - Result: y_0 (phase-specific Hi-C)
 
 MEMORY OPTIMIZATION: Train one phase at a time to reduce GPU memory usage
@@ -166,42 +173,34 @@ RESUME_CHECKPOINT = None  # Default: start from scratch (can be set via CLI)
 
 
 ############################################
-# 1) SR3 NOISE SCHEDULE
+# 1) COSINE NOISE SCHEDULE
 ############################################
-def sr3_noise_schedule(timesteps, gamma_min=1e-4, gamma_max=1.0):
+def cosine_schedule(T, s=0.008):
     """
-    SR3 inference schedule: γ decreases from 1.0 (pure noise) to ~0 (clean).
-    
-    During inference, we start at t=T (γ=1.0, pure noise) and denoise
-    down to t=0 (γ≈0, clean image).
-    
-    Args:
-        timesteps: Number of diffusion steps T
-        gamma_min: Minimum noise level (end, almost clean) - default 1e-4
-        gamma_max: Maximum noise level (start, pure noise) - default 1.0
-    
-    Returns:
-        gammas: (T,) tensor of noise levels, decreasing from gamma_max to gamma_min
-        alphas: (T,) tensor of step-wise alphas α_t = γ_{t-1} / γ_t
-        alphas_cumprod: (T,) tensor (kept for compatibility, not used in SR3)
+    Cosine noise schedule (Improved DDPM, Nichol & Dhariwal 2021).
+
+    Returns gamma (signal fraction) for t = 0 .. T-1:
+      gammas[0]   ≈ 1.0  (clean;  end of reverse process / easy training samples)
+      gammas[T-1] ≈ 0.0  (noisy; start of reverse process / hard training samples)
+
+    Compared to linear, the cosine schedule avoids abrupt transitions at the
+    extremes and keeps more steps in the mid-noise regime, which is where
+    Hi-C structural features (TADs, loops) are partially visible and most
+    informative for training.
     """
-    # at inference, we start with gamma close to 0 at T - 1 and end with gamma close to 1 at time step 0
-    gammas = torch.linspace(gamma_max, gamma_min, T)
-
-    alphas = torch.ones(T)
-    
-    # Compute α_t = γ_{t-1} / γ_t for reverse process
-    alphas[1:] = gammas[1:] / (gammas[:-1] + 1e-10)
-    
-    # Cumulative product (not used in SR3, kept for compatibility)
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    
-    return gammas, alphas, alphas_cumprod
+    steps = torch.arange(T + 1, dtype=torch.float64)
+    f = torch.cos((steps / T + s) / (1 + s) * math.pi / 2) ** 2
+    gammas = (f / f[0]).float()
+    # gammas[0]=1 (clean), gammas[T]=0 (noisy); drop the t=0 anchor → T values
+    return torch.clamp(gammas[1:], 1e-4, 1.0 - 1e-4)
 
 
-# Initialize SR3 inference schedule (only used during inference, not training)
-gammas, alphas, alphas_cumprod = sr3_noise_schedule(T, gamma_min=1e-4, gamma_max=1.0)
-# Note: Training does NOT use this schedule - it samples γ ~ Uniform(0,1) directly
+# Precomputed cosine schedule (used at training AND inference).
+# gammas[0] ≈ 1.0 (clean), gammas[T-1] ≈ 0.0 (noisy).
+gammas = cosine_schedule(T)
+alphas = torch.ones(T)
+alphas[1:] = gammas[1:] / (gammas[:-1] + 1e-10)   # α_t = γ_t / γ_{t-1}
+alphas_cumprod = torch.cumprod(alphas, dim=0)       # kept for compatibility
 
 
 ############################################
@@ -680,14 +679,37 @@ class SR3UNet(nn.Module):
         self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)
         self.dec1 = BigGANResBlock(base_ch, base_ch, noise_dim)
 
-        # ---- OUTPUT ----
+        # ---- OUTPUT: 2 channels — [0]=image, [1]=gate for sparsity ----
         self.output_block = nn.Sequential(
             nn.GroupNorm(min(8, base_ch), base_ch),
             nn.SiLU(),
-            nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
+            nn.Conv2d(base_ch, 2, kernel_size=3, padding=1)
         )
         nn.init.zeros_(self.output_block[-1].weight)
         nn.init.zeros_(self.output_block[-1].bias)
+        # Gate channel starts near 1 (pass-through) so early training is stable.
+        # sigmoid(3) ≈ 0.95; without this the gate starts at 0.5 and halves all outputs.
+        self.output_block[-1].bias.data[1] = 3.0
+
+        # Auxiliary head: predict x_0 directly from chip pair features alone.
+        # Trained with sparse-weighted MSE to bias the chip encoder toward
+        # learning loop/punctate structure rather than diffuse background.
+        self.chip_pred_head = nn.Conv2d(self.c_pair, 1, kernel_size=1)
+        nn.init.zeros_(self.chip_pred_head.weight)
+        nn.init.zeros_(self.chip_pred_head.bias)
+
+    def chip_aux_pred(self, h_chip):
+        """
+        Apply the auxiliary prediction head to already-computed chip features.
+
+        Args:
+            h_chip: (B, c_pair, 64, 64) from forward() — reused to avoid a
+                    second encoder pass.
+        Returns:
+            chip_pred_vec: (B, vec_dim) predicted x_0 from chip features only.
+        """
+        chip_pred_map = self.chip_pred_head(h_chip)          # (B, 1, 64, 64)
+        return matrix_to_upper_tri_vec(chip_pred_map.squeeze(1))  # (B, vec_dim)
 
     def forward(self, x_t_vec, gamma, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_vec):
         """
@@ -706,7 +728,8 @@ class SR3UNet(nn.Module):
             bulk_vec:  (B, vec_dim) bulk Hi-C vector (conditioning)
 
         Returns:
-            eps_vec: (B, vec_dim) predicted noise ε
+            x0_vec: (B, vec_dim) predicted clean Hi-C x_0
+            h_chip: (B, c_pair, 64, 64) chip pair features (reuse for aux loss)
         """
         B = x_t_vec.shape[0]
         N = self.n
@@ -770,9 +793,10 @@ class SR3UNet(nn.Module):
         h = self.dec1_reduce(h)
         h = self.dec1(h, noise_emb)
 
-        eps_map = self.output_block(h).squeeze(1)
-        eps_vec = matrix_to_upper_tri_vec(eps_map)
-        return eps_vec
+        x0_map = self.output_block(h)   # (B, 2, 64, 64): [0]=image, [1]=gate
+        x0_gated = torch.sigmoid(x0_map[:, 1]) * x0_map[:, 0]   # sparsity gate
+        x0_vec = matrix_to_upper_tri_vec(x0_gated)
+        return x0_vec, h_chip
 
 
 ############################################
@@ -898,20 +922,22 @@ def eval_batch_loss(model, batch, device, phase_name, generator: torch.Generator
     chip_me1 = batch["chip_seq_h3k4me1"].float().to(device)
     chip_me3 = batch["chip_seq_h3k4me3"].float().to(device)
 
-    # Use a local generator if provided so validation gamma/eps are deterministic
+    # Sample t uniformly from the cosine schedule; deterministic if generator given
+    schedule = gammas.to(device)
     if generator is not None:
-        gamma_t = torch.rand(batch_size, 1, device=device, generator=generator)
+        t = torch.randint(0, T, (batch_size,), device=device, generator=generator)
         eps_true = torch.randn(x0_current.shape, device=device, generator=generator)
     else:
-        gamma_t = torch.rand(batch_size, 1, device=device)
+        t = torch.randint(0, T, (batch_size,), device=device)
         eps_true = torch.randn_like(x0_current)
+    gamma_t = schedule[t].unsqueeze(1)               # (batch_size, 1)
     sqrt_gamma_t = torch.sqrt(gamma_t)
     sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
     y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
 
-    # 4 tracks: CTCF, H3K27ac, H3K4me1, H3K4me3
-    eps_pred = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_for_model)
-    return F.mse_loss(eps_pred, eps_true).item()
+    # 4 tracks: CTCF, H3K27ac, H3K4me1, H3K4me3; model predicts x_0 directly
+    x0_pred, _ = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_for_model)
+    return F.mse_loss(x0_pred, x0_current).item()
 
 
 def compute_validation_loss(model, val_dataloader, device, phase_name):
@@ -973,32 +999,46 @@ def train_step(model, optimizer, batch, device, phase_name, global_step=0):
     chip_me1 = batch['chip_seq_h3k4me1'].float().to(device)    # (batch_size, N)
     chip_me3 = batch['chip_seq_h3k4me3'].float().to(device)    # (batch_size, N)
     
-    # SR3 TRAINING (Algorithm 1): Sample random noise level γ ~ Uniform(0, 1)
-    # γ represents the noise variance: 0 = clean, 1 = pure noise
-    gamma_t = torch.rand(batch_size, 1, device=device)  # Uniform[0, 1]
-    
-    # Sample random noise ϵ ~ N(0, I) - THIS IS THE TARGET!
-    eps_true = torch.randn_like(x0_current)  # (batch_size, vec_dim)
-    
-    # SR3 forward process: y_γ = √γ · y_0 + √(1-γ) · ϵ
-    # Following SR3 Algorithm 1 line 5
+    # Sample t ~ Uniform(0, T-1) and look up γ from the cosine schedule.
+    # γ is the signal fraction: γ≈1 → nearly clean, γ≈0 → nearly pure noise.
+    t = torch.randint(0, T, (batch_size,), device=device)
+    gamma_t = gammas.to(device)[t].unsqueeze(1)       # (batch_size, 1)
+
+    # Sample noise ϵ ~ N(0, I) to corrupt the clean image
+    eps_true = torch.randn_like(x0_current)            # (batch_size, vec_dim)
+
+    # Forward process: y_γ = √γ · y_0 + √(1-γ) · ϵ
     sqrt_gamma_t = torch.sqrt(gamma_t)
     sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
     y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
-    
-    # SR3 MODEL: Predicts noise ε given (y_γ, γ, conditioning)
-    # No timesteps in training - γ is passed directly!
-    eps_pred = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, x0_bulk_normalized)
-    
-    # SR3 LOSS: MSE between predicted noise and true noise
-    # Algorithm 1 line 5: minimize ||f_θ(x, √γ y_0 + √(1-γ)ε, γ) - ε||²
-    loss = F.mse_loss(eps_pred, eps_true)
-    
+
+    # Model predicts x_0 directly (x0-parameterization).
+    # Compared to noise prediction, this yields sharper outputs for sparse
+    # punctate structures (Hi-C loops) because the target is always in
+    # data space rather than noise space.
+    x0_pred, h_chip = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, x0_bulk_normalized)
+
+    # Main loss: MSE in x_0 space
+    loss = F.mse_loss(x0_pred, x0_current)
+
+    # Auxiliary chip loss: MSE on the top 1% of contacts only.
+    # Masking to the 99th-percentile threshold means gradients only flow from
+    # actual loop/TAD-boundary positions — the head cannot lower its loss by
+    # inflating predictions across the board.
+    chip_pred = model.chip_aux_pred(h_chip)
+    with torch.no_grad():
+        thresh = torch.quantile(x0_current, 0.99, dim=1, keepdim=True)  # (B, 1)
+        sparse_mask = (x0_current >= thresh).float()                     # (B, vec_dim)
+        n_active = sparse_mask.sum(dim=1, keepdim=True).clamp(min=1)
+    # Normalise by active count so loss magnitude doesn't depend on sparsity level
+    chip_aux_loss = ((sparse_mask * (chip_pred - x0_current) ** 2).sum(dim=1) / n_active.squeeze(1)).mean()
+    loss = loss + 0.3 * chip_aux_loss
+
     # Backward pass
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    
+
     return loss.item()
 
 ############################################
@@ -1231,7 +1271,7 @@ def main():
         # save checkpoint with data type and log transform info
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-5_alpha64_maxpool.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-18-mse_sparse_gate.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
