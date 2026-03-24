@@ -679,7 +679,10 @@ class SR3UNet(nn.Module):
         self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)
         self.dec1 = BigGANResBlock(base_ch, base_ch, noise_dim)
 
-        # ---- OUTPUT: 2 channels — [0]=image, [1]=gate for sparsity ----
+        # ---- OUTPUT: 2 channels — [0]=value prediction, [1]=sparsity bit logit ----
+        # Sparsity bits (arxiv 2502.02448): channel 1 is supervised with BCE against
+        # a binary contact mask (x0 > 0).  At inference, Heaviside(bit_logit) gates
+        # the value prediction to enforce sparse structure.
         self.output_block = nn.Sequential(
             nn.GroupNorm(min(8, base_ch), base_ch),
             nn.SiLU(),
@@ -687,9 +690,6 @@ class SR3UNet(nn.Module):
         )
         nn.init.zeros_(self.output_block[-1].weight)
         nn.init.zeros_(self.output_block[-1].bias)
-        # Gate channel starts near 1 (pass-through) so early training is stable.
-        # sigmoid(3) ≈ 0.95; without this the gate starts at 0.5 and halves all outputs.
-        self.output_block[-1].bias.data[1] = 3.0
 
         # Auxiliary head: predict x_0 directly from chip pair features alone.
         # Trained with sparse-weighted MSE to bias the chip encoder toward
@@ -728,8 +728,9 @@ class SR3UNet(nn.Module):
             bulk_vec:  (B, vec_dim) bulk Hi-C vector (conditioning)
 
         Returns:
-            x0_vec: (B, vec_dim) predicted clean Hi-C x_0
-            h_chip: (B, c_pair, 64, 64) chip pair features (reuse for aux loss)
+            x0_vec:       (B, vec_dim) predicted clean Hi-C x_0
+            bit_logit_vec:(B, vec_dim) sparsity bit logits (pre-sigmoid); BCE-supervised
+            h_chip:       (B, c_pair, 64, 64) chip pair features (reuse for aux loss)
         """
         B = x_t_vec.shape[0]
         N = self.n
@@ -793,10 +794,10 @@ class SR3UNet(nn.Module):
         h = self.dec1_reduce(h)
         h = self.dec1(h, noise_emb)
 
-        x0_map = self.output_block(h)   # (B, 2, 64, 64): [0]=image, [1]=gate
-        x0_gated = torch.sigmoid(x0_map[:, 1]) * x0_map[:, 0]   # sparsity gate
-        x0_vec = matrix_to_upper_tri_vec(x0_gated)
-        return x0_vec, h_chip
+        x0_map = self.output_block(h)                           # (B, 2, 64, 64)
+        x0_vec = matrix_to_upper_tri_vec(x0_map[:, 0])         # value prediction
+        bit_logit_vec = matrix_to_upper_tri_vec(x0_map[:, 1])  # sparsity bit logits
+        return x0_vec, bit_logit_vec, h_chip
 
 
 ############################################
@@ -936,7 +937,7 @@ def eval_batch_loss(model, batch, device, phase_name, generator: torch.Generator
     y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
 
     # 4 tracks: CTCF, H3K27ac, H3K4me1, H3K4me3; model predicts x_0 directly
-    x0_pred, _ = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_for_model)
+    x0_pred, _, _ = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_for_model)
     return F.mse_loss(x0_pred, x0_current).item()
 
 
@@ -1012,34 +1013,34 @@ def train_step(model, optimizer, batch, device, phase_name, global_step=0):
     sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
     y_gamma = sqrt_gamma_t * x0_current + sqrt_one_minus_gamma_t * eps_true
 
-    # Model predicts x_0 directly (x0-parameterization).
-    # Compared to noise prediction, this yields sharper outputs for sparse
-    # punctate structures (Hi-C loops) because the target is always in
-    # data space rather than noise space.
-    x0_pred, h_chip = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, x0_bulk_normalized)
+    # Model predicts x_0 directly (x0-parameterization) plus a sparsity bit logit.
+    x0_pred, bit_logit, h_chip = model(y_gamma, gamma_t.squeeze(), chip_ctcf, chip_hac, chip_me1, chip_me3, x0_bulk_normalized)
 
-    # Main loss: MSE in x_0 space
-    loss = F.mse_loss(x0_pred, x0_current)
+    # Main loss: MSE in x_0 space (as in arxiv 2502.02448)
+    mse_loss = F.mse_loss(x0_pred, x0_current)
+    loss = mse_loss
+
+    # Sparsity bit loss: BCE against binary contact mask (arxiv 2502.02448).
+    # Contacts defined as x0 > 0 (enriched over expected in OE log space).
+    # Directly supervises WHERE structure is placed, independent of value magnitude.
+    with torch.no_grad():
+        bits_target = (x0_current > -0.5).float()   # (B, vec_dim)
+    bit_loss = F.binary_cross_entropy_with_logits(bit_logit, bits_target)
+    loss = loss + 0.15 * bit_loss
 
     # Auxiliary chip loss: MSE on the top 1% of contacts only.
-    # Masking to the 99th-percentile threshold means gradients only flow from
-    # actual loop/TAD-boundary positions — the head cannot lower its loss by
-    # inflating predictions across the board.
+    # Gradients only flow from actual loop positions so the chip encoder
+    # is forced to localise punctate structure.
     chip_pred = model.chip_aux_pred(h_chip)
-    with torch.no_grad():
-        thresh = torch.quantile(x0_current, 0.99, dim=1, keepdim=True)  # (B, 1)
-        sparse_mask = (x0_current >= thresh).float()                     # (B, vec_dim)
-        n_active = sparse_mask.sum(dim=1, keepdim=True).clamp(min=1)
-    # Normalise by active count so loss magnitude doesn't depend on sparsity level
-    chip_aux_loss = ((sparse_mask * (chip_pred - x0_current) ** 2).sum(dim=1) / n_active.squeeze(1)).mean()
-    loss = loss + 0.3 * chip_aux_loss
+    chip_aux_loss = F.mse_loss(chip_pred, x0_current)
+    loss = loss + 0.40 * chip_aux_loss
 
     # Backward pass
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item()
+    return loss.item(), mse_loss.item(), bit_loss.item(), chip_aux_loss.item()
 
 ############################################
 # 6.5) CHECKPOINT LOADING
@@ -1244,15 +1245,18 @@ def main():
 
     # Training loop
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses = []
+        epoch_losses, epoch_mse, epoch_bit, epoch_chip = [], [], [], []
         model.train()
 
         # Iterate through training batches
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [{CURRENT_PHASE}]")
         for batch_idx, batch in enumerate(pbar):
-            loss = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE, global_step)
+            loss, mse, bit, chip = train_step(model, optimizer, batch, DEVICE, CURRENT_PHASE, global_step)
             epoch_losses.append(loss)
+            epoch_mse.append(mse)
+            epoch_bit.append(bit)
+            epoch_chip.append(chip)
             global_step += 1
 
             # Validation loss every 100 iterations
@@ -1260,18 +1264,18 @@ def main():
                 val_loss = compute_validation_loss(model, val_dataloader, DEVICE, CURRENT_PHASE)
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
 
-            # Update progress bar
-            pbar.set_postfix({'loss': f"{loss:.4f}"})
-        
+            # Update progress bar with all three components
+            pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'bit': f"{bit:.4f}", 'chip': f"{chip:.4f}"})
+
         # Epoch summary
         avg_loss = np.mean(epoch_losses)
         total_epochs = start_epoch + num_epochs
-        print(f"\nEpoch {epoch+1}/{total_epochs} - Average Loss: {avg_loss:.6f}")
+        print(f"\nEpoch {epoch+1}/{total_epochs} - total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  bit={np.mean(epoch_bit):.6f}  chip={np.mean(epoch_chip):.6f}")
         
         # save checkpoint with data type and log transform info
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-18-mse_sparse_gate.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_{CURRENT_PHASE}_epoch{epoch+1}_3-19-mse_sparse_gate_bce.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),

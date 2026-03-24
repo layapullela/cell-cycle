@@ -20,13 +20,14 @@ class Inference:
     """
     SR3 inference engine for sampling phase-specific Hi-C from trained models.
 
-    Implements SR3 Algorithm 2: iterative refinement using noise prediction.
+    Implements iterative refinement using x0-prediction (model predicts the
+    clean image directly, then the implied noise is used for the SR3 update).
     """
 
     def __init__(self, model, device, T=1000, gamma_min=1e-4, gamma_max=1.0):
         """
         Args:
-            model: Trained SR3UNet model (predicts noise ε)
+            model: Trained SR3UNet model (predicts x_0 directly)
             device: torch device
             T: Number of diffusion timesteps
             gamma_min: Minimum noise level (almost clean) - default 1e-4
@@ -38,8 +39,8 @@ class Inference:
         self.gamma_min = gamma_min
         self.gamma_max = gamma_max
 
-        # Load noise schedule from training (must match script used for training)
-        from train_diffusion_single_tracks import gammas, alphas
+        # Load noise schedule from training (must match training script)
+        from train_diffusion_alpha import gammas, alphas
         self.gammas = gammas.to(device)
         self.alphas = alphas.to(device)
 
@@ -67,6 +68,7 @@ class Inference:
         
         # Iteratively denoise: t = T-1, T-2, ..., 1
         # SR3 Algorithm 2: same formula for all steps, z=0 only at final step (t=1)
+        bit_logit_last = None
         for t_idx in range(self.T - 1, 0, -1):
             # Get noise levels from schedule
             gamma_t = self.gammas[t_idx]
@@ -76,10 +78,9 @@ class Inference:
             sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
             sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
 
-            # Predict noise ε - pass gamma directly to model
+            # Model predicts x̂_0 and sparsity bit logits; discard h_chip
             gamma_batch = torch.full((batch_size,), gamma_t, device=self.device)
-            # For alpha model: 4 ChIP tracks (ctcf, hac, me1, me3)
-            eps_pred = self.model(
+            x0_pred, bit_logit, _ = self.model(
                 y_t,
                 gamma_batch,
                 chip_ctcf,
@@ -88,24 +89,30 @@ class Inference:
                 chip_me3,
                 bulk_vec,
             )
+            bit_logit_last = bit_logit
 
-            # #SR3 Algorithm 2: z ~ N(0,I) if t > 1, else z = 0
+            # Recover implied noise from x̂_0:  ε = (y_t - √γ · x̂_0) / √(1-γ)
+            sqrt_gamma_t = torch.sqrt(gamma_t)
+            eps_implied = (y_t - sqrt_gamma_t * x0_pred) / (sqrt_one_minus_gamma_t + 1e-8)
+
+            # SR3 reverse step using implied noise
             if t_idx > 1:
                 z = torch.randn_like(y_t)
             else:
-                z = torch.zeros_like(y_t)  # Final step: t=1→0, no noise
+                z = torch.zeros_like(y_t)  # final step: no added noise
 
-            # for now, let's make z = 0 for all steps (hicDiff)
-            #z = torch.zeros_like(y_t)
-            
-            # SR3 Algorithm 2 formula (same for all steps)
-            y_prev = (1.0 / sqrt_alpha_t) * (y_t - ((1.0 - alpha_t) / sqrt_one_minus_gamma_t) * eps_pred) + sqrt_one_minus_alpha_t * z
+            y_prev = (1.0 / sqrt_alpha_t) * (y_t - ((1.0 - alpha_t) / sqrt_one_minus_gamma_t) * eps_implied) + sqrt_one_minus_alpha_t * z
 
-            #y_prev = torch.clamp(y_prev, -1.0, 1.0) # clip to -1, 1 #TODO: check this
-            
+            # clamp
+            y_prev = torch.clamp(y_prev, min=-1.0, max=1.0)
+
             y_t = y_prev
-        
-        # After loop, y_t is y_0 (fully denoised)
+
+        # Apply sparsity bits: gate value prediction by Heaviside of bit logit from
+        # the final sampling step (arxiv 2502.02448).  Zeroes out entries the model
+        # predicts as non-contacts without distorting surviving contact magnitudes.
+        # if bit_logit_last is not None:
+        #     y_t = y_t * (bit_logit_last > 0).float()
         return y_t
     
     def visualize(self, batch, phase_name, output_path=None, n=64, vmin=None, vmax=None):
