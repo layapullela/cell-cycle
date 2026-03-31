@@ -10,10 +10,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from pathlib import Path
 import sys
-
-# Add preprocess dir to path for undo_normalization
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess"))
-from undo_normalization import reverse_normalization_to_log_scale, quantile_normalize_across_samples
 
 
 class Inference:
@@ -65,22 +62,24 @@ class Inference:
         
         # SR3 Algorithm 2 Line 1: Start from pure Gaussian noise
         y_t = torch.randn(batch_size, vec_dim, device=self.device)
-        
-        # Iteratively denoise: t = T-1, T-2, ..., 1
-        # SR3 Algorithm 2: same formula for all steps, z=0 only at final step (t=1)
-        bit_logit_last = None
-        for t_idx in range(self.T - 1, 0, -1):
-            # Get noise levels from schedule
-            gamma_t = self.gammas[t_idx]
-            # Get alpha_t from schedule
-            alpha_t = self.alphas[t_idx]
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
-            sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
 
-            # Model predicts x̂_0 and sparsity bit logits; discard h_chip
+        #breakpoint()
+        
+        # SR3 Algorithm 2: iterative refinement with stochastic noise re-injection.
+        # Model predicts ε directly (SR3 Algorithm 1 training).
+        #
+        #   y_{t-1} = (1/√α_t)(y_t - (1-α_t)/√(1-γ_t) · ε_θ(y_t, γ_t)) + √(1-α_t) · z
+        #
+        # where z ~ N(0,I) for t > 1, z = 0 for t = 1 (final step is deterministic).
+        for t_idx in range(self.T - 1, 0, -1):
+            gamma_t = self.gammas[t_idx]
+            alpha_t = self.alphas[t_idx]
+
+            sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
+
+            # Model predicts ε; discard h_chip
             gamma_batch = torch.full((batch_size,), gamma_t, device=self.device)
-            x0_pred, bit_logit, _ = self.model(
+            eps_pred, _ = self.model(
                 y_t,
                 gamma_batch,
                 chip_ctcf,
@@ -89,30 +88,26 @@ class Inference:
                 chip_me3,
                 bulk_vec,
             )
-            bit_logit_last = bit_logit
 
-            # Recover implied noise from x̂_0:  ε = (y_t - √γ · x̂_0) / √(1-γ)
-            sqrt_gamma_t = torch.sqrt(gamma_t)
-            eps_implied = (y_t - sqrt_gamma_t * x0_pred) / (sqrt_one_minus_gamma_t + 1e-8)
+            # SR3 Algorithm 2 update
+            z = torch.randn_like(y_t) if t_idx > 1 else torch.zeros_like(y_t)
+            y_t = (1.0 / torch.sqrt(alpha_t)) * (
+                y_t - (1.0 - alpha_t) / sqrt_one_minus_gamma_t * eps_pred
+            ) + torch.sqrt(1.0 - alpha_t) * z
 
-            # SR3 reverse step using implied noise
-            if t_idx > 1:
-                z = torch.randn_like(y_t)
-            else:
-                z = torch.zeros_like(y_t)  # final step: no added noise
+        # ---- Commented-out DDIM x0-prediction update (deviation from SR3) ----
+        # for t_idx in range(self.T - 1, 0, -1):
+        #     gamma_t    = self.gammas[t_idx]
+        #     gamma_prev = self.gammas[t_idx - 1]
+        #     sqrt_gamma_t           = torch.sqrt(gamma_t)
+        #     sqrt_one_minus_gamma_t = torch.sqrt(torch.clamp(1.0 - gamma_t, min=0.0))
+        #     gamma_batch = torch.full((batch_size,), gamma_t, device=self.device)
+        #     x0_pred, _ = self.model(y_t, gamma_batch, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_vec)
+        #     eps_implied = (y_t - sqrt_gamma_t * x0_pred) / (sqrt_one_minus_gamma_t + 1e-8)
+        #     sqrt_gamma_prev           = torch.sqrt(gamma_prev)
+        #     sqrt_one_minus_gamma_prev = torch.sqrt(torch.clamp(1.0 - gamma_prev, min=0.0))
+        #     y_t = sqrt_gamma_prev * x0_pred + sqrt_one_minus_gamma_prev * eps_implied
 
-            y_prev = (1.0 / sqrt_alpha_t) * (y_t - ((1.0 - alpha_t) / sqrt_one_minus_gamma_t) * eps_implied) + sqrt_one_minus_alpha_t * z
-
-            # clamp
-            y_prev = torch.clamp(y_prev, min=-1.0, max=1.0)
-
-            y_t = y_prev
-
-        # Apply sparsity bits: gate value prediction by Heaviside of bit logit from
-        # the final sampling step (arxiv 2502.02448).  Zeroes out entries the model
-        # predicts as non-contacts without distorting surviving contact magnitudes.
-        # if bit_logit_last is not None:
-        #     y_t = y_t * (bit_logit_last > 0).float()
         return y_t
     
     def visualize(self, batch, phase_name, output_path=None, n=64, vmin=None, vmax=None):
@@ -135,7 +130,7 @@ class Inference:
             sampled: (B, vec_dim) sampled phase-specific Hi-C
         """
         # Import matrix conversion utilities (must match training script: N=64)
-        from train_diffusion_single_tracks import upper_tri_vec_to_matrix
+        from train_diffusion_alpha import upper_tri_vec_to_matrix
         
         # Extract ground truth and conditioning
         x0_early = batch['earlyG1'].float().to(self.device)
@@ -161,6 +156,8 @@ class Inference:
             'anatelo': x0_anatelo
         }
         gt_vec = phase_to_gt[phase_name]
+
+        #breakpoint()
         
         # Run sampling
         sampled_vec = self.sample(bulk_vec, chip_ctcf, chip_hac, chip_me1, chip_me3)

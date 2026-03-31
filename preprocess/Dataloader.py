@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Union, Optional, Tuple
 import hicstraw as straw
 import pyBigWig
+from utils import matrix_to_upper_tri_vec_np, upper_tri_vec_to_matrix_np
 
 
 class CellCycleDataLoader:
@@ -312,17 +313,7 @@ class CellCycleDataLoader:
         Returns:
             2D symmetric numpy array (64x64)
         """
-        n = self.image_size
-        matrix = np.zeros((n, n), dtype=upper_tri_vec.dtype)
-
-        idx = 0
-        for i in range(n):
-            for j in range(i, n):
-                matrix[i, j] = upper_tri_vec[idx]
-                matrix[j, i] = upper_tri_vec[idx]  # Symmetric
-                idx += 1
-
-        return matrix
+        return upper_tri_vec_to_matrix_np(upper_tri_vec, self.image_size)
 
     def _flip_hic_matrix(self, upper_tri_vec: np.ndarray) -> np.ndarray:
         """
@@ -361,21 +352,14 @@ class CellCycleDataLoader:
         """
         Extract upper triangular portion of symmetric matrix as a flattened vector.
         Elements are stacked row by row (e.g., row 0, then row 1, etc.).
-        
+
         Args:
             matrix: 2D numpy array (square, symmetric)
-        
+
         Returns:
             1D numpy array containing upper triangular elements in row-major order
         """
-        n = matrix.shape[0]
-        upper_tri_vec = []
-        
-        # Stack rows: for row i, take elements from column i to n-1
-        for i in range(n):
-            upper_tri_vec.extend(matrix[i, i:].tolist())
-        
-        return np.array(upper_tri_vec, dtype=matrix.dtype)
+        return matrix_to_upper_tri_vec_np(matrix)
     
     def _extract_region_matrix(self, hic_file: Path, region: str) -> np.ndarray:
         """
