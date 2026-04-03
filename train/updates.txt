@@ -1,0 +1,23 @@
+3-30 model: 
+    things changed: 
+        1. remove sparsity bit loss (the images are not sparse so close to the diagonal)
+        2. clean code base (seperate files for model.py, schedule.py)
+        3. when you change the target from noise prediction to x0 prediction, the noise schedule becomes very important 
+           this is because hte loss is very high at early stages and you want to make sure the model doesn't overcorrect on the noisiest steps
+           from SR3 paper: "We expect both of these variants to work reasonably well if p(γ) is modified to account
+           for the scale of the loss function." 
+           - our solution is to use cosine noise scheduler from Nichol and Dariwal 
+           - then use min SNR clamping strategy on noise (hang et. al)
+            this technique is useful becasue we are predicitng x0 instead of eta, and in the supplementals they say that the 
+            error between x0 - x_hat(xt, t) is proportional to the signal to noise ratio
+        4. chip auxillary loss is now weighted by gamma so we are more strict at lower noise levels
+
+        * the issue with this run was that the samples are coming out too dark
+
+3-31: 
+    things changed 
+        1. we are going back to the original formulation of SR3, same uniform noise schedule and DDPM
+        2. no clamping either, and we are repredicting eps rather than xt
+        3. this seems to work best and we should not change it.
+
+
