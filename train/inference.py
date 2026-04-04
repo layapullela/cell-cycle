@@ -93,6 +93,13 @@ class Inference:
                 y_t - (1.0 - alpha_t) / sqrt_one_minus_gamma_t * eps_pred
             ) + torch.sqrt(1.0 - alpha_t) * z
 
+            # Project y_t onto the constraint: (y_t[:,0] + y_t[:,1]) / 2 == bulk_vec.
+            # Residual is split equally between both channels so their relative
+            # difference is unchanged — only the mean is corrected.
+            current_mean = (y_t[:, 0] + y_t[:, 1]) / 2.0   # (B, vec_dim)
+            residual     = bulk_vec - current_mean            # (B, vec_dim)
+            y_t = y_t + (residual / 2.0).unsqueeze(1)        # broadcast to (B, 2, vec_dim)
+
         # ---- Commented-out DDIM x0-prediction update (deviation from SR3) ----
         # for t_idx in range(self.T - 1, 0, -1):
         #     gamma_t    = self.gammas[t_idx]
