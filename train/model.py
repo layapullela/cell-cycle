@@ -345,12 +345,12 @@ class SR3UNet(nn.Module):
     SR3-style U-Net that predicts x_0 (x0-parameterization).
 
     Architecture:
-        - Input: noisy (1) + bulk Hi-C (1) → (B, 2, 64, 64); ChIP is supplemental
+        - Input: noisy anaphase (1) + noisy G1 (1) + bulk Hi-C (1) → (B, 3, 64, 64); ChIP supplemental
         - ChIP-seq: 4 tracks → AlphaFold-style outer product → (B, c_pair, 64, 64)
         - Four downsampling stages: 64 → 32 → 16 → 8
         - BigGAN residual blocks + self-attention at 16×16 and 8×8 (bottleneck)
         - Standard U-Net skip connections (concatenation)
-        - Output: Predicted clean image x_0
+        - Output: [anaphase_pred, G1_pred] x_0 → (B, 2, vec_dim)
     """
     def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64, c_pair: int | None = None):
         super().__init__()
@@ -363,7 +363,8 @@ class SR3UNet(nn.Module):
 
         noise_dim = self.noise_embed.mlp[-1].out_features
 
-        self.input_conv = nn.Conv2d(2, base_ch // 2, kernel_size=3, padding=1)
+        # 3 input channels: noisy anaphase + noisy G1 + bulk
+        self.input_conv = nn.Conv2d(3, base_ch // 2, kernel_size=3, padding=1)
         self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=self.c_pair)
 
         # ---- ENCODER ----
@@ -398,16 +399,17 @@ class SR3UNet(nn.Module):
         self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)
         self.dec1 = BigGANResBlock(base_ch, base_ch, noise_dim)
 
+        # 2 output channels: anaphase + G1
         self.output_block = nn.Sequential(
             nn.GroupNorm(min(8, base_ch), base_ch),
             nn.SiLU(),
-            nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
+            nn.Conv2d(base_ch, 2, kernel_size=3, padding=1)
         )
         nn.init.zeros_(self.output_block[-1].weight)
         nn.init.zeros_(self.output_block[-1].bias)
 
-        # Auxiliary head: predict x_0 from chip features alone
-        self.chip_pred_head = nn.Conv2d(self.c_pair, 1, kernel_size=1)
+        # Auxiliary head: predict both phases from chip features alone
+        self.chip_pred_head = nn.Conv2d(self.c_pair, 2, kernel_size=1)
         nn.init.zeros_(self.chip_pred_head.weight)
         nn.init.zeros_(self.chip_pred_head.bias)
 
@@ -418,17 +420,19 @@ class SR3UNet(nn.Module):
         Args:
             h_chip: (B, c_pair, 64, 64) from forward()
         Returns:
-            chip_pred_vec: (B, vec_dim) predicted x_0 from chip features only.
+            chip_pred_vec: (B, 2, vec_dim) predicted [anaphase, G1] from chip features only.
         """
-        chip_pred_map = self.chip_pred_head(h_chip)           # (B, 1, 64, 64)
-        return matrix_to_upper_tri_vec(chip_pred_map.squeeze(1))
+        chip_pred_map = self.chip_pred_head(h_chip)           # (B, 2, 64, 64)
+        ch0 = matrix_to_upper_tri_vec(chip_pred_map[:, 0])    # (B, vec_dim)
+        ch1 = matrix_to_upper_tri_vec(chip_pred_map[:, 1])    # (B, vec_dim)
+        return torch.stack([ch0, ch1], dim=1)                  # (B, 2, vec_dim)
 
     def forward(self, x_t_vec, gamma, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_vec):
         """
         SR3 forward pass: predict x_0 given noisy input y_γ.
 
         Args:
-            x_t_vec:   (B, vec_dim) noisy Hi-C vector y_γ
+            x_t_vec:   (B, 2, vec_dim) noisy Hi-C vectors [anaphase, G1]
             gamma:     (B,) or (B, 1) noise level γ ∈ [0, 1]
             chip_ctcf: (B, 64) CTCF ChIP-seq
             chip_hac:  (B, 64) H3K27ac
@@ -437,7 +441,7 @@ class SR3UNet(nn.Module):
             bulk_vec:  (B, vec_dim) bulk Hi-C vector (conditioning)
 
         Returns:
-            x0_vec: (B, vec_dim) predicted clean Hi-C x_0
+            x0_vec: (B, 2, vec_dim) predicted clean Hi-C [anaphase, G1]
             h_chip: (B, c_pair, 64, 64) chip pair features (reuse for aux loss)
         """
         B = x_t_vec.shape[0]
@@ -448,11 +452,13 @@ class SR3UNet(nn.Module):
         gamma_scaled = gamma * 999.0
         noise_emb = self.noise_embed(gamma_scaled)
 
-        x_t_map = upper_tri_vec_to_matrix(x_t_vec, N).unsqueeze(1)    # (B, 1, 64, 64)
-        bulk_map = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)  # (B, 1, 64, 64)
+        # x_t_vec: (B, 2, vec_dim) — channel 0=anaphase, channel 1=G1
+        x_t_anaphase = upper_tri_vec_to_matrix(x_t_vec[:, 0], N).unsqueeze(1)  # (B, 1, N, N)
+        x_t_G1 = upper_tri_vec_to_matrix(x_t_vec[:, 1], N).unsqueeze(1)        # (B, 1, N, N)
+        bulk_map = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)            # (B, 1, N, N)
 
-        x_in = torch.cat([x_t_map, bulk_map], dim=1)                  # (B, 2, 64, 64)
-        h_bulk = self.input_conv(x_in)                                 # (B, base_ch//2, 64, 64)
+        x_in = torch.cat([x_t_anaphase, x_t_G1, bulk_map], dim=1)             # (B, 3, N, N)
+        h_bulk = self.input_conv(x_in)                                          # (B, base_ch//2, N, N)
 
         h_chip = self.chip_pair_encoder(chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_map)
 
@@ -493,6 +499,8 @@ class SR3UNet(nn.Module):
         h = self.dec1_reduce(h)
         h = self.dec1(h, noise_emb)
 
-        x0_map = self.output_block(h)                          # (B, 1, 64, 64)
-        x0_vec = matrix_to_upper_tri_vec(x0_map[:, 0])
+        x0_map = self.output_block(h)                                    # (B, 2, N, N)
+        x0_anaphase = matrix_to_upper_tri_vec(x0_map[:, 0])             # (B, vec_dim)
+        x0_G1 = matrix_to_upper_tri_vec(x0_map[:, 1])                   # (B, vec_dim)
+        x0_vec = torch.stack([x0_anaphase, x0_G1], dim=1)               # (B, 2, vec_dim)
         return x0_vec, h_chip
