@@ -317,11 +317,10 @@ def run_test_evaluation_chromosome2(
             start_mb = start / 1e6
             end_mb = end / 1e6
 
-            # Run inference and visualize with fixed [0, 40] color scale
+            # Run inference and visualize (both anaphase and G1 channels)
             save_path = run_inference_and_visualize(
                 model=model,
                 batch=batch,
-                phase_name=phase_name,
                 device=device,
                 step=f"chr2_{start_mb:.2f}Mb-{end_mb:.2f}Mb_{region_clean}",
                 output_dir=output_dir

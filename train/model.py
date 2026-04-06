@@ -338,161 +338,275 @@ class ChipPairEncoderAlpha(nn.Module):
 
 
 ############################################
-# SR3-STYLE U-NET (Denoised Image Predictor)
+# PHASE CROSS-ATTENTION (between decoder streams)
+############################################
+class PhaseStreamAttention(nn.Module):
+    """
+    Cross-phase attention between 4 parallel decoder streams at a given resolution.
+
+    Each stream's feature map is summarised into one token via average pooling,
+    then a 4×4 attention matrix lets each phase gather context from the others.
+    The attended update is broadcast back to every spatial position via a 1×1 conv.
+
+    This operates on feature maps, not output pixels, so the 4 phases can
+    exchange semantic information (e.g. "anatelo has strong TADs here") before
+    the next decoder level commits to a prediction.
+
+    Shapes (example at 16×16, base_ch*4=256):
+        streams : list of 4 × (B, C, H, W)
+        tokens  : (B, 4, C)               one token per phase (global avg pool)
+        Q,K,V   : (B, 4, d_model)
+        A       : (B, 4, 4)               cross-phase attention weights
+        update  : (B, 4, C) → broadcast → 4 × (B, C, H, W)  via 1×1 conv
+    """
+    def __init__(self, channels: int, d_model: int = 64, n_phases: int = 4):
+        super().__init__()
+        self.scale   = d_model ** -0.5
+        self.norm    = nn.GroupNorm(min(8, channels), channels)
+        self.to_token = nn.Linear(channels, d_model, bias=False)
+        self.W_q     = nn.Linear(d_model, d_model, bias=False)
+        self.W_k     = nn.Linear(d_model, d_model, bias=False)
+        self.W_v     = nn.Linear(d_model, d_model, bias=False)
+        self.to_feat = nn.Conv2d(d_model, channels, kernel_size=1)
+
+        # Zero-init: module is identity at training start
+        nn.init.zeros_(self.to_feat.weight)
+        nn.init.zeros_(self.to_feat.bias)
+
+    def forward(self, streams):
+        """
+        streams: list of n_phases tensors, each (B, C, H, W)
+        returns: list of n_phases tensors, same shape, residual-updated
+        """
+        B, C, H, W = streams[0].shape
+
+        # Summarise each stream into one token via global average pool
+        tokens = torch.stack(
+            [self.norm(s).mean(dim=(2, 3)) for s in streams], dim=1
+        )                                                        # (B, 4, C)
+        tokens = self.to_token(tokens)                           # (B, 4, d_model)
+
+        Q = self.W_q(tokens)                                     # (B, 4, d_model)
+        K = self.W_k(tokens)                                     # (B, 4, d_model)
+        V = self.W_v(tokens)                                     # (B, 4, d_model)
+
+        A = torch.softmax(Q @ K.transpose(-2, -1) * self.scale, dim=-1)  # (B, 4, 4)
+        Z = A @ V                                                          # (B, 4, d_model)
+
+        # Broadcast update back to spatial dims via 1×1 conv
+        out_streams = []
+        for i, s in enumerate(streams):
+            update = self.to_feat(
+                Z[:, i].unsqueeze(-1).unsqueeze(-1).expand(B, -1, H, W)
+            )                                                    # (B, C, H, W)
+            out_streams.append(s + update)
+        return out_streams
+
+
+############################################
+# SR3-STYLE U-NET — SPLIT DECODER (Denoised Image Predictor)
 ############################################
 class SR3UNet(nn.Module):
     """
-    SR3-style U-Net that predicts x_0 (x0-parameterization).
+    SR3-style U-Net with a shared encoder and 4 parallel phase-specific decoder streams.
 
     Architecture:
-        - Input: noisy (1) + bulk Hi-C (1) → (B, 2, 64, 64); ChIP is supplemental
-        - ChIP-seq: 4 tracks → AlphaFold-style outer product → (B, c_pair, 64, 64)
-        - Four downsampling stages: 64 → 32 → 16 → 8
-        - BigGAN residual blocks + self-attention at 16×16 and 8×8 (bottleneck)
-        - Standard U-Net skip connections (concatenation)
-        - Output: Predicted clean image x_0
+        Encoder (shared):
+            (B, 5, 64, 64) → [enc1 → enc2 → enc3 → bottleneck] → (B, 512, 8, 8)
+            Input channels: noisy earlyG1 + midG1 + lateG1 + anatelo + bulk
+
+        Decoder (4 parallel streams, one per phase):
+            bottleneck → split into 4 streams via stream_init
+            Each stream runs its own upsampling BigGAN blocks.
+            Between levels, PhaseStreamAttention lets streams communicate.
+            Skip connections from encoder are shared across all 4 streams.
+
+        Output:
+            Each stream → GroupNorm → SiLU → Conv2d(base_ch, 1)
+            Stack → (B, 4, vec_dim)
+
+    Cross-phase attention positions (feature-level, not pixel-level):
+        After dec3 (16×16, base_ch*4 channels)
+        After dec2 (32×32, base_ch*2 channels)
+        After dec1 (64×64, base_ch   channels)
     """
+    N_PHASES = 4
+
     def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64, c_pair: int | None = None):
         super().__init__()
-        self.vec_dim = vec_dim
-        self.n = n
+        self.vec_dim  = vec_dim
+        self.n        = n
+        self.base_ch  = base_ch
         self.noise_embed = noise_embed_module
-        self.base_ch = base_ch
-        assert base_ch % 2 == 0, "base_ch must be divisible by 2 for bulk/chip split"
-        self.c_pair = base_ch // 2
+        assert base_ch % 2 == 0
+        self.c_pair   = base_ch // 2
+        P             = self.N_PHASES
 
         noise_dim = self.noise_embed.mlp[-1].out_features
 
-        self.input_conv = nn.Conv2d(2, base_ch // 2, kernel_size=3, padding=1)
+        # ---- INPUT ----
+        # 5 channels: 4 noisy phases + bulk
+        self.input_conv      = nn.Conv2d(5, base_ch // 2, kernel_size=3, padding=1)
         self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=self.c_pair)
 
-        # ---- ENCODER ----
-        self.enc1 = BigGANResBlock(base_ch, base_ch, noise_dim)
-        self.enc1_down = BigGANResBlock(base_ch, base_ch * 2, noise_dim, down=True)
+        # ---- SHARED ENCODER ----
+        self.enc1          = BigGANResBlock(base_ch,     base_ch,     noise_dim)
+        self.enc1_down     = BigGANResBlock(base_ch,     base_ch * 2, noise_dim, down=True)
+        self.enc2          = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
+        self.enc2_down     = BigGANResBlock(base_ch * 2, base_ch * 4, noise_dim, down=True)
+        self.enc3          = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
+        self.enc3_self_attn= SelfAttentionBlock(base_ch * 4)
+        self.enc3_down     = BigGANResBlock(base_ch * 4, base_ch * 8, noise_dim, down=True)
 
-        self.enc2 = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
-        self.enc2_down = BigGANResBlock(base_ch * 2, base_ch * 4, noise_dim, down=True)
-
-        self.enc3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
-        self.enc3_self_attn = SelfAttentionBlock(base_ch * 4)
-        self.enc3_down = BigGANResBlock(base_ch * 4, base_ch * 8, noise_dim, down=True)
-
-        # ---- BOTTLENECK: 8x8 ----
+        # ---- BOTTLENECK ----
         self.bottleneck = nn.ModuleList([
             BigGANResBlock(base_ch * 8, base_ch * 8, noise_dim),
             SelfAttentionBlock(base_ch * 8),
             BigGANResBlock(base_ch * 8, base_ch * 8, noise_dim),
         ])
 
-        # ---- DECODER ----
-        self.dec3_up = BigGANResBlock(base_ch * 8, base_ch * 4, noise_dim, up=True)
-        self.dec3_reduce = nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)
-        self.dec3 = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
-        self.dec3_self_attn = SelfAttentionBlock(base_ch * 4)
+        # ---- SPLIT: bottleneck → 4 phase streams ----
+        # One 1×1 conv per phase to project (base_ch*8) → (base_ch*4) and give each stream its own start
+        self.stream_init = nn.ModuleList([
+            nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1) for _ in range(P)
+        ])
 
-        self.dec2_up = BigGANResBlock(base_ch * 4, base_ch * 2, noise_dim, up=True)
-        self.dec2_reduce = nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)
-        self.dec2 = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
+        # ---- PHASE-PARALLEL DECODER ----
+        # Level 3: 8×8 → 16×16
+        self.dec3_up     = nn.ModuleList([BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim, up=True)  for _ in range(P)])
+        self.dec3_reduce = nn.ModuleList([nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)             for _ in range(P)])
+        self.dec3        = nn.ModuleList([BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)             for _ in range(P)])
+        self.phase_attn3 = PhaseStreamAttention(base_ch * 4, d_model=64)
 
-        self.dec1_up = BigGANResBlock(base_ch * 2, base_ch, noise_dim, up=True)
-        self.dec1_reduce = nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)
-        self.dec1 = BigGANResBlock(base_ch, base_ch, noise_dim)
+        # Level 2: 16×16 → 32×32
+        self.dec2_up     = nn.ModuleList([BigGANResBlock(base_ch * 4, base_ch * 2, noise_dim, up=True)  for _ in range(P)])
+        self.dec2_reduce = nn.ModuleList([nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)             for _ in range(P)])
+        self.dec2        = nn.ModuleList([BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)             for _ in range(P)])
+        self.phase_attn2 = PhaseStreamAttention(base_ch * 2, d_model=64)
 
-        self.output_block = nn.Sequential(
-            nn.GroupNorm(min(8, base_ch), base_ch),
-            nn.SiLU(),
-            nn.Conv2d(base_ch, 1, kernel_size=3, padding=1)
-        )
-        nn.init.zeros_(self.output_block[-1].weight)
-        nn.init.zeros_(self.output_block[-1].bias)
+        # Level 1: 32×32 → 64×64
+        self.dec1_up     = nn.ModuleList([BigGANResBlock(base_ch * 2, base_ch, noise_dim, up=True)       for _ in range(P)])
+        self.dec1_reduce = nn.ModuleList([nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)                  for _ in range(P)])
+        self.dec1        = nn.ModuleList([BigGANResBlock(base_ch, base_ch, noise_dim)                      for _ in range(P)])
+        self.phase_attn1 = PhaseStreamAttention(base_ch, d_model=64)
 
-        # Auxiliary head: predict x_0 from chip features alone
-        self.chip_pred_head = nn.Conv2d(self.c_pair, 1, kernel_size=1)
+        # ---- PER-PHASE OUTPUT HEADS ----
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(min(8, base_ch), base_ch),
+                nn.SiLU(),
+                nn.Conv2d(base_ch, 1, kernel_size=3, padding=1),
+            ) for _ in range(P)
+        ])
+        for head in self.output_heads:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+
+        # ---- AUXILIARY CHIP HEAD ----
+        self.chip_pred_head = nn.Conv2d(self.c_pair, 4, kernel_size=1)
         nn.init.zeros_(self.chip_pred_head.weight)
         nn.init.zeros_(self.chip_pred_head.bias)
 
+    # ------------------------------------------------------------------
     def chip_aux_pred(self, h_chip):
         """
-        Apply the auxiliary prediction head to already-computed chip features.
-
         Args:
-            h_chip: (B, c_pair, 64, 64) from forward()
+            h_chip: (B, c_pair, 64, 64)
         Returns:
-            chip_pred_vec: (B, vec_dim) predicted x_0 from chip features only.
+            (B, 4, vec_dim)
         """
-        chip_pred_map = self.chip_pred_head(h_chip)           # (B, 1, 64, 64)
-        return matrix_to_upper_tri_vec(chip_pred_map.squeeze(1))
+        chip_pred_map = self.chip_pred_head(h_chip)                 # (B, 4, 64, 64)
+        return torch.stack([
+            matrix_to_upper_tri_vec(chip_pred_map[:, i]) for i in range(self.N_PHASES)
+        ], dim=1)                                                    # (B, 4, vec_dim)
 
+    # ------------------------------------------------------------------
     def forward(self, x_t_vec, gamma, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_vec):
         """
-        SR3 forward pass: predict x_0 given noisy input y_γ.
-
         Args:
-            x_t_vec:   (B, vec_dim) noisy Hi-C vector y_γ
-            gamma:     (B,) or (B, 1) noise level γ ∈ [0, 1]
-            chip_ctcf: (B, 64) CTCF ChIP-seq
-            chip_hac:  (B, 64) H3K27ac
-            chip_me1:  (B, 64) H3K4me1
-            chip_me3:  (B, 64) H3K4me3
-            bulk_vec:  (B, vec_dim) bulk Hi-C vector (conditioning)
-
+            x_t_vec:  (B, 4, vec_dim)  noisy phases [earlyG1, midG1, lateG1, anatelo]
+            gamma:    (B,)             noise level
+            chip_*:   (B, 64)          ChIP-seq tracks
+            bulk_vec: (B, vec_dim)     bulk Hi-C conditioning
         Returns:
-            x0_vec: (B, vec_dim) predicted clean Hi-C x_0
-            h_chip: (B, c_pair, 64, 64) chip pair features (reuse for aux loss)
+            x0_vec:  (B, 4, vec_dim)
+            h_chip:  (B, c_pair, 64, 64)
         """
-        B = x_t_vec.shape[0]
-        N = self.n
+        B  = x_t_vec.shape[0]
+        N  = self.n
+        P  = self.N_PHASES
 
         if gamma.dim() == 2:
             gamma = gamma.squeeze(-1)
-        gamma_scaled = gamma * 999.0
-        noise_emb = self.noise_embed(gamma_scaled)
+        noise_emb = self.noise_embed(gamma * 999.0)
 
-        x_t_map = upper_tri_vec_to_matrix(x_t_vec, N).unsqueeze(1)    # (B, 1, 64, 64)
-        bulk_map = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)  # (B, 1, 64, 64)
+        # ---- Build input maps ----
+        phase_maps = [upper_tri_vec_to_matrix(x_t_vec[:, i], N).unsqueeze(1) for i in range(P)]
+        bulk_map   = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)         # (B, 1, N, N)
 
-        x_in = torch.cat([x_t_map, bulk_map], dim=1)                  # (B, 2, 64, 64)
-        h_bulk = self.input_conv(x_in)                                 # (B, base_ch//2, 64, 64)
-
+        x_in   = torch.cat(phase_maps + [bulk_map], dim=1)                     # (B, 5, N, N)
+        h_bulk = self.input_conv(x_in)                                          # (B, base_ch//2, N, N)
         h_chip = self.chip_pair_encoder(chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_map)
 
-        h = torch.cat([h_bulk, h_chip], dim=1)                        # (B, base_ch, 64, 64)
+        h = torch.cat([h_bulk, h_chip], dim=1)                                 # (B, base_ch, 64, 64)
 
-        # ========== ENCODER ==========
-        h = self.enc1(h, noise_emb)
-        skip1 = h
-        h = self.enc1_down(h, noise_emb)                              # (B, base_ch*2, 32, 32)
+        # ========== SHARED ENCODER ==========
+        h     = self.enc1(h, noise_emb)
+        skip1 = h                                                               # (B, base_ch,   64, 64)
+        h     = self.enc1_down(h, noise_emb)
 
-        h = self.enc2(h, noise_emb)
-        skip2 = h
-        h = self.enc2_down(h, noise_emb)                              # (B, base_ch*4, 16, 16)
+        h     = self.enc2(h, noise_emb)
+        skip2 = h                                                               # (B, base_ch*2, 32, 32)
+        h     = self.enc2_down(h, noise_emb)
 
-        h = self.enc3(h, noise_emb)
-        h = self.enc3_self_attn(h)
-        skip3 = h
-        h = self.enc3_down(h, noise_emb)                              # (B, base_ch*8, 8, 8)
+        h     = self.enc3(h, noise_emb)
+        h     = self.enc3_self_attn(h)
+        skip3 = h                                                               # (B, base_ch*4, 16, 16)
+        h     = self.enc3_down(h, noise_emb)                                   # (B, base_ch*8,  8,  8)
 
         # ========== BOTTLENECK ==========
         for block in self.bottleneck:
             h = block(h, noise_emb) if isinstance(block, BigGANResBlock) else block(h)
+                                                                                # (B, base_ch*8, 8, 8)
 
-        # ========== DECODER ==========
-        h = self.dec3_up(h, noise_emb)                                # (B, base_ch*4, 16, 16)
-        h = torch.cat([h, skip3], dim=1)
-        h = self.dec3_reduce(h)
-        h = self.dec3(h, noise_emb)
-        h = self.dec3_self_attn(h)
+        # ========== SPLIT INTO 4 PHASE STREAMS ==========
+        # Each stream gets an independent linear projection of the bottleneck
+        streams = [init(h) for init in self.stream_init]                       # 4 × (B, base_ch*4, 8, 8)
 
-        h = self.dec2_up(h, noise_emb)                                # (B, base_ch*2, 32, 32)
-        h = torch.cat([h, skip2], dim=1)
-        h = self.dec2_reduce(h)
-        h = self.dec2(h, noise_emb)
+        # ========== PHASE-PARALLEL DECODER ==========
 
-        h = self.dec1_up(h, noise_emb)                                # (B, base_ch, 64, 64)
-        h = torch.cat([h, skip1], dim=1)
-        h = self.dec1_reduce(h)
-        h = self.dec1(h, noise_emb)
+        # -- Level 3: 8×8 → 16×16 --
+        streams = [self.dec3_up[i](streams[i], noise_emb) for i in range(P)]  # 4 × (B, base_ch*4, 16, 16)
+        streams = [
+            self.dec3_reduce[i](torch.cat([streams[i], skip3], dim=1))
+            for i in range(P)
+        ]
+        streams = [self.dec3[i](streams[i], noise_emb) for i in range(P)]
+        streams = self.phase_attn3(streams)                                    # cross-phase communication
 
-        x0_map = self.output_block(h)                          # (B, 1, 64, 64)
-        x0_vec = matrix_to_upper_tri_vec(x0_map[:, 0])
+        # -- Level 2: 16×16 → 32×32 --
+        streams = [self.dec2_up[i](streams[i], noise_emb) for i in range(P)]  # 4 × (B, base_ch*2, 32, 32)
+        streams = [
+            self.dec2_reduce[i](torch.cat([streams[i], skip2], dim=1))
+            for i in range(P)
+        ]
+        streams = [self.dec2[i](streams[i], noise_emb) for i in range(P)]
+        streams = self.phase_attn2(streams)                                    # cross-phase communication
+
+        # -- Level 1: 32×32 → 64×64 --
+        streams = [self.dec1_up[i](streams[i], noise_emb) for i in range(P)]  # 4 × (B, base_ch, 64, 64)
+        streams = [
+            self.dec1_reduce[i](torch.cat([streams[i], skip1], dim=1))
+            for i in range(P)
+        ]
+        streams = [self.dec1[i](streams[i], noise_emb) for i in range(P)]
+        streams = self.phase_attn1(streams)                                    # cross-phase communication
+
+        # ========== PER-PHASE OUTPUT ==========
+        phase_vecs = []
+        for i in range(P):
+            out_map = self.output_heads[i](streams[i])                         # (B, 1, 64, 64)
+            phase_vecs.append(matrix_to_upper_tri_vec(out_map[:, 0]))         # (B, vec_dim)
+
+        x0_vec = torch.stack(phase_vecs, dim=1)                               # (B, 4, vec_dim)
         return x0_vec, h_chip

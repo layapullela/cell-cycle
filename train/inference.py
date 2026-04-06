@@ -46,25 +46,23 @@ class Inference:
     @torch.no_grad()
     def sample(self, bulk_vec, chip_ctcf, chip_hac, chip_me1, chip_me3):
         """
-        SR3 sampling: Generate phase-specific Hi-C from bulk using iterative refinement.
-        
+        SR3 sampling: Generate anaphase and G1 Hi-C from bulk using iterative refinement.
+
         Args:
-            bulk_vec:  (B, vec_dim) bulk Hi-C conditioning
+            bulk_vec:  (B, vec_dim) bulk Hi-C conditioning = average(anaphase, G1)
             chip_ctcf: (B, N) CTCF ChIP-seq conditioning
             chip_hac:  (B, N) H3K27ac ChIP-seq conditioning
             chip_me1:  (B, N) H3K4me1 ChIP-seq conditioning
             chip_me3:  (B, N) H3K4me3 ChIP-seq conditioning
-        
+
         Returns:
-            y_0: (B, vec_dim) sampled phase-specific Hi-C
+            y_0: (B, 4, vec_dim)  channels: earlyG1, midG1, lateG1, anatelo
         """
         batch_size, vec_dim = bulk_vec.shape
-        
-        # SR3 Algorithm 2 Line 1: Start from pure Gaussian noise
-        y_t = torch.randn(batch_size, vec_dim, device=self.device)
 
-        #breakpoint()
-        
+        # SR3 Algorithm 2 Line 1: Start from pure Gaussian noise (all four channels)
+        y_t = torch.randn(batch_size, 4, vec_dim, device=self.device)
+
         # SR3 Algorithm 2: iterative refinement with stochastic noise re-injection.
         # Model predicts ε directly (SR3 Algorithm 1 training).
         #
@@ -77,7 +75,7 @@ class Inference:
 
             sqrt_one_minus_gamma_t = torch.sqrt(1.0 - gamma_t)
 
-            # Model predicts ε; discard h_chip
+            # Model predicts ε for both channels; discard h_chip
             gamma_batch = torch.full((batch_size,), gamma_t, device=self.device)
             eps_pred, _ = self.model(
                 y_t,
@@ -89,11 +87,21 @@ class Inference:
                 bulk_vec,
             )
 
-            # SR3 Algorithm 2 update
+            # SR3 Algorithm 2 update (applied identically to both channels)
             z = torch.randn_like(y_t) if t_idx > 1 else torch.zeros_like(y_t)
             y_t = (1.0 / torch.sqrt(alpha_t)) * (
                 y_t - (1.0 - alpha_t) / sqrt_one_minus_gamma_t * eps_pred
             ) + torch.sqrt(1.0 - alpha_t) * z
+
+            # clamp
+            y_t = torch.clamp(y_t, min=-1.0, max=1.0)
+
+            # Project y_t onto the constraint: mean(y_t[:,0..3]) == bulk_vec.
+            # Adding residual to every channel shifts the mean to bulk without
+            # changing any pairwise differences between channels.
+            # current_mean = y_t.mean(dim=1)                   # (B, vec_dim)
+            # residual     = bulk_vec - current_mean            # (B, vec_dim)
+            # y_t = y_t + residual.unsqueeze(1)                 # broadcast to (B, 4, vec_dim)
 
         # ---- Commented-out DDIM x0-prediction update (deviation from SR3) ----
         # for t_idx in range(self.T - 1, 0, -1):
@@ -107,202 +115,118 @@ class Inference:
         #     sqrt_gamma_prev           = torch.sqrt(gamma_prev)
         #     sqrt_one_minus_gamma_prev = torch.sqrt(torch.clamp(1.0 - gamma_prev, min=0.0))
         #     y_t = sqrt_gamma_prev * x0_pred + sqrt_one_minus_gamma_prev * eps_implied
-
-        return y_t
+        return y_t  # (B, 4, vec_dim)
     
-    def visualize(self, batch, phase_name, output_path=None, n=64, vmin=None, vmax=None):
+    def visualize(self, batch, output_path=None, n=64, vmin=None, vmax=None):
         """
-        Run inference and visualize results.
+        Run inference and visualize results for all four output channels.
 
         Args:
-            batch: Dict with keys
-                   'earlyG1', 'midG1', 'lateG1', 'anatelo',
-                   'chip_seq_ctcf', 'chip_seq_hac',
-                   optionally 'chip_seq_h3k4me1', 'chip_seq_h3k4me3',
-                   and 'region'
-            phase_name: Which phase to visualize ('earlyG1', 'midG1', 'lateG1', or 'anatelo')
+            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'anatelo',
+                   'chip_seq_ctcf', 'chip_seq_hac', 'chip_seq_h3k4me1',
+                   'chip_seq_h3k4me3', and optionally 'region'
             output_path: Where to save plot (if None, just display)
             n: Matrix size (default 64)
-            vmin: Optional fixed vmin for color scale (if None, computed from this batch)
-            vmax: Optional fixed vmax for color scale (if None, computed from this batch)
+            vmin/vmax: Optional fixed color scale (default: -1.0 / 1.0)
 
         Returns:
-            sampled: (B, vec_dim) sampled phase-specific Hi-C
+            sampled_vec: (B, 4, vec_dim)  channels: earlyG1, midG1, lateG1, anatelo
         """
-        # Import matrix conversion utilities (must match training script: N=64)
         from train_diffusion_alpha import upper_tri_vec_to_matrix
-        
-        # Extract ground truth and conditioning
-        x0_early = batch['earlyG1'].float().to(self.device)
-        x0_mid = batch['midG1'].float().to(self.device)
-        x0_late = batch['lateG1'].float().to(self.device)
-        x0_anatelo = batch['anatelo'].float().to(self.device)
-        chip_ctcf = batch['chip_seq_ctcf'].float().to(self.device)
-        chip_hac = batch['chip_seq_hac'].float().to(self.device)
-        # Backward-compatible: if me1/me3 not present (old models), reuse hac
-        chip_me1 = batch.get('chip_seq_h3k4me1', batch['chip_seq_hac']).float().to(self.device)
-        chip_me3 = batch.get('chip_seq_h3k4me3', batch['chip_seq_hac']).float().to(self.device)
-        
-        # Compute bulk conditioning (average of four phases)
-        bulk_vec = (x0_early + x0_mid + x0_late + x0_anatelo) / 4.0
-        # Use HAC (H3K27ac) as the 1D track for visualization
-        chip_histone_1d = chip_hac[0].detach().cpu().numpy()
-        
-        # Get ground truth for current phase
-        phase_to_gt = {
-            'earlyG1': x0_early,
-            'midG1': x0_mid,
-            'lateG1': x0_late,
-            'anatelo': x0_anatelo
-        }
-        gt_vec = phase_to_gt[phase_name]
 
-        #breakpoint()
-        
-        # Run sampling
+        x0_early   = batch['earlyG1'].float().to(self.device)
+        x0_mid     = batch['midG1'].float().to(self.device)
+        x0_late    = batch['lateG1'].float().to(self.device)
+        x0_anatelo = batch['anatelo'].float().to(self.device)
+        chip_ctcf  = batch['chip_seq_ctcf'].float().to(self.device)
+        chip_hac   = batch['chip_seq_hac'].float().to(self.device)
+        chip_me1   = batch.get('chip_seq_h3k4me1', batch['chip_seq_hac']).float().to(self.device)
+        chip_me3   = batch.get('chip_seq_h3k4me3', batch['chip_seq_hac']).float().to(self.device)
+
+        bulk_vec = (x0_early + x0_mid + x0_late + x0_anatelo) / 4.0
+        chip_histone_1d = chip_hac[0].detach().cpu().numpy()
+
+        # Run sampling → (B, 4, vec_dim)
         sampled_vec = self.sample(bulk_vec, chip_ctcf, chip_hac, chip_me1, chip_me3)
 
-        # Convert to matrices for visualization (use first sample in batch)
-        # Convert ALL phase ground truths to enable cross-phase quantile normalization
-        early_matrix = upper_tri_vec_to_matrix(x0_early[0:1], n)[0].cpu().numpy()
-        mid_matrix = upper_tri_vec_to_matrix(x0_mid[0:1], n)[0].cpu().numpy()
-        late_matrix = upper_tri_vec_to_matrix(x0_late[0:1], n)[0].cpu().numpy()
-        anatelo_matrix = upper_tri_vec_to_matrix(x0_anatelo[0:1], n)[0].cpu().numpy()
-        sampled_matrix = upper_tri_vec_to_matrix(sampled_vec[0:1], n)[0].cpu().numpy()
-        bulk_matrix = upper_tri_vec_to_matrix(bulk_vec[0:1], n)[0].cpu().numpy()
+        def to_mat(vec):
+            return upper_tri_vec_to_matrix(vec[0:1], n)[0].cpu().numpy()
 
-        # Get region for display
+        gt_mats   = [to_mat(x) for x in [x0_early, x0_mid, x0_late, x0_anatelo]]
+        pred_mats = [upper_tri_vec_to_matrix(sampled_vec[0:1, i], n)[0].cpu().numpy() for i in range(4)]
+        bulk_mat  = to_mat(bulk_vec)
+        phase_labels = ['earlyG1', 'midG1', 'lateG1', 'anatelo']
+
         region = batch.get('region', ['unknown'])[0]
+        print(f"\n  [{region}] value ranges:", flush=True)
+        print(f"    {'bulk':12s}: [{bulk_mat.min():.4f}, {bulk_mat.max():.4f}]  mean={bulk_mat.mean():.4f}", flush=True)
+        for label, gt, pred in zip(phase_labels, gt_mats, pred_mats):
+            print(f"    {label+'_gt':12s}: [{gt.min():.4f}, {gt.max():.4f}]  mean={gt.mean():.4f}", flush=True)
+            print(f"    {label+'_pred':12s}: [{pred.min():.4f}, {pred.max():.4f}]  mean={pred.mean():.4f}", flush=True)
 
-        # DEBUG: Check raw value ranges BEFORE quantile normalization
-        import sys
-        print(f"\n  DEBUG [{region}] - Raw value ranges (in [-1, 1] space, BEFORE quantile norm):", flush=True)
-        print(f"    earlyG1:  [{early_matrix.min():.4f}, {early_matrix.max():.4f}], mean={early_matrix.mean():.4f}, std={early_matrix.std():.4f}", flush=True)
-        print(f"    midG1:    [{mid_matrix.min():.4f}, {mid_matrix.max():.4f}], mean={mid_matrix.mean():.4f}, std={mid_matrix.std():.4f}", flush=True)
-        print(f"    lateG1:   [{late_matrix.min():.4f}, {late_matrix.max():.4f}], mean={late_matrix.mean():.4f}, std={late_matrix.std():.4f}", flush=True)
-        print(f"    anatelo:  [{anatelo_matrix.min():.4f}, {anatelo_matrix.max():.4f}], mean={anatelo_matrix.mean():.4f}, std={anatelo_matrix.std():.4f}", flush=True)
-        print(f"    bulk:     [{bulk_matrix.min():.4f}, {bulk_matrix.max():.4f}], mean={bulk_matrix.mean():.4f}, std={bulk_matrix.std():.4f}", flush=True)
-        print(f"    SAMPLED:  [{sampled_matrix.min():.4f}, {sampled_matrix.max():.4f}], mean={sampled_matrix.mean():.4f}, std={sampled_matrix.std():.4f}", flush=True)
-        # Apply quantile normalization ACROSS all phases for the same region
-        # This allows fair comparison: same color = same relative contact frequency across phases
-        # Pool all 4 phase ground truths + sampled + bulk, compute global ranks
-        # normalized_matrices = quantile_normalize_across_samples(
-        #     [early_matrix, mid_matrix, late_matrix, anatelo_matrix, sampled_matrix, bulk_matrix],
-        #     output_min=0.0,
-        #     output_max=40.0
-        # )
-
-        normalized_matrices = [early_matrix, mid_matrix, late_matrix, anatelo_matrix, sampled_matrix, bulk_matrix]
-
-        # Extract normalized matrices
-        early_norm, mid_norm, late_norm, anatelo_norm, sampled_matrix, bulk_matrix = normalized_matrices
-
-        # Get the ground truth for the current phase
-        phase_to_normalized = {
-            'earlyG1': early_norm,
-            'midG1': mid_norm,
-            'lateG1': late_norm,
-            'anatelo': anatelo_norm
-        }
-        gt_matrix = phase_to_normalized[phase_name]
-
-        # Use fixed [0, 40] scale for q-normed data (matching papers)
-        # This can be overridden with vmin/vmax parameters if needed
         if vmin is None:
             vmin = -1.0
         if vmax is None:
             vmax = 1.0
-        
-        # Create visualization: 1 row x 3 columns
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        
-        # Input: Bulk Hi-C (conditioning)
-        im1 = axes[0].imshow(bulk_matrix, cmap='Reds', vmin=vmin, vmax=vmax)
-        axes[0].set_title(f'Input: Bulk Hi-C\n(Conditioning)', fontsize=14, fontweight='bold')
-        axes[0].axis('off')
-        plt.colorbar(im1, ax=axes[0], fraction=0.046)
-        
-        # Output: Sampled phase-specific
-        im2 = axes[1].imshow(sampled_matrix, cmap='Reds', vmin=vmin, vmax=vmax)
-        axes[1].set_title(f'Output: Sampled {phase_name}\n(SR3 Inference)', fontsize=14, fontweight='bold')
-        axes[1].axis('off')
-        plt.colorbar(im2, ax=axes[1], fraction=0.046)
-        
-        # Ground truth: Target phase
-        im3 = axes[2].imshow(gt_matrix, cmap='Reds', vmin=vmin, vmax=vmax)
-        axes[2].set_title(f'Ground Truth: {phase_name}', fontsize=14, fontweight='bold')
-        axes[2].axis('off')
-        plt.colorbar(im3, ax=axes[2], fraction=0.046)
 
-        # Add histone ChIP-seq track to the right side of each map, aligned with the heatmap y-axis
-        # Assume chip_histone_1d length matches matrix size n; if not, interpolate to n bins
+        # ChIP track (interpolated if needed)
         chip_len = chip_histone_1d.shape[0]
-        if chip_len != n:
-            # Simple interpolation to n points
-            x_orig = np.linspace(0, 1, chip_len)
-            x_new = np.linspace(0, 1, n)
-            chip_histone_plot = np.interp(x_new, x_orig, chip_histone_1d)
-        else:
-            chip_histone_plot = chip_histone_1d
+        chip_plot = (np.interp(np.linspace(0, 1, n), np.linspace(0, 1, chip_len), chip_histone_1d)
+                     if chip_len != n else chip_histone_1d)
 
-        for ax in axes:
-            # Get the exact y-limits used by the heatmap so we can match them
-            ymin, ymax = ax.get_ylim()
-            y_positions = np.linspace(ymax, ymin, n)
+        def _add_chip_inset(ax):
+            ymin_ax, ymax_ax = ax.get_ylim()
+            ins = inset_axes(ax, width="8%", height="100%", loc="right",
+                             bbox_to_anchor=(0, 0, 1, 1), bbox_transform=ax.transAxes, borderpad=0)
+            ins.plot(chip_plot, np.linspace(ymax_ax, ymin_ax, n), color="black", linewidth=1.0)
+            ins.set_ylim(ymin_ax, ymax_ax)
+            ins.set_xticks([]); ins.set_yticks([])
+            ins.set_xlim(chip_plot.min(), chip_plot.max())
 
-            # Create a narrow inset axis on the right side of each heatmap
-            inset_ax = inset_axes(
-                ax,
-                width="8%",
-                height="100%",
-                loc="right",
-                bbox_to_anchor=(0.0, 0.0, 1.0, 1.0),
-                bbox_transform=ax.transAxes,
-                borderpad=0,
-            )
-            inset_ax.plot(chip_histone_plot, y_positions, color="black", linewidth=1.0)
-            inset_ax.set_ylim(ymin, ymax)  # Match heatmap y-axis exactly
-            inset_ax.set_xticks([])
-            inset_ax.set_yticks([])
-            inset_ax.set_xlim(chip_histone_plot.min(), chip_histone_plot.max())
-        
-        # Compute metrics
-        mse = np.mean((gt_matrix - sampled_matrix) ** 2)
-        
-        # Correlation (handle degenerate cases early in training)
-        try:
-            corr = np.corrcoef(gt_matrix.flatten(), sampled_matrix.flatten())[0, 1]
-            if np.isnan(corr):
-                corr = 0.0  # Zero variance or invalid data
-        except:
-            corr = 0.0  # Fallback for any issues
-        
-        # Move region extraction to earlier (already done above)
-        # region = batch.get('region', ['unknown'])[0]  # Already extracted above
-        fig.suptitle(
-            f'SR3 Inference: {phase_name} | Region: {region}\n'
-            f'MSE: {mse:.6f} | Correlation: {corr:.4f}',
-            fontsize=16,
-            fontweight='bold',
-            y=1.02  # Move title slightly above to avoid overlap
-        )
+        # 4 rows × 3 cols: bulk | predicted | ground truth
+        fig, axes = plt.subplots(4, 3, figsize=(16, 20))
+        metrics = []
+        for row, (label, gt, pred) in enumerate(zip(phase_labels, gt_mats, pred_mats)):
+            axes[row, 0].imshow(bulk_mat, cmap='Reds', vmin=vmin, vmax=vmax)
+            axes[row, 0].set_title('Bulk (conditioning)', fontsize=11, fontweight='bold')
+            axes[row, 0].axis('off')
 
-        # Leave space at top for suptitle (rect=[left, bottom, right, top])
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-        
-        # Save or show
+            axes[row, 1].imshow(pred, cmap='Reds', vmin=vmin, vmax=vmax)
+            axes[row, 1].set_title(f'Predicted: {label}', fontsize=11, fontweight='bold')
+            axes[row, 1].axis('off')
+
+            im = axes[row, 2].imshow(gt, cmap='Reds', vmin=vmin, vmax=vmax)
+            axes[row, 2].set_title(f'Ground Truth: {label}', fontsize=11, fontweight='bold')
+            axes[row, 2].axis('off')
+            plt.colorbar(im, ax=axes[row, 2], fraction=0.046)
+
+            for ax in axes[row]:
+                _add_chip_inset(ax)
+
+            try:
+                corr = np.corrcoef(gt.flatten(), pred.flatten())[0, 1]
+                corr = 0.0 if np.isnan(corr) else corr
+            except Exception:
+                corr = 0.0
+            mse = np.mean((gt - pred) ** 2)
+            metrics.append((label, mse, corr))
+
+        metric_str = '  |  '.join(f"{l}: MSE={m:.4f} r={c:.3f}" for l, m, c in metrics)
+        fig.suptitle(f'SR3 Inference | Region: {region}\n{metric_str}',
+                     fontsize=12, fontweight='bold', y=1.005)
+        plt.tight_layout(rect=[0, 0, 1, 0.995])
+
         if output_path:
             plt.savefig(output_path, dpi=150, bbox_inches='tight')
             print(f"Visualization saved: {output_path}")
         else:
             plt.show()
-        
         plt.close(fig)
-        
+
         return sampled_vec
 
 
-def run_inference_and_visualize(model, batch, phase_name, device, step, output_dir="./inference_visualizations",
+def run_inference_and_visualize(model, batch, device, step, output_dir="./inference_visualizations",
                                 vmin=None, vmax=None):
     """
     Convenience function for running inference during training.
@@ -310,25 +234,20 @@ def run_inference_and_visualize(model, batch, phase_name, device, step, output_d
     Args:
         model: Trained SR3UNet model
         batch: Training batch
-        phase_name: Phase to sample ('earlyG1', 'midG1', 'lateG1', or 'anatelo')
         device: torch device
         step: Current training step (for filename)
         output_dir: Where to save visualization
-        vmin: Optional fixed vmin for color scale
-        vmax: Optional fixed vmax for color scale
+        vmin/vmax: Optional fixed color scale
 
     Returns:
         output_path: Path to saved visualization
     """
-    # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
 
-    # Initialize inference
     inference = Inference(model, device, T=1000)
 
-    # Run and visualize
-    save_path = output_path / f"inference_{phase_name}_step_{step}_alpha.png"
-    inference.visualize(batch, phase_name, output_path=save_path, vmin=vmin, vmax=vmax)
+    save_path = output_path / f"inference_4phase_step_{step}_alpha.png"
+    inference.visualize(batch, output_path=save_path, vmin=vmin, vmax=vmax)
 
     return save_path
