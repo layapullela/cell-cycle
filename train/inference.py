@@ -46,7 +46,7 @@ class Inference:
     @torch.no_grad()
     def sample(self, bulk_vec, chip_ctcf, chip_hac, chip_me1, chip_me3):
         """
-        SR3 sampling: Generate anaphase and G1 Hi-C from bulk using iterative refinement.
+        SR3 sampling: Generate all four phases Hi-C from bulk using iterative refinement.
 
         Args:
             bulk_vec:  (B, vec_dim) bulk Hi-C conditioning = average(anaphase, G1)

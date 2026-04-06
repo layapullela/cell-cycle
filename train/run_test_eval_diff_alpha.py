@@ -317,7 +317,7 @@ def run_test_evaluation_chromosome2(
             start_mb = start / 1e6
             end_mb = end / 1e6
 
-            # Run inference and visualize (both anaphase and G1 channels)
+            # Run inference and visualize (all four channels)
             save_path = run_inference_and_visualize(
                 model=model,
                 batch=batch,

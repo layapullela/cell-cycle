@@ -330,7 +330,7 @@ def main():
     num_epochs = args.num_epochs if args.num_epochs is not None else NUM_EPOCHS
 
     print("="*80)
-    print("TRAINING: anaphase + G1 (two-channel decomposition)")
+    print("TRAINING: all four phases")
     print("="*80)
     print(f"Device: {DEVICE}")
     print(f"Vector dimension: {VEC_DIM}, Matrix size: {N}x{N}")
@@ -471,7 +471,7 @@ def main():
         print(f"✓ Saved epoch checkpoint: {checkpoint_path}")
 
     print("\n" + "="*80)
-    print("Training complete for anaphase + G1 two-channel model!")
+    print("Training complete for all four phases!")
     print(f"Best loss: {best_loss:.6f}")
     print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
     print("="*80)
