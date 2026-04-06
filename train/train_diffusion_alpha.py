@@ -83,10 +83,8 @@ class CellCycleDataset(Dataset):
 ############################################
 # 1) CONFIG
 ############################################
-# Two-channel decomposition: bulk = average(anaphase, G1)
-#   anaphase = anatelo phase
-#   G1       = mean(earlyG1, midG1, lateG1)
-# Model outputs channel 0 = anaphase, channel 1 = G1.
+# Four-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo)
+# Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo.
 
 # T is imported from schedule.py
 N = 64                 # contact map size (64 x 64)
@@ -208,11 +206,11 @@ def get_validation_regions_chr2(holdout_regions, n=10, seed=42):
 ############################################
 def _build_targets(batch, device):
     """
-    Construct two-channel target and bulk conditioning.
+    Construct four-channel target and bulk conditioning.
 
     Returns:
-        x0_current: (B, 2, vec_dim)  channel 0=anaphase, channel 1=G1
-        x0_bulk:    (B, vec_dim)     average of anaphase and G1
+        x0_current: (B, 4, vec_dim)  channels: earlyG1, midG1, lateG1, anatelo
+        x0_bulk:    (B, vec_dim)     average of all four phases
         chip_*:     (B, N) chip-seq tracks
     """
     x0_early   = batch["earlyG1"].float().to(device)
@@ -220,10 +218,8 @@ def _build_targets(batch, device):
     x0_late    = batch["lateG1"].float().to(device)
     x0_anatelo = batch["anatelo"].float().to(device)
 
-    x0_anaphase = x0_anatelo                                  # (B, vec_dim)
-    x0_G1       = (x0_early + x0_mid + x0_late) / 3.0        # (B, vec_dim)
-    x0_bulk     = (x0_early + x0_mid + x0_late + x0_anatelo) * 0.25              # (B, vec_dim)
-    x0_current  = torch.stack([x0_anaphase, x0_G1], dim=1)   # (B, 2, vec_dim)
+    x0_bulk    = (x0_early + x0_mid + x0_late + x0_anatelo) * 0.25                  # (B, vec_dim)
+    x0_current = torch.stack([x0_early, x0_mid, x0_late, x0_anatelo], dim=1)        # (B, 4, vec_dim)
 
     chip_ctcf = batch["chip_seq_ctcf"].float().to(device)
     chip_hac  = batch["chip_seq_hac"].float().to(device)
@@ -274,10 +270,9 @@ def train_step(model, optimizer, batch, device, global_step=0):
     """
     Single training step for SR3-style iterative refinement.
 
-    Model predicts ε for both channels simultaneously:
-        channel 0 = anaphase (anatelo)
-        channel 1 = G1 (mean of earlyG1, midG1, lateG1)
-    Bulk conditioning = average(anaphase, G1).
+    Model predicts ε for all four channels simultaneously:
+        channel 0 = earlyG1, 1 = midG1, 2 = lateG1, 3 = anatelo
+    Bulk conditioning = average of all four phases.
 
     Returns:
         (total_loss, mse_loss, chip_aux_loss) as floats
@@ -287,15 +282,19 @@ def train_step(model, optimizer, batch, device, global_step=0):
 
     # SR3: sample γ ~ Uniform(γ_min, γ_max) continuously
     gamma_t = torch.rand(batch_size, device=device) * (GAMMA_MAX - GAMMA_MIN) + GAMMA_MIN  # (B,)
-    gamma_3d = gamma_t[:, None, None]  # (B, 1, 1) for broadcast with (B, 2, vec_dim)
+    gamma_3d = gamma_t[:, None, None]  # (B, 1, 1) for broadcast with (B, 4, vec_dim)
 
-    eps_true = torch.randn_like(x0_current)  # (B, 2, vec_dim)
-    y_gamma = torch.sqrt(gamma_3d) * x0_current + torch.sqrt(1.0 - gamma_3d) * eps_true
+    eps_true = torch.randn_like(x0_current)  # (B, 4, vec_dim)
+    y_gamma  = torch.sqrt(gamma_3d) * x0_current + torch.sqrt(1.0 - gamma_3d) * eps_true
 
     # SR3 Algorithm 1: model predicts ε directly
     eps_pred, h_chip = model(y_gamma, gamma_t, chip_ctcf, chip_hac, chip_me1, chip_me3, x0_bulk)
 
-    mse_loss = F.mse_loss(eps_pred, eps_true)
+    # Weighted MSE: anatelo (ch 3) gets 2× weight because anaphase is harder to predict.
+    # Weights: earlyG1=0.20, midG1=0.20, lateG1=0.20, anatelo=0.40 (sum=1.0)
+    channel_weights = torch.tensor([0.20, 0.20, 0.20, 0.40], device=device)   # (4,)
+    mse_per_channel = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2))            # (4,) mean over B, vec_dim
+    mse_loss = (channel_weights * mse_per_channel).sum()
 
     # ---- Commented-out deviations from SR3 ----
     # Min-SNR weighted MSE (Hang et al. 2023):
@@ -303,9 +302,10 @@ def train_step(model, optimizer, batch, device, global_step=0):
     # weight = torch.clamp(snr, max=5.0)
     # mse_loss = (weight * (eps_pred - eps_true) ** 2).mean()
 
-    # Aux loss: predict both channels from chip features alone
-    chip_pred = model.chip_aux_pred(h_chip)                   # (B, 2, vec_dim)
+    # Aux loss: predict all four channels from chip features alone
+    chip_pred = model.chip_aux_pred(h_chip)                    # (B, 4, vec_dim)
     chip_aux_loss = 0.20 * F.mse_loss(chip_pred, x0_current)
+
     loss = mse_loss + chip_aux_loss
 
     optimizer.zero_grad()
@@ -441,7 +441,7 @@ def main():
         model.train()
 
         total_epochs = start_epoch + num_epochs
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [anaphase+G1]")
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [4-phase]")
         for batch in pbar:
             loss, mse, chip = train_step(model, optimizer, batch, DEVICE, global_step)
             epoch_losses.append(loss)
@@ -460,7 +460,7 @@ def main():
 
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_anaphase_G1_epoch{epoch+1}_4-3.pth"
+        checkpoint_path = CHECKPOINT_DIR / f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-5_parallel_40_60_weights.pth"
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
