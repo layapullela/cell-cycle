@@ -445,7 +445,7 @@ def main():
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
         checkpoint_path = (CHECKPOINT_DIR /
-                           f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_offdiag_matrix.pth")
+                           f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-7_asym.pth")
         torch.save({
             'epoch':                epoch,
             'model_state_dict':     model.state_dict(),

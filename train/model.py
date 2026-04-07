@@ -169,7 +169,7 @@ class SelfAttentionBlock(nn.Module):
 
 
 ############################################
-# ChIP-SEQ PAIR ENCODER — outer product + axial attention
+# ChIP-SEQ PAIR ENCODER — 1-D attention then outer product
 ############################################
 class AdaNorm(nn.Module):
     """
@@ -186,15 +186,17 @@ class AdaNorm(nn.Module):
         return x + self.alpha * self.ln(x)
 
 
-class AxialPairAttention(nn.Module):
+class ChipSelfAttention1D(nn.Module):
     """
-    Axial attention (row-wise then column-wise) on a pair tensor (B, N, N, C)
-    with additive bias derived from the bulk Hi-C contact map.
+    1-D self-attention on a chip embedding (B, N, C) with a bulk contact
+    profile used as an additive key-side bias.
 
-    Row pass : for each row i, attend over all column positions j.
-    Col pass : for each col j, attend over all row positions i.
+    The bias encodes "how globally connected is position j?" — bins inside
+    TADs or at strong anchors get higher average bulk contact and will be
+    attended to more by default.  The learned weight lets each head decide
+    how much to trust that prior.
 
-    Both passes use a per-head bias learned from bulk_map via a 1×1 conv.
+    Starts as identity (out projection zero-initialised).
     """
     def __init__(self, c_in: int, n_heads: int = 4):
         super().__init__()
@@ -202,85 +204,59 @@ class AxialPairAttention(nn.Module):
         self.n_heads = n_heads
         self.d_head  = c_in // n_heads
 
-        # Row attention
-        self.row_qkv  = nn.Linear(c_in, c_in * 3, bias=False)
-        self.row_out  = nn.Linear(c_in, c_in, bias=False)
-        self.row_norm = nn.LayerNorm(c_in)
-        self.row_bias = nn.Conv2d(1, n_heads, kernel_size=1)
+        self.qkv          = nn.Linear(c_in, c_in * 3, bias=False)
+        self.out          = nn.Linear(c_in, c_in, bias=False)
+        self.norm         = nn.LayerNorm(c_in)
+        # Maps each bin's scalar bulk-profile value → n_heads additive biases
+        self.profile_bias = nn.Linear(1, n_heads, bias=False)
 
-        # Col attention
-        self.col_qkv  = nn.Linear(c_in, c_in * 3, bias=False)
-        self.col_out  = nn.Linear(c_in, c_in, bias=False)
-        self.col_norm = nn.LayerNorm(c_in)
-        self.col_bias = nn.Conv2d(1, n_heads, kernel_size=1)
+        nn.init.zeros_(self.out.weight)
 
-        # Zero-init so module starts as identity
-        nn.init.zeros_(self.row_out.weight)
-        nn.init.zeros_(self.col_out.weight)
-
-    def _attn_pass(self, x, bulk_bias_4d, qkv_layer, out_layer, norm_layer):
+    def forward(self, x: torch.Tensor, bulk_profile: torch.Tensor) -> torch.Tensor:
         """
-        x:             (B*N, N, C)
-        bulk_bias_4d:  (B*N, H, N, N)  pre-computed per-head additive bias
+        x:             (B, N, C)  chip embedding
+        bulk_profile:  (B, N)     mean bulk contact per bin along this axis
+        Returns:       (B, N, C)
         """
-        BN, N, C = x.shape
-        H, D = self.n_heads, self.d_head
+        B, N, C = x.shape
+        H, D    = self.n_heads, self.d_head
 
-        q, k, v = qkv_layer(x).chunk(3, dim=-1)
-        q = q.view(BN, N, H, D).transpose(1, 2)   # (BN, H, N, D)
-        k = k.view(BN, N, H, D).transpose(1, 2)
-        v = v.view(BN, N, H, D).transpose(1, 2)
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(B, N, H, D).transpose(1, 2)   # (B, H, N, D)
+        k = k.view(B, N, H, D).transpose(1, 2)
+        v = v.view(B, N, H, D).transpose(1, 2)
 
-        scores = q @ k.transpose(-2, -1) / (D ** 0.5) + bulk_bias_4d   # (BN, H, N, N)
-        attn   = torch.softmax(scores, dim=-1)
-        out    = (attn @ v).transpose(1, 2).contiguous().view(BN, N, C)
-        return norm_layer(x + out_layer(out))
+        scores = q @ k.transpose(-2, -1) / (D ** 0.5)   # (B, H, N, N)
 
-    def forward(self, pair: torch.Tensor, bulk_map: torch.Tensor) -> torch.Tensor:
-        """
-        pair:     (B, N, N, C)
-        bulk_map: (B, 1, N, N)
-        Returns:  (B, N, N, C)
-        """
-        B, N, _, C = pair.shape
-        H = self.n_heads
+        # bias[b, h, :, j] = learned_weight[h] * bulk_profile[b, j]
+        # shape: (B, N, H) → (B, H, 1, N)  → broadcasts over query positions
+        bias   = self.profile_bias(bulk_profile.unsqueeze(-1))  # (B, N, H)
+        bias   = bias.permute(0, 2, 1).unsqueeze(2)             # (B, H, 1, N)
+        scores = scores + bias
 
-        # ---- Row attention: attend over j for each fixed row i ----
-        row_bias = self.row_bias(bulk_map)                              # (B, H, N, N)
-        row_bias = row_bias.unsqueeze(1).expand(B, N, H, N, N)         # (B, N, H, N, N)
-        row_bias = row_bias.reshape(B * N, H, N, N)
-
-        x    = pair.reshape(B * N, N, C)
-        x    = self._attn_pass(x, row_bias, self.row_qkv, self.row_out, self.row_norm)
-        pair = x.view(B, N, N, C)
-
-        # ---- Col attention: attend over i for each fixed col j ----
-        bulk_map_T = bulk_map.transpose(-2, -1).contiguous()
-        col_bias   = self.col_bias(bulk_map_T)                          # (B, H, N, N)
-        col_bias   = col_bias.unsqueeze(1).expand(B, N, H, N, N)
-        col_bias   = col_bias.reshape(B * N, H, N, N)
-
-        x    = pair.transpose(1, 2).contiguous().reshape(B * N, N, C)
-        x    = self._attn_pass(x, col_bias, self.col_qkv, self.col_out, self.col_norm)
-        pair = x.view(B, N, N, C).transpose(1, 2).contiguous()
-
-        return pair
+        attn = torch.softmax(scores, dim=-1)
+        out  = (attn @ v).transpose(1, 2).contiguous().view(B, N, C)
+        return self.norm(x + self.out(out))
 
 
 class ChipPairEncoderAlpha(nn.Module):
     """
-    AlphaFold-inspired ChIP-seq pair encoder using outer products and axial attention.
+    ChIP-seq pair encoder: 1-D contextualisation then outer product.
 
     Flow:
-      1) Embed 4 ChIP tracks for the *row* genomic window and the *col* genomic
-         window independently into MSA-style tensors (B, 4, N, c_msa).
-      2) Max-pool over tracks → chip_i (B, N, c_msa) and chip_j (B, N, c_msa).
-      3) Outer product: pair[i, j] = chip_i[i] ⊗ chip_j[j]  → (B, N, N, c_msa²).
-      4) Project to c_inner, then apply AxialPairAttention with bulk Hi-C bias.
-      5) Linear + AdaNorm + SiLU → c_pair.  Return (B, c_pair, N, N).
+      1) Embed 4 ChIP tracks for the row window  → max over tracks → chip_i (B, N, c_msa).
+         Apply ChipSelfAttention1D biased by the bulk row-mean profile.
+      2) Same for the col window → chip_j (B, N, c_msa).
+      3) Outer product: pair[i,j] = chip_i[i] ⊗ chip_j[j]  → (B, N, N, c_msa²).
+         Each position already carries full neighbourhood context from step 1/2.
+      4) Project to c_pair, add a direct bulk residual, then AdaNorm + SiLU.
+      5) Return (B, c_pair, N, N).
 
-    For diagonal crops chip_*_row == chip_*_col, so the outer product is symmetric.
-    For off-diagonal crops the two sets of tracks are different.
+    Complexity: O(N²) attention (1-D passes of length N, done once per axis)
+    versus O(N³) for axial attention after the outer product.
+
+    For diagonal crops chip_*_row == chip_*_col → symmetric outer product.
+    For off-diagonal crops the two sets of tracks differ → asymmetric.
     """
     def __init__(self, n_bins: int = 64, c_msa: int = 32, c_pair: int = 16, n_heads: int = 4):
         super().__init__()
@@ -288,23 +264,27 @@ class ChipPairEncoderAlpha(nn.Module):
         self.c_msa  = c_msa
         self.c_pair = c_pair
 
+        # Track embedding (shared weights for row and col)
         self.msa_embed     = nn.Linear(1, c_msa)
         self.pos_embed_row = nn.Parameter(torch.zeros(1, 1, n_bins, c_msa))
         self.pos_embed_col = nn.Parameter(torch.zeros(1, 1, n_bins, c_msa))
         self.msa_norm      = nn.LayerNorm(c_msa)
 
-        c_inner         = c_msa   # dimension after outer-product projection
-        self.outer_proj = nn.Linear(c_msa * c_msa, c_inner)
-        self.axial_attn = AxialPairAttention(c_inner, n_heads=n_heads)
+        # 1-D self-attention applied BEFORE outer product
+        self.row_attn = ChipSelfAttention1D(c_msa, n_heads=n_heads)
+        self.col_attn = ChipSelfAttention1D(c_msa, n_heads=n_heads)
+
+        # Outer-product projection + direct bulk residual
+        self.outer_proj   = nn.Linear(c_msa * c_msa, c_pair)
+        self.bulk_to_pair = nn.Linear(1, c_pair)   # (B,N,N,1) → (B,N,N,c_pair)
 
         self.pair_proj = nn.Sequential(
-            nn.Linear(c_inner, c_pair),
             AdaNorm(c_pair),
             nn.SiLU(),
         )
 
     def _embed_tracks(self, ctcf, hac, me1, me3, pos_embed):
-        """Stack 4 tracks, embed to c_msa, add positional embedding. Returns (B, N, c_msa)."""
+        """Stack 4 tracks, embed each bin to c_msa, max over tracks. Returns (B, N, c_msa)."""
         sig = torch.stack([ctcf, hac, me1, me3], dim=1).float().unsqueeze(-1)  # (B, 4, N, 1)
         msa = self.msa_embed(sig) + pos_embed                                   # (B, 4, N, c_msa)
         msa = self.msa_norm(msa)
@@ -326,21 +306,31 @@ class ChipPairEncoderAlpha(nn.Module):
         """
         B = chip_ctcf_row.shape[0]
 
+        # 1-D bulk profiles — mean contact along each axis
+        row_profile = bulk_map[:, 0].mean(dim=-1)   # (B, N)  mean over cols
+        col_profile = bulk_map[:, 0].mean(dim=-2)   # (B, N)  mean over rows
+
+        # Embed tracks then add 1-D context BEFORE outer product
         chip_i = self._embed_tracks(chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
-                                    self.pos_embed_row)   # (B, N, c_msa)
+                                    self.pos_embed_row)            # (B, N, c_msa)
+        chip_i = self.row_attn(chip_i, row_profile)                # (B, N, c_msa)
+
         chip_j = self._embed_tracks(chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
-                                    self.pos_embed_col)   # (B, N, c_msa)
+                                    self.pos_embed_col)            # (B, N, c_msa)
+        chip_j = self.col_attn(chip_j, col_profile)                # (B, N, c_msa)
 
         # Outer product → (B, N, N, c_msa²)
         pair_2d   = torch.einsum("bic,bjd->bijcd", chip_i, chip_j)
         pair_flat = pair_2d.reshape(B, self.n_bins, self.n_bins, self.c_msa * self.c_msa)
         pair_flat = F.normalize(pair_flat, dim=-1, eps=1e-6)
 
-        pair = self.outer_proj(pair_flat)      # (B, N, N, c_inner)
-        pair = self.axial_attn(pair, bulk_map) # (B, N, N, c_inner)
+        # Project + direct bulk residual (channels-last throughout)
+        pair      = self.outer_proj(pair_flat)                                   # (B, N, N, c_pair)
+        bulk_feat = self.bulk_to_pair(bulk_map.permute(0, 2, 3, 1))             # (B, N, N, c_pair)
+        pair      = pair + bulk_feat
 
-        pair_feat = self.pair_proj(pair)       # (B, N, N, c_pair)
-        return pair_feat.permute(0, 3, 1, 2)  # (B, c_pair, N, N)
+        pair_feat = self.pair_proj(pair)                                         # (B, N, N, c_pair)
+        return pair_feat.permute(0, 3, 1, 2)                                    # (B, c_pair, N, N)
 
 
 ############################################
