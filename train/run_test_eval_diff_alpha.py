@@ -11,6 +11,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+from typing import Tuple
 
 # Add preprocess dir to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess"))
@@ -20,7 +21,7 @@ from Dataloader import CellCycleDataLoader
 from train_diffusion_alpha import (
     SR3UNet,
     NoiseEmbedding,
-    T, N, VEC_DIM,
+    T, N,
     RESOLUTION_BP,
     REGION_SIZE_BP,
 )
@@ -47,7 +48,6 @@ def load_checkpoint(checkpoint_path, device):
     noise_embed_module = NoiseEmbedding(d_t, max_value=1000)
     
     model = SR3UNet(
-        vec_dim=VEC_DIM,
         n=N,
         noise_embed_module=noise_embed_module,
         base_ch=64            # Base channels for U-Net (64 -> 128 -> 256 -> 512)
@@ -64,16 +64,61 @@ def load_checkpoint(checkpoint_path, device):
     return model, checkpoint
 
 
-def parse_region(region_str):
+def _parse_interval(interval_str: str) -> Tuple[int, int]:
     """
-    Parse region string like "2:44700000-45300000" into components.
-    
+    Parse a genomic interval like "44700000-45300000".
+    """
+    start, end = map(int, interval_str.split('-'))
+    if end <= start:
+        raise ValueError(
+            f"Invalid interval '{interval_str}': end must be greater than start."
+        )
+    return start, end
+
+
+def normalize_region(region_str: str) -> str:
+    """
+    Normalize region strings to the loader's canonical 2D format.
+
+    Supported inputs:
+      "chrom:start-end"                           -> diagonal crop
+      "chrom:row_start-row_end:col_start-col_end" -> canonical 2D crop
+      "chrom:row_start-row_end,col_start-col_end" -> shorthand 2D crop
+    """
+    parts = region_str.split(':')
+    if len(parts) == 2:
+        chrom, coords = parts
+        if ',' in coords:
+            row_coords, col_coords = coords.split(',', 1)
+        else:
+            row_coords = coords
+            col_coords = coords
+    elif len(parts) == 3:
+        chrom, row_coords, col_coords = parts
+    else:
+        raise ValueError(
+            "Region must be one of: 'chrom:start-end', "
+            "'chrom:row_start-row_end:col_start-col_end', or "
+            "'chrom:row_start-row_end,col_start-col_end'. "
+            f"Received: '{region_str}'"
+        )
+
+    row_start, row_end = _parse_interval(row_coords)
+    col_start, col_end = _parse_interval(col_coords)
+    return f"{chrom}:{row_start}-{row_end}:{col_start}-{col_end}"
+
+
+def parse_region(region_str: str) -> Tuple[str, int, int, int, int]:
+    """
+    Parse a region string into row/column genomic ranges.
+
     Returns:
-        Tuple of (chrom, start, end) as integers
+        Tuple of (chrom, row_start, row_end, col_start, col_end)
     """
-    chrom, coords = region_str.split(':')
-    start, end = coords.split('-')
-    return chrom, int(start), int(end)
+    chrom, row_coords, col_coords = normalize_region(region_str).split(':')
+    row_start, row_end = _parse_interval(row_coords)
+    col_start, col_end = _parse_interval(col_coords)
+    return chrom, row_start, row_end, col_start, col_end
 
 
 def region_in_range(region_str, target_start, target_end):
@@ -88,9 +133,10 @@ def region_in_range(region_str, target_start, target_end):
     Returns:
         True if region overlaps with target range
     """
-    chrom, start, end = parse_region(region_str)
-    # Check if region overlaps with target range
-    return (start < target_end and end > target_start)
+    _, row_start, row_end, col_start, col_end = parse_region(region_str)
+    region_start = min(row_start, col_start)
+    region_end = max(row_end, col_end)
+    return region_start < target_end and region_end > target_start
 
 
 def get_cluster3_regions_chr2(all_chr2_regions, data_dir):
@@ -158,15 +204,23 @@ def get_cluster3_regions_chr2(all_chr2_regions, data_dir):
         # Find all regions that contain both anchors
         candidate_regions = []
         for region_str in all_chr2_regions:
-            chrom, start, end = parse_region(region_str)
+            chrom, row_start, row_end, col_start, col_end = parse_region(region_str)
 
-            # Check if both anchors are within this region
-            anchor1_contained = (start <= a1_start and a1_end <= end)
-            anchor2_contained = (start <= a2_start and a2_end <= end)
+            anchor1_in_row = (row_start <= a1_start and a1_end <= row_end)
+            anchor1_in_col = (col_start <= a1_start and a1_end <= col_end)
+            anchor2_in_row = (row_start <= a2_start and a2_end <= row_end)
+            anchor2_in_col = (col_start <= a2_start and a2_end <= col_end)
 
-            if anchor1_contained and anchor2_contained:
-                # Calculate region midpoint
-                region_midpoint = (start + end) / 2
+            # For off-diagonal crops, one anchor must lie on each axis.
+            contains_loop = (
+                (anchor1_in_row and anchor2_in_col) or
+                (anchor1_in_col and anchor2_in_row)
+            )
+
+            if contains_loop:
+                region_midpoint = (
+                    min(row_start, col_start) + max(row_end, col_end)
+                ) / 2
                 # Calculate distance from loop midpoint
                 distance = abs(region_midpoint - loop_midpoint)
                 candidate_regions.append((region_str, distance))
@@ -228,6 +282,9 @@ def run_test_evaluation_chromosome2(
     print(f"Using hic_data_type='{hic_data_type}', use_log_transform={use_log_transform}")
     print(f"  (Model trained on '{hic_data_type}' data with log1p transformation)")
     
+    # Default cache location (matches training)
+    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr"
+
     cell_cycle_loader = CellCycleDataLoader(
         data_dir=data_dir,
         resolution=RESOLUTION_BP,
@@ -236,7 +293,9 @@ def run_test_evaluation_chromosome2(
         hold_out_chromosome="2",  # Match training setup
         hic_data_type=hic_data_type,  # Match training data type
         use_log_transform=use_log_transform,  # Match training preprocessing
-        augment=0
+        processed_data_dir=processed_data_dir,
+        augment=0,
+        allow_live_fallback=True,
     )
 
     # Decide which regions to evaluate
@@ -264,6 +323,7 @@ def run_test_evaluation_chromosome2(
         target_regions = [reg for reg, _ in target_regions_with_loops]
     else:
         # Use user-specified explicit regions (e.g. 2:18563263-19203263)
+        target_regions = [normalize_region(region) for region in target_regions]
         print("\nUsing user-specified target regions:")
         for i, reg in enumerate(target_regions, 1):
             print(f"  {i}. {reg}")
@@ -310,19 +370,24 @@ def run_test_evaluation_chromosome2(
         for sample_idx, batch in enumerate(test_dataloader):
             # Get region info for filename
             region = batch['region'][0] if 'region' in batch else f"sample_{sample_idx}"
-            region_clean = region.replace(':', '_').replace('-', '_')
+            region_clean = region.replace(':', '_').replace('-', '_').replace(',', '_')
 
             # Parse region for better filename
-            chrom, start, end = parse_region(region)
-            start_mb = start / 1e6
-            end_mb = end / 1e6
+            chrom, row_start, row_end, col_start, col_end = parse_region(region)
+            row_start_mb = row_start / 1e6
+            row_end_mb = row_end / 1e6
+            col_start_mb = col_start / 1e6
+            col_end_mb = col_end / 1e6
 
             # Run inference and visualize (all four channels)
             save_path = run_inference_and_visualize(
                 model=model,
                 batch=batch,
                 device=device,
-                step=f"chr2_{start_mb:.2f}Mb-{end_mb:.2f}Mb_{region_clean}",
+                step=(
+                    f"chr{chrom}_rows_{row_start_mb:.2f}Mb-{row_end_mb:.2f}Mb_"
+                    f"cols_{col_start_mb:.2f}Mb-{col_end_mb:.2f}Mb_{region_clean}"
+                ),
                 output_dir=output_dir
             )
 
@@ -383,7 +448,9 @@ color scale [0, 40], allowing direct comparison across all maps.
         nargs="*",
         default=None,
         help=(
-            "Optional explicit list of regions like '2:18563263-19203263'. "
+            "Optional explicit list of regions like '2:18563263-19203263', "
+            "'2:18400000-19040000,18650000-19290000', or "
+            "'2:18400000-19040000:18650000-19290000'. "
             "If provided, evaluation is run ONLY on these regions instead of cluster 3 loops."
         ),
     )

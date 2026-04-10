@@ -75,7 +75,7 @@ d_t        = 256                 # time embedding dimension
 
 BATCH_SIZE  = 32
 LR          = 1e-4
-NUM_EPOCHS  = 1
+NUM_EPOCHS  = 10
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
@@ -146,7 +146,7 @@ def _parse_region(region_str: str):
     chrom = parts[0]
     row_start, row_end = map(int, parts[1].split("-"))
     if len(parts) == 3:
-        col_start, col_end = map(int, parts[2].split("-"))
+        _, col_end = map(int, parts[2].split("-"))
         return chrom, row_start, col_end   # full genomic span
     return chrom, row_start, row_end
 
@@ -252,13 +252,14 @@ def compute_validation_loss(model, val_dataloader, device):
     return total_loss / n_batches if n_batches else 0.0
 
 
-def train_step(model, optimizer, batch, device, global_step=0):
+def train_step(model, raw_model, optimizer, batch, device):
     """
     Single training step for SR3-style iterative refinement.
 
-    Model predicts ε for all four channels simultaneously.
-    Bulk conditioning = average of all four phase matrices.
-
+    Args:
+        model:     nn.DataParallel-wrapped (or plain) SR3UNet — used for forward pass
+        raw_model: Underlying SR3UNet (model.module when DataParallel, else model itself).
+                   Used directly for chip_aux_pred to avoid DP re-scattering a small tensor.
     Returns:
         (total_loss, mse_loss, chip_aux_loss) as floats
     """
@@ -275,6 +276,7 @@ def train_step(model, optimizer, batch, device, global_step=0):
     eps_true = torch.randn_like(x0_current)
     y_gamma  = torch.sqrt(gamma_4d) * x0_current + torch.sqrt(1.0 - gamma_4d) * eps_true
 
+    # DataParallel splits along dim=0; h_chip is gathered back to GPU 0 automatically
     eps_pred, h_chip = model(
         y_gamma, gamma_t,
         chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -287,8 +289,8 @@ def train_step(model, optimizer, batch, device, global_step=0):
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (4,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # Aux loss: predict all four channels from chip features alone
-    chip_pred     = model.chip_aux_pred(h_chip)              # (B, 4, N, N)
+    # chip_aux_pred is a single Conv2d — run on raw_model to avoid DP overhead
+    chip_pred     = raw_model.chip_aux_pred(h_chip)
     chip_aux_loss = 0.20 * F.mse_loss(chip_pred, x0_current)
 
     loss = mse_loss + chip_aux_loss
@@ -323,26 +325,44 @@ def main():
 
     noise_embed_module = NoiseEmbedding(d_t, max_value=1000)
 
-    model = SR3UNet(
+    raw_model = SR3UNet(
         n=N,
         noise_embed_module=noise_embed_module,
         base_ch=64,
     ).to(DEVICE)
 
-    num_params = sum(p.numel() for p in model.parameters())
+    num_params = sum(p.numel() for p in raw_model.parameters())
     print(f"Parameters: {num_params:,}")
     print(f"Estimated memory: ~{num_params * 4 / 1e9:.2f} GB (fp32)")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=LR)
 
+    # Load checkpoint into raw_model BEFORE wrapping with DataParallel so that
+    # state-dict keys never have the "module." prefix.
     start_epoch, global_step, best_loss = load_checkpoint_for_training(
-        resume_checkpoint, model, optimizer, DEVICE
+        resume_checkpoint, raw_model, optimizer, DEVICE
     )
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"Using {n_gpus} GPUs with DataParallel (batch split: {BATCH_SIZE} → {BATCH_SIZE // n_gpus} per GPU)")
+        model = torch.nn.DataParallel(raw_model)
+    else:
+        print(f"Using {'GPU' if n_gpus == 1 else 'CPU'}")
+        model = raw_model
 
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
     HOLD_OUT_CHROMOSOME = "2"
+
+    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr"
+    if not processed_data_dir.exists():
+        raise ValueError(
+            f"Cache directory not found at {processed_data_dir}. "
+            "Training is cache-only; run preprocess/prestore_hic.py first."
+        )
+    print(f"Using pre-stored cache (cache-only training): {processed_data_dir}")
 
     base_loader_kwargs = dict(
         data_dir=data_dir,
@@ -353,10 +373,12 @@ def main():
         hic_data_type="oe",
         use_log_transform=True,
         normalization_stats_file=data_dir / "normalization_stats.csv",
+        processed_data_dir=processed_data_dir,
+        allow_live_fallback=False,
     )
 
     cell_cycle_loader_train = CellCycleDataLoader(
-        save_normalization_stats=True,
+        save_normalization_stats=False,  # only needed once; disable to reduce I/O overhead
         augment=50,
         **base_loader_kwargs,
     )
@@ -408,12 +430,14 @@ def main():
           f"(n={len(validation_regions)})")
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}, Val: {len(val_dataset)}")
 
+    NUM_WORKERS = 4  # each worker pre-fetches independently, overlapping NFS I/O with GPU
     train_dataloader = TorchDataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=0,
+        num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,  # keep workers alive between epochs to avoid re-fork cost
     )
 
     print(f"Batches per epoch: {len(train_dataloader)}")
@@ -426,7 +450,7 @@ def main():
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [4-phase]")
         for batch in pbar:
-            loss, mse, chip = train_step(model, optimizer, batch, DEVICE, global_step)
+            loss, mse, chip = train_step(model, raw_model, optimizer, batch, DEVICE)
             epoch_losses.append(loss)
             epoch_mse.append(mse)
             epoch_chip.append(chip)
@@ -445,10 +469,10 @@ def main():
         data_type_str = cell_cycle_loader_train.hic_data_type
         log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
         checkpoint_path = (CHECKPOINT_DIR /
-                           f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-7_asym.pth")
+                           f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-8_asym.pth")
         torch.save({
             'epoch':                epoch,
-            'model_state_dict':     model.state_dict(),
+            'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
             'optimizer_state_dict': optimizer.state_dict(),
             'loss':                 avg_loss,
             'global_step':          global_step,

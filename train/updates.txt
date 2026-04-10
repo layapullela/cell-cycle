@@ -46,3 +46,11 @@
    then take the outer product, then axial attention with pair bias, then feed it to the linear layer + adanorm
 
 
+4-7: 
+   OOM issues!!
+   a couple of changes, 1. change msa size to 16 instead of 32 (we can prolly change this back)
+   2. num_workers = 4, and make sure each forked process has its own copy of the chip seq file handlers 
+   3. 2 GPUs? adding CPU ram to the sbatch call.
+   4. THIS IS THE BIG: no calling hic.straw anymore, preprocess all HiC into numpy and call that.
+      lets have a folder called zhang/oe/ch#/start-end_start-end.hic
+

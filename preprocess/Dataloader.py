@@ -1,26 +1,14 @@
 """
-dataloader for cell cycle Hi-C contact maps and chip seq signals.
+Cache-backed dataloader for cell cycle Hi-C contact maps and ChIP-seq signals.
 
-Regions are now represented as 2D crops (not restricted to the diagonal):
-  Format: "chrom:row_start-row_end:col_start-col_end"
-  Diagonal crops (row == col range) are symmetric; off-diagonal crops are not.
-
-Training set includes:
-  1. Overlapping diagonal sliding-window crops (as before, 10-pixel step).
-  2. An equal number of off-diagonal crops sampled from the upper-triangular
-     part of the genome, with weights inversely proportional to their distance
-     from the diagonal (i.e. nearby-diagonal crops are sampled more often).
-
-Samples now return full (N, N) contact matrices (float32), not flattened
-upper-triangular vectors.  ChIP-seq is returned as separate row and col tracks
-(identical for diagonal crops).
+This loader does not generate or resample genomic regions. It simply enumerates
+pre-stored `.npz` files under `processed_data` and serves them as training or
+holdout samples based on the chromosome split.
 """
 
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Union, Optional, Tuple
-import hicstraw as straw
-import pyBigWig
 
 
 class CellCycleDataLoader:
@@ -47,6 +35,8 @@ class CellCycleDataLoader:
         hic_data_type: str = "oe",
         use_log_transform: bool = True,
         augment: Union[int, float] = 50,
+        processed_data_dir: Optional[Union[str, Path]] = None,
+        allow_live_fallback: bool = True,
     ):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
@@ -57,6 +47,8 @@ class CellCycleDataLoader:
         self.hic_data_type = hic_data_type
         self.use_log_transform = use_log_transform
         self.augment = float(augment)
+        self.allow_live_fallback = bool(allow_live_fallback)
+        self.processed_data_dir = Path(processed_data_dir) if processed_data_dir else None
 
         self.save_normalization_stats = save_normalization_stats
         if normalization_stats_file is None:
@@ -69,59 +61,164 @@ class CellCycleDataLoader:
                 f.write("region,phase,min,max\n")
             print(f"Saving normalization stats to: {self.normalization_stats_file}")
 
-        self.step_pixels = 10
-        self.step_bp = self.step_pixels * resolution
+        self.phase_names = ('earlyG1', 'midG1', 'lateG1', 'anatelo')
+        self.phase_paths: Dict[str, Path] = {}
+        self._chipseq_paths: Dict[str, Optional[str]] = {}
+        self.chipseq_files: Dict[str, Optional[object]] = {}
 
-        raw_data_dir = self.data_dir.parent.parent / "raw_data" / "zhang_4dn"
+        default_processed_data_dir = Path(__file__).resolve().parent.parent / "processed_data"
+        self.processed_data_dir = Path(processed_data_dir) if processed_data_dir else default_processed_data_dir
+        if not self.processed_data_dir.exists() and not self.allow_live_fallback:
+            raise ValueError(
+                f"Processed data directory not found: {self.processed_data_dir}. "
+                "Run preprocess/prestore_hic.py first (or set allow_live_fallback=True)."
+            )
 
-        self.chipseq_files = {}
+        self.region_to_path: Dict[str, Path] = {}
+        if self.processed_data_dir.exists():
+            self.regions, self.holdout_regions = self._generate_regions()
+        else:
+            self.regions, self.holdout_regions = [], []
 
-        def _load_chip(key: str, filename: str, label: str):
-            chip_path = raw_data_dir / filename
-            if chip_path.exists():
-                try:
-                    self.chipseq_files[key] = pyBigWig.open(str(chip_path))
-                    print(f"Loaded {label} ChIP-seq from: {chip_path}")
-                except Exception as e:
-                    print(f"Warning: Failed to load {label} bigWig file {chip_path}: {e}")
-                    self.chipseq_files[key] = None
-            else:
-                print(f"Warning: {label} bigWig file not found at expected path: {chip_path}")
+        total_cached = len(self.regions) + len(self.holdout_regions)
+        if total_cached == 0 and not self.allow_live_fallback:
+            raise ValueError(
+                f"No cached .npz files found under {self.processed_data_dir}. "
+                "Run preprocess/prestore_hic.py first (or set allow_live_fallback=True)."
+            )
+
+        if self.allow_live_fallback:
+            self._init_live_sources()
+
+    # ------------------------------------------------------------------
+    # ChIP-seq handle management
+    # ------------------------------------------------------------------
+    def _open_chipseq_handles(self):
+        """Open all pyBigWig file handles (single-process inference)."""
+        if not self.allow_live_fallback:
+            return
+        for key, path in self._chipseq_paths.items():
+            if path is None:
+                self.chipseq_files[key] = None
+                continue
+            try:
+                import pyBigWig  # lazy import
+                self.chipseq_files[key] = pyBigWig.open(path)
+            except Exception:
                 self.chipseq_files[key] = None
 
-        _load_chip('ctcf',    "GSE129997_CTCF_asyn_mm10.bw",    "CTCF")
-        _load_chip('hac',     "GSM1502751_534.mm10.bigWig",      "H3K27ac (HAC)")
-        _load_chip('h3k4me1', "h3k04me1.mm10.bigWig",            "H3K4me1")
-        _load_chip('h3k4me3', "G1eH3k04me3.mm10.bigWig",         "H3K4me3")
-        self.chipseq_files['rad21'] = None
+    # ------------------------------------------------------------------
+    # Live sources (used only when region isn't cached)
+    # ------------------------------------------------------------------
+    def _init_live_sources(self) -> None:
+        """Initialize `.hic` and bigWig paths for live fallback queries."""
+        # Hi-C phase files
+        for phase in self.phase_names:
+            p = self.data_dir / f"{phase}.hic"
+            if p.exists():
+                self.phase_paths[phase] = p
 
-        self.phase_files = {
-            'earlyG1': 'earlyG1.hic',
-            'lateG1':  'lateG1.hic',
-            'midG1':   'midG1.hic',
-            'anatelo': 'anatelo.hic',
+        # bigWig files (optional)
+        raw_data_dir = self.data_dir.parent.parent / "raw_data" / "zhang_4dn"
+        chip_files = {
+            'ctcf':    raw_data_dir / "GSE129997_CTCF_asyn_mm10.bw",
+            'hac':     raw_data_dir / "GSM1502751_534.mm10.bigWig",
+            'h3k4me1': raw_data_dir / "h3k04me1.mm10.bigWig",
+            'h3k4me3': raw_data_dir / "G1eH3k04me3.mm10.bigWig",
         }
+        for k, p in chip_files.items():
+            self._chipseq_paths[k] = str(p) if p.exists() else None
 
-        self.phase_paths = {}
-        for phase, filename in self.phase_files.items():
-            filepath = self.data_dir / filename
-            if filepath.exists():
-                self.phase_paths[phase] = filepath
+        self._open_chipseq_handles()
 
+    def _extract_region_matrix_live(self, hic_file: Path, region: str) -> np.ndarray:
+        chrom, row_start, row_end, col_start, col_end = self._parse_region(region)
+        is_diagonal = (row_start == col_start)
+        try:
+            import hicstraw as straw  # lazy import
+            result = straw.straw(
+                self.hic_data_type,
+                self.normalization,
+                str(hic_file),
+                f"{chrom}:{row_start}:{row_end}",
+                f"{chrom}:{col_start}:{col_end}",
+                "BP",
+                self.resolution,
+            )
+        except Exception as e:
+            raise ValueError(f"Error reading region {region} from {hic_file}: {e}")
+
+        matrix = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+        for record in result:
+            x_idx = int((record.binX - row_start) // self.resolution)
+            y_idx = int((record.binY - col_start) // self.resolution)
+            if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
+                matrix[x_idx, y_idx] = float(record.counts)
+                if is_diagonal and x_idx != y_idx:
+                    matrix[y_idx, x_idx] = float(record.counts)
+        return matrix
+
+    def _extract_chipseq_signal_live(self, region_1d: str, bw) -> np.ndarray:
+        if bw is None:
+            return np.zeros(self.image_size, dtype=np.float32)
+        parts = region_1d.split(':')
+        chrom = parts[0]
+        start, end = map(int, parts[1].split('-'))
+        signal = np.zeros(self.image_size, dtype=np.float32)
+        chrom_name = "chr" + chrom
+        try:
+            for i in range(self.image_size):
+                bin_start = start + i * self.resolution
+                bin_end = start + (i + 1) * self.resolution
+                values = bw.stats(chrom_name, bin_start, bin_end, type="max")
+                signal[i] = np.log1p(values[0] if values[0] is not None else 0.0)
+        except Exception:
+            pass
+        return signal
+
+    def _load_from_live(self, region: str, do_flip: bool) -> Dict[str, object]:
         if not self.phase_paths:
-            raise ValueError(f"No .hic files found in {self.data_dir}")
+            raise ValueError(
+                f"Live fallback requested for region {region}, but no .hic files were found under {self.data_dir}."
+            )
 
-        self.chromosome_sizes = {
-            "1": 195471971, "2": 182113224, "3": 160039680, "4": 156508116,
-            "5": 151834684, "6": 149736546, "7": 145441459, "8": 129401213,
-            "9": 124595110, "10": 130694993, "11": 122082543, "12": 120129022,
-            "13": 120421639, "14": 124902244, "15": 104043685, "16": 98207768,
-            "17": 94987271, "18": 90702639, "19": 61431566,
-            "X": 171031299, "Y": 91744698,
-        }
+        chrom, row_start, row_end, col_start, col_end = self._parse_region(region)
+        is_diagonal = (row_start == col_start)
+        row_1d = f"{chrom}:{row_start}-{row_end}"
+        col_1d = f"{chrom}:{col_start}-{col_end}"
 
-        self.min_start_position = 3000000
-        self.regions, self.holdout_regions = self._generate_regions()
+        sample: Dict[str, object] = {'region': region}
+
+        for phase, hic_path in self.phase_paths.items():
+            mat = self._extract_region_matrix_live(hic_path, region)
+            if self.use_log_transform:
+                mat = np.log1p(mat)
+
+            threshold = np.percentile(mat, 99.9)
+            mat = np.where(mat > threshold, threshold, mat)
+            m_min, m_max = mat.min(), mat.max()
+            self._save_normalization_stat(region, phase, float(m_min), float(m_max))
+
+            normalized = (
+                np.zeros_like(mat, dtype=np.float32)
+                if m_max - m_min < 1e-10
+                else ((mat - m_min) / (m_max - m_min) * 2.0 - 1.0).astype(np.float32)
+            )
+            if do_flip:
+                normalized = np.flip(normalized, axis=(0, 1)).copy()
+            sample[phase] = normalized
+
+        for mark in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
+            bw = self.chipseq_files.get(mark)
+            row = self._extract_chipseq_signal_live(row_1d, bw)
+            col = row.copy() if is_diagonal else self._extract_chipseq_signal_live(col_1d, bw)
+            if do_flip:
+                row = np.flip(row).copy()
+                col = np.flip(col).copy()
+            sample[f"chip_seq_{mark}_row"] = row.astype(np.float32)
+            sample[f"chip_seq_{mark}_col"] = col.astype(np.float32)
+
+        return sample
 
     # ------------------------------------------------------------------
     # Region parsing
@@ -147,104 +244,52 @@ class CellCycleDataLoader:
         return chrom, row_start, row_end, col_start, col_end
 
     # ------------------------------------------------------------------
-    # Region generation
+    # Region enumeration
     # ------------------------------------------------------------------
-    def _make_diag_region(self, chrom: str, start: int) -> str:
-        end = start + self.region_size
-        return f"{chrom}:{start}-{end}:{start}-{end}"
-
-    def _sample_offdiag_regions(
-        self,
-        chrom: str,
-        diag_positions: List[int],
-        n_samples: int,
-        rng: np.random.Generator,
-    ) -> List[str]:
-        """
-        Sample n_samples off-diagonal upper-triangular crops.
-
-        Distance is measured as the number of step_bp steps between the two
-        window start positions.  Probability ∝ 1 / distance so near-diagonal
-        crops are preferred.
-        """
-        pos_array = np.asarray(diag_positions, dtype=np.int64)
-        n_pos = len(pos_array)
-        if n_pos < 2:
-            return []
-
-        D_MAX = n_pos - 1
-        d_vals = np.arange(1, D_MAX + 1, dtype=np.float64)
-        d_probs = 1.0 / d_vals
-        d_probs /= d_probs.sum()
-
-        regions: List[str] = []
-        attempts = 0
-        max_attempts = n_samples * 15
-
-        while len(regions) < n_samples and attempts < max_attempts:
-            batch = min((n_samples - len(regions)) * 3, 4096)
-
-            row_idx = rng.integers(0, n_pos - 1, size=batch)
-            d_steps = rng.choice(D_MAX, size=batch, p=d_probs) + 1
-            col_idx = row_idx + d_steps
-
-            valid = col_idx < n_pos
-            for k in range(batch):
-                if not valid[k]:
-                    continue
-                rs = int(pos_array[row_idx[k]])
-                cs = int(pos_array[col_idx[k]])
-                regions.append(
-                    f"{chrom}:{rs}-{rs + self.region_size}:{cs}-{cs + self.region_size}"
-                )
-                if len(regions) >= n_samples:
-                    break
-            attempts += batch
-
-        return regions[:n_samples]
-
     def _generate_regions(self) -> Tuple[List[str], List[str]]:
         """
-        Build training and holdout region lists.
+        Build training and holdout region lists directly from cached `.npz` files.
 
-        Training  = diagonal sliding windows + equal-count off-diagonal samples.
-        Holdout   = diagonal sliding windows only (for clean eval).
+        Sampling policy lives in `preprocess/prestore_hic.py`; the dataloader only
+        indexes what has already been written to disk.
+        """
+        training_regions, holdout_regions = self._enumerate_cached_regions()
+        print(f"Indexed cached regions from: {self.processed_data_dir}")
+        print(f"Training regions: {len(training_regions)}")
+        if self.hold_out_chromosome is not None:
+            print(f"Holdout chromosome '{self.hold_out_chromosome}': {len(holdout_regions)} regions")
+        return training_regions, holdout_regions
+
+    def _enumerate_cached_regions(self) -> Tuple[List[str], List[str]]:
+        """
+        Enumerate all cached `.npz` files under `processed_data_dir`.
+
+        File naming convention:
+            .../chr{chrom}/{rs}-{re},{cs}-{ce}.npz  →  "{chrom}:{rs}-{re}:{cs}-{ce}"
         """
         training_regions: List[str] = []
         holdout_regions: List[str] = []
-        rng = np.random.default_rng(42)
+        holdout = str(self.hold_out_chromosome) if self.hold_out_chromosome else None
 
-        for chrom, size in self.chromosome_sizes.items():
-            if chrom == 'Y':
+        for npz_path in sorted(self.processed_data_dir.rglob("*.npz")):
+            chrom_dir = npz_path.parent.name
+            if not chrom_dir.startswith("chr"):
                 continue
 
-            is_holdout = (
-                self.hold_out_chromosome is not None
-                and str(chrom) == str(self.hold_out_chromosome)
-            )
-
-            diag_positions = list(range(
-                self.min_start_position,
-                size - self.region_size + 1,
-                self.step_bp,
-            ))
-
-            diag_region_strs = [self._make_diag_region(chrom, s) for s in diag_positions]
-
-            if is_holdout:
-                holdout_regions.extend(diag_region_strs)
-            else:
-                training_regions.extend(diag_region_strs)
-                # Off-diagonal: same count as diagonal, training only
-                offdiag = self._sample_offdiag_regions(
-                    chrom, diag_positions, len(diag_region_strs), rng
+            chrom = chrom_dir[3:]
+            row_part, col_part = npz_path.stem.split(",")
+            region = f"{chrom}:{row_part}:{col_part}"
+            if region in self.region_to_path and self.region_to_path[region] != npz_path:
+                raise ValueError(
+                    f"Duplicate cached region found for {region} under {self.processed_data_dir}. "
+                    "Pass a more specific processed_data_dir."
                 )
-                training_regions.extend(offdiag)
+            self.region_to_path[region] = npz_path
 
-        if self.hold_out_chromosome:
-            print(f"Holdout chromosome '{self.hold_out_chromosome}': {len(holdout_regions)} regions")
-            print(f"Training regions: {len(training_regions)} "
-                  f"(~50% diagonal, ~50% off-diagonal)")
+            if holdout is not None and chrom == holdout:
+                holdout_regions.append(region)
+            else:
+                training_regions.append(region)
 
         return training_regions, holdout_regions
 
@@ -274,70 +319,60 @@ class CellCycleDataLoader:
         return stats_dict
 
     # ------------------------------------------------------------------
-    # Hi-C extraction
+    # Cache helpers
     # ------------------------------------------------------------------
-    def _extract_region_matrix(self, hic_file: Path, region: str) -> np.ndarray:
-        """
-        Extract a (N, N) contact matrix for the given region.
+    def _npz_path(self, region: str) -> Optional[Path]:
+        """Return the cached .npz path for a region, if indexed."""
+        return self.region_to_path.get(region)
 
-        For diagonal crops (row == col) the matrix is symmetric.
-        For off-diagonal crops the matrix is a raw rectangular slice of the
-        full contact map (not symmetric).
+    def _load_from_cache(self, region: str, do_flip: bool) -> Optional[Dict]:
         """
-        chrom, row_start, row_end, col_start, col_end = self._parse_region(region)
-        is_diagonal = (row_start == col_start)
+        Load a pre-stored .npz file and return a fully normalised sample dict,
+        or None if the cache file does not exist.
 
-        try:
-            result = straw.straw(
-                self.hic_data_type,
-                self.normalization,
-                str(hic_file),
-                f"{chrom}:{row_start}:{row_end}",
-                f"{chrom}:{col_start}:{col_end}",
-                "BP",
-                self.resolution,
+        The .npz stores raw Hi-C counts (no log) and log1p chip signals, matching
+        exactly what prestore_hic.py writes.
+        """
+        path = self._npz_path(region)
+        if path is None or not path.exists():
+            return None
+
+        data   = np.load(path)
+        sample = {'region': region}
+
+        # ---- Hi-C phases (same normalisation as the live path) ----
+        for phase in ('earlyG1', 'midG1', 'lateG1', 'anatelo'):
+            mat = data[phase].copy()                   # (N, N) raw counts
+
+            if self.use_log_transform:
+                mat = np.log1p(mat)
+
+            threshold = np.percentile(mat, 99.9)
+            mat = np.where(mat > threshold, threshold, mat)
+
+            m_min, m_max = mat.min(), mat.max()
+            #self._save_normalization_stat(region, phase, float(m_min), float(m_max))
+
+            normalized = (
+                np.zeros_like(mat, dtype=np.float32)
+                if m_max - m_min < 1e-10
+                else ((mat - m_min) / (m_max - m_min) * 2.0 - 1.0).astype(np.float32)
             )
-        except Exception as e:
-            raise ValueError(f"Error reading region {region} from {hic_file}: {e}")
+            if do_flip:
+                normalized = np.flip(normalized, axis=(0, 1)).copy()
+            sample[phase] = normalized
 
-        matrix = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+        # ---- ChIP-seq tracks (already log1p in the .npz) ----
+        for mark in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
+            row = data[f"chip_{mark}_row"].copy()
+            col = data[f"chip_{mark}_col"].copy()
+            if do_flip:
+                row = np.flip(row).copy()
+                col = np.flip(col).copy()
+            sample[f"chip_seq_{mark}_row"] = row.astype(np.float32)
+            sample[f"chip_seq_{mark}_col"] = col.astype(np.float32)
 
-        for record in result:
-            x_idx = int((record.binX - row_start) // self.resolution)
-            y_idx = int((record.binY - col_start) // self.resolution)
-
-            if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
-                matrix[x_idx, y_idx] = float(record.counts)
-                if is_diagonal and x_idx != y_idx:
-                    matrix[y_idx, x_idx] = float(record.counts)
-
-        return matrix
-
-    # ------------------------------------------------------------------
-    # ChIP-seq extraction
-    # ------------------------------------------------------------------
-    def _extract_chipseq_signal(self, region_1d: str, chipseq_bw=None) -> np.ndarray:
-        """
-        Extract ChIP-seq signal for a 1-D genomic interval "chrom:start-end".
-        Returns max-per-bin signal with log1p transformation.
-        """
-        if chipseq_bw is None:
-            return np.zeros(self.image_size, dtype=np.float32)
-
-        parts  = region_1d.split(':')
-        chrom  = parts[0]
-        start, end = map(int, parts[1].split('-'))
-        signal = np.zeros(self.image_size, dtype=np.float32)
-        chrom_name = "chr" + chrom
-        try:
-            for i in range(self.image_size):
-                bin_start = start + i * self.resolution
-                bin_end   = start + (i + 1) * self.resolution
-                values    = chipseq_bw.stats(chrom_name, bin_start, bin_end, type="max")
-                signal[i] = np.log1p(values[0] if values[0] is not None else 0.0)
-            return signal
-        except Exception as e:
-            raise ValueError(f"Error extracting ChIP-seq signal for region {region_1d}: {e}")
+        return sample
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -357,67 +392,19 @@ class CellCycleDataLoader:
         """
         if isinstance(idx, str):
             region = idx
-            # Validate that size matches if not in known lists
-            all_regions = self.regions + (self.holdout_regions if hasattr(self, 'holdout_regions') else [])
-            if region not in all_regions:
-                _, rs, re, cs, ce = self._parse_region(region)
-                if (re - rs) != self.region_size or (ce - cs) != self.region_size:
-                    raise KeyError(
-                        f"Region {region} not in regions list and window size does not match "
-                        f"region_size={self.region_size}"
-                    )
         else:
             region = self.regions[idx]
 
-        chrom, row_start, row_end, col_start, col_end = self._parse_region(region)
-        is_diagonal = (row_start == col_start)
-
-        # 1-D region strings for ChIP-seq
-        row_1d = f"{chrom}:{row_start}-{row_end}"
-        col_1d = f"{chrom}:{col_start}-{col_end}"
-
-        sample: Dict[str, object] = {'region': region}
         do_flip = (self.augment > 0) and (np.random.rand() < (self.augment / 100.0))
 
-        # ---- Hi-C phases ----
-        for phase, filepath in self.phase_paths.items():
-            mat = self._extract_region_matrix(filepath, region)  # (N, N)
+        cached = self._load_from_cache(region, do_flip)
+        if cached is not None:
+            return cached
 
-            if self.use_log_transform:
-                mat = np.log1p(mat)
+        if not self.allow_live_fallback:
+            raise KeyError(f"Region not found in cached dataset: {region}")
 
-            threshold = np.percentile(mat, 99.9)
-            mat = np.where(mat > threshold, threshold, mat)
-
-            m_min = mat.min()
-            m_max = mat.max()
-            self._save_normalization_stat(region, phase, float(m_min), float(m_max))
-
-            if m_max - m_min < 1e-10:
-                normalized = np.zeros_like(mat, dtype=np.float32)
-            else:
-                normalized = (mat - m_min) / (m_max - m_min) * 2.0 - 1.0
-
-            if do_flip:
-                normalized = np.flip(normalized, axis=(0, 1)).copy()
-
-            sample[phase] = normalized.astype(np.float32)
-
-        # ---- ChIP-seq tracks ----
-        for key in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
-            bw = self.chipseq_files.get(key)
-            row_track = self._extract_chipseq_signal(row_1d, chipseq_bw=bw)
-            col_track = row_track.copy() if is_diagonal else self._extract_chipseq_signal(col_1d, chipseq_bw=bw)
-
-            if do_flip:
-                row_track = np.flip(row_track).copy()
-                col_track = np.flip(col_track).copy()
-
-            tag = f"chip_seq_{key}"
-            sample[f"{tag}_row"] = row_track.astype(np.float32)
-            sample[f"{tag}_col"] = col_track.astype(np.float32)
-
-        return sample
+        return self._load_from_live(region, do_flip)
 
     def __iter__(self):
         for i in range(len(self)):
@@ -427,10 +414,12 @@ class CellCycleDataLoader:
         return self.regions.copy()
 
     def get_available_phases(self) -> List[str]:
-        return list(self.phase_paths.keys())
+        return list(self.phase_names)
 
     def close(self):
-        for key, bw in self.chipseq_files.items():
+        if not self.allow_live_fallback:
+            return
+        for bw in self.chipseq_files.values():
             if bw is not None:
                 try:
                     bw.close()

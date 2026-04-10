@@ -258,7 +258,7 @@ class ChipPairEncoderAlpha(nn.Module):
     For diagonal crops chip_*_row == chip_*_col → symmetric outer product.
     For off-diagonal crops the two sets of tracks differ → asymmetric.
     """
-    def __init__(self, n_bins: int = 64, c_msa: int = 32, c_pair: int = 16, n_heads: int = 4):
+    def __init__(self, n_bins: int = 64, c_msa: int = 16, c_pair: int = 16, n_heads: int = 4):
         super().__init__()
         self.n_bins = n_bins
         self.c_msa  = c_msa
