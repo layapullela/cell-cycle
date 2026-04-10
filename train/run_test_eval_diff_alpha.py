@@ -379,7 +379,8 @@ def run_test_evaluation_chromosome2(
             col_start_mb = col_start / 1e6
             col_end_mb = col_end / 1e6
 
-            # Run inference and visualize (all four channels)
+            # Inference.visualize infers diagonal-block regions from batch['region'] and
+            # averages predictions with their transpose; off-diagonal crops (row ≠ col interval) are unchanged.
             save_path = run_inference_and_visualize(
                 model=model,
                 batch=batch,

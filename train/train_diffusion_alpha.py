@@ -290,8 +290,15 @@ def train_step(model, raw_model, optimizer, batch, device):
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
     # chip_aux_pred is a single Conv2d — run on raw_model to avoid DP overhead
-    chip_pred     = raw_model.chip_aux_pred(h_chip)
-    chip_aux_loss = 0.20 * F.mse_loss(chip_pred, x0_current)
+    chip_pred = raw_model.chip_aux_pred(h_chip)
+    # Target: normalized per-phase residual vs. bulk (mean of the four phases).
+    # Relative residual emphasizes structure over absolute intensity:
+    #   r = (x0_phase - bulk) / (|bulk| + eps)
+    # bulk_map is (B,1,N,N) and broadcasts across 4 phases.
+    bulk_eps = 1e-3
+    denom = bulk_map.abs().clamp_min(bulk_eps)
+    chip_aux_target = (x0_current - bulk_map) / denom
+    chip_aux_loss   = F.mse_loss(chip_pred, chip_aux_target)
 
     loss = mse_loss + chip_aux_loss
 
@@ -466,18 +473,20 @@ def main():
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  chip={np.mean(epoch_chip):.6f}")
 
-        data_type_str = cell_cycle_loader_train.hic_data_type
-        log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-        checkpoint_path = (CHECKPOINT_DIR /
-                           f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-8_asym.pth")
-        torch.save({
-            'epoch':                epoch,
-            'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss':                 avg_loss,
-            'global_step':          global_step,
-        }, checkpoint_path)
-        print(f"✓ Saved epoch checkpoint: {checkpoint_path}")
+        # Save only selected epochs to reduce checkpoint churn.
+        if (epoch + 1) in (10, 20):
+            data_type_str = cell_cycle_loader_train.hic_data_type
+            log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
+            checkpoint_path = (CHECKPOINT_DIR /
+                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-10_asym-residual-loss.pth")
+            torch.save({
+                'epoch':                epoch,
+                'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss':                 avg_loss,
+                'global_step':          global_step,
+            }, checkpoint_path)
+            print(f"✓ Saved epoch checkpoint: {checkpoint_path}")
 
     print("\n" + "="*80)
     print("Training complete for all four phases!")

@@ -13,6 +13,52 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess"))
 
 
+def _parse_region_intervals(region: str) -> tuple[str, int, int, int, int]:
+    """
+    Parse region string like CellCycleDataLoader._parse_region.
+
+    Formats:
+      "chrom:row_start-row_end:col_start-col_end"
+      "chrom:start-end"  (legacy diagonal → same interval on both axes)
+    """
+    parts = region.split(":")
+    chrom = parts[0]
+    row_start, row_end = map(int, parts[1].split("-"))
+    if len(parts) == 3:
+        col_start, col_end = map(int, parts[2].split("-"))
+    else:
+        col_start, col_end = row_start, row_end
+    return chrom, row_start, row_end, col_start, col_end
+
+
+def region_is_symmetric(region) -> bool:
+    """
+    True for diagonal-block Hi-C (same genomic interval on row and column axes).
+
+    Off-diagonal crops (row interval ≠ col interval) are not symmetric; predicted
+    contacts M[i,j] and M[j,i] generally differ.
+    """
+    if region is None:
+        return False
+    if isinstance(region, (list, tuple)):
+        if len(region) == 0:
+            return False
+        region = region[0]
+    if not isinstance(region, str):
+        return False
+    try:
+        _, rs, re, cs, ce = _parse_region_intervals(region)
+    except (ValueError, IndexError):
+        return False
+    return rs == cs and re == ce
+
+
+def symmetrize_maps(y: torch.Tensor) -> torch.Tensor:
+    """Enforce M = M^T per batch entry and channel; y is (B, C, H, W)."""
+    yt = y.transpose(-2, -1)
+    return 0.5 * (y + yt)
+
+
 class Inference:
     """
     SR3 inference engine for sampling phase-specific Hi-C from trained models.
@@ -43,6 +89,7 @@ class Inference:
         bulk_map,
         chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
         chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
+        enforce_symmetry: bool = False,
     ):
         """
         SR3 sampling: generate all four phase Hi-C matrices from bulk.
@@ -51,6 +98,8 @@ class Inference:
             bulk_map:     (B, 1, N, N) bulk Hi-C conditioning
             chip_*_row:   (B, N)       ChIP-seq for the row genomic window
             chip_*_col:   (B, N)       ChIP-seq for the col genomic window
+            enforce_symmetry: If True, average each predicted map with its transpose
+                (diagonal-block Hi-C should be symmetric). Use False for off-diagonal crops.
 
         Returns:
             y_0: (B, 4, N, N)  channels: earlyG1, midG1, lateG1, anatelo
@@ -79,9 +128,21 @@ class Inference:
 
             y_t = torch.clamp(y_t, min=-1.0, max=1.0)
 
+        if enforce_symmetry:
+            y_t = symmetrize_maps(y_t)
+            y_t = torch.clamp(y_t, min=-1.0, max=1.0)
+
         return y_t   # (B, 4, N, N)
 
-    def visualize(self, batch, output_path=None, n=64, vmin=None, vmax=None):
+    def visualize(
+        self,
+        batch,
+        output_path=None,
+        n=64,
+        vmin=None,
+        vmax=None,
+        enforce_symmetry: bool | None = None,
+    ):
         """
         Run inference and visualize results for all four output channels.
 
@@ -91,6 +152,8 @@ class Inference:
             output_path: Where to save plot (None → display)
             n: Matrix size (default 64)
             vmin/vmax: Optional fixed colour scale
+            enforce_symmetry: None → use region string in batch (symmetric only for
+                diagonal blocks where row interval == col interval); True/False overrides.
 
         Returns:
             sampled: (B, 4, N, N)
@@ -113,11 +176,18 @@ class Inference:
 
         chip_histone_1d = chip_hac_row[0].detach().cpu().numpy()
 
+        if enforce_symmetry is None:
+            reg = batch.get("region")
+            sym = region_is_symmetric(reg)
+        else:
+            sym = enforce_symmetry
+
         # Run sampling → (B, 4, N, N)
         sampled = self.sample(
             bulk_map,
             chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
+            enforce_symmetry=sym,
         )
 
         gt_mats   = [x[0].cpu().numpy() for x in [x0_early, x0_mid, x0_late, x0_anatelo]]
@@ -194,17 +264,27 @@ class Inference:
         return sampled
 
 
-def run_inference_and_visualize(model, batch, device, step, output_dir="./inference_visualizations",
-                                vmin=None, vmax=None):
+def run_inference_and_visualize(
+    model,
+    batch,
+    device,
+    step,
+    output_dir="./inference_visualizations",
+    vmin=None,
+    vmax=None,
+    enforce_symmetry: bool | None = None,
+):
     """
     Convenience function for running inference during training.
 
     Args:
         model: Trained SR3UNet model
-        batch: Training batch
+        batch: Training batch (optional ``region`` selects symmetric post-processing when
+            row/col genomic intervals match; see ``region_is_symmetric``)
         device: torch device
         step: Current training step (for filename)
         output_dir: Where to save visualization
+        enforce_symmetry: Same as ``Inference.visualize`` (default None = infer from ``batch['region']``)
 
     Returns:
         output_path: Path to saved visualization
@@ -215,6 +295,12 @@ def run_inference_and_visualize(model, batch, device, step, output_dir="./infere
     inference = Inference(model, device, T=1000)
 
     save_path = output_path / f"inference_4phase_step_{step}_alpha.png"
-    inference.visualize(batch, output_path=save_path, vmin=vmin, vmax=vmax)
+    inference.visualize(
+        batch,
+        output_path=save_path,
+        vmin=vmin,
+        vmax=vmax,
+        enforce_symmetry=enforce_symmetry,
+    )
 
     return save_path

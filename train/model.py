@@ -258,7 +258,7 @@ class ChipPairEncoderAlpha(nn.Module):
     For diagonal crops chip_*_row == chip_*_col → symmetric outer product.
     For off-diagonal crops the two sets of tracks differ → asymmetric.
     """
-    def __init__(self, n_bins: int = 64, c_msa: int = 16, c_pair: int = 16, n_heads: int = 4):
+    def __init__(self, n_bins: int = 64, c_msa: int = 32, c_pair: int = 16, n_heads: int = 4):
         super().__init__()
         self.n_bins = n_bins
         self.c_msa  = c_msa
@@ -478,7 +478,7 @@ class SR3UNet(nn.Module):
             nn.init.zeros_(head[-1].bias)
 
         # ---- AUXILIARY CHIP HEAD ----
-        # Predicts all 4 phase matrices from chip features alone
+        # Predicts per-phase residual vs. bulk (x0_phase - mean_phases) from chip features alone
         self.chip_pred_head = nn.Conv2d(self.c_pair, 4, kernel_size=1)
         nn.init.zeros_(self.chip_pred_head.weight)
         nn.init.zeros_(self.chip_pred_head.bias)
@@ -489,7 +489,7 @@ class SR3UNet(nn.Module):
         Args:
             h_chip: (B, c_pair, N, N)
         Returns:
-            (B, 4, N, N) predicted phase matrices from chip features alone
+            (B, 4, N, N) predicted per-phase residual vs. bulk (training target: x0 - bulk)
         """
         return self.chip_pred_head(h_chip)
 
