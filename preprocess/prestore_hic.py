@@ -97,12 +97,19 @@ def _extract_matrix(hic_file: str, region: str) -> np.ndarray:
 
     mat = np.zeros((_image_size, _image_size), dtype=np.float32)
     for rec in result:
+        val = float(rec.counts)
+        # hicstraw always returns binX <= binY; try both coordinate mappings
+        # so that off-diagonal regions with overlapping intervals get filled
+        # on both sides of the submatrix.
         xi = int((rec.binX - rs) // _resolution)
         yj = int((rec.binY - cs) // _resolution)
         if 0 <= xi < _image_size and 0 <= yj < _image_size:
-            mat[xi, yj] = float(rec.counts)
-            if is_diagonal and xi != yj:
-                mat[yj, xi] = float(rec.counts)
+            mat[xi, yj] = val
+
+        xi2 = int((rec.binY - rs) // _resolution)
+        yj2 = int((rec.binX - cs) // _resolution)
+        if 0 <= xi2 < _image_size and 0 <= yj2 < _image_size and (xi2, yj2) != (xi, yj):
+            mat[xi2, yj2] = val
     return mat
 
 

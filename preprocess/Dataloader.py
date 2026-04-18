@@ -150,12 +150,19 @@ class CellCycleDataLoader:
 
         matrix = np.zeros((self.image_size, self.image_size), dtype=np.float32)
         for record in result:
+            val = float(record.counts)
+            # hicstraw always returns binX <= binY; try both coordinate mappings
+            # so that off-diagonal regions with overlapping intervals get filled
+            # on both sides of the submatrix.
             x_idx = int((record.binX - row_start) // self.resolution)
             y_idx = int((record.binY - col_start) // self.resolution)
             if 0 <= x_idx < self.image_size and 0 <= y_idx < self.image_size:
-                matrix[x_idx, y_idx] = float(record.counts)
-                if is_diagonal and x_idx != y_idx:
-                    matrix[y_idx, x_idx] = float(record.counts)
+                matrix[x_idx, y_idx] = val
+
+            x2 = int((record.binY - row_start) // self.resolution)
+            y2 = int((record.binX - col_start) // self.resolution)
+            if 0 <= x2 < self.image_size and 0 <= y2 < self.image_size and (x2, y2) != (x_idx, y_idx):
+                matrix[x2, y2] = val
         return matrix
 
     def _extract_chipseq_signal_live(self, region_1d: str, bw) -> np.ndarray:

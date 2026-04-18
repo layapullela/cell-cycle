@@ -75,13 +75,20 @@ d_t        = 256                 # time embedding dimension
 
 BATCH_SIZE  = 32
 LR          = 1e-4
-NUM_EPOCHS  = 10
+NUM_EPOCHS  = 40
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 RESUME_CHECKPOINT = None
+
+# Chip aux target: per phase, DoG(phase) − DoG(bulk).
+# DoG(z) = blur_small(z) − blur_large(z), which tends to emphasize outlines/corners more
+# than a single Gaussian blur.
+CHIP_DOG_KERNEL       = 15  # odd
+CHIP_DOG_SIGMA_SMALL  = 5
+CHIP_DOG_SIGMA_LARGE  = 11
 
 
 ############################################
@@ -210,6 +217,70 @@ def _build_targets(batch, device):
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col)
 
 
+def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+    """Depthwise isotropic Gaussian blur. x: (B, C, H, W)."""
+    _ks = kernel_size
+    if _ks % 2 != 1 or _ks < 1:
+        raise ValueError("kernel_size must be a positive odd integer")
+    B, C, H, W = x.shape
+    device, dtype = x.device, x.dtype
+    coords = torch.arange(_ks, device=device, dtype=dtype) - (_ks - 1) / 2.0
+    g1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+    g1d = g1d / g1d.sum()
+    k2d = torch.outer(g1d, g1d)
+    k2d = k2d / k2d.sum()
+    weight = k2d.view(1, 1, _ks, _ks).expand(C, 1, _ks, _ks).contiguous()
+    pad = _ks // 2
+    return F.conv2d(x, weight, padding=pad, groups=C)
+
+
+def high_pass_x0_maps(x0: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+    """High-pass each channel: x0 - Gaussian_blur(x0). No bulk subtraction."""
+    low = _gaussian_blur_depthwise(x0, kernel_size, sigma)
+    return x0 - low
+
+
+def gaussian_blur_residual_vs_bulk(
+    x0: torch.Tensor,
+    bulk_map: torch.Tensor,
+    kernel_size: int,
+    sigma: float,
+) -> torch.Tensor:
+    """
+    Per phase c: Gaussian_blur(x0_c) − Gaussian_blur(bulk).
+
+    x0:       (B, 4, H, W)
+    bulk_map: (B, 1, H, W)
+    """
+    low_x0 = _gaussian_blur_depthwise(x0, kernel_size, sigma)
+    low_bulk = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma)
+    return low_x0 - low_bulk
+
+
+def dog_residual_vs_bulk(
+    x0: torch.Tensor,
+    bulk_map: torch.Tensor,
+    kernel_size: int,
+    sigma_small: float,
+    sigma_large: float,
+) -> torch.Tensor:
+    """
+    Per phase c: DoG(x0_c) − DoG(bulk), where DoG(z)=blur_small(z)−blur_large(z).
+
+    x0:       (B, 4, H, W)
+    bulk_map: (B, 1, H, W)
+    """
+    low_x0_small = _gaussian_blur_depthwise(x0, kernel_size, sigma_small)
+    low_x0_large = _gaussian_blur_depthwise(x0, kernel_size, sigma_large)
+
+    #low_bulk_small = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma_small)
+    #low_bulk_large = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma_large)
+
+    dog_x0 = low_x0_small - low_x0_large
+    #dog_bulk = low_bulk_small - low_bulk_large
+    return dog_x0 #- dog_bulk
+
+
 def eval_batch_loss(model, batch, device, generator: torch.Generator | None = None):
     """Compute SR3 MSE loss for one batch (no backward)."""
     (x0_current, bulk_map,
@@ -289,18 +360,22 @@ def train_step(model, raw_model, optimizer, batch, device):
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (4,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # chip_aux_pred is a single Conv2d — run on raw_model to avoid DP overhead
+    # Chip aux: predict DoG(phase) − DoG(bulk) from ChIP features.
     chip_pred = raw_model.chip_aux_pred(h_chip)
-    # Target: normalized per-phase residual vs. bulk (mean of the four phases).
-    # Relative residual emphasizes structure over absolute intensity:
-    #   r = (x0_phase - bulk) / (|bulk| + eps)
-    # bulk_map is (B,1,N,N) and broadcasts across 4 phases.
-    bulk_eps = 1e-3
-    denom = bulk_map.abs().clamp_min(bulk_eps)
-    chip_aux_target = (x0_current - bulk_map) / denom
-    chip_aux_loss   = F.mse_loss(chip_pred, chip_aux_target)
+    chip_aux_target = dog_residual_vs_bulk(
+        x0_current,
+        bulk_map,
+        CHIP_DOG_KERNEL,
+        CHIP_DOG_SIGMA_SMALL,
+        CHIP_DOG_SIGMA_LARGE,
+    )
+    chip_aux_loss = F.mse_loss(chip_pred, chip_aux_target)
 
-    loss = mse_loss + chip_aux_loss
+    #breakpoint()
+
+    loss = mse_loss + 1000 * chip_aux_loss
+
+    #breakpoint()
 
     optimizer.zero_grad()
     loss.backward()
@@ -363,7 +438,7 @@ def main():
 
     HOLD_OUT_CHROMOSOME = "2"
 
-    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr"
+    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr2"
     if not processed_data_dir.exists():
         raise ValueError(
             f"Cache directory not found at {processed_data_dir}. "
@@ -467,18 +542,18 @@ def main():
                 val_loss = compute_validation_loss(model, val_dataloader, DEVICE)
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
 
-            pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'chip': f"{chip:.4f}"})
+            pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'chip': f"{chip * 1000:.4f}"})
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  chip={np.mean(epoch_chip):.6f}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (10, 20):
+        if (epoch + 1) in (10, 20, 30, 40):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-10_asym-residual-loss.pth")
+                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-16_asym-residual-loss.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix

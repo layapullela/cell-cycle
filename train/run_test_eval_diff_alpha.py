@@ -283,7 +283,7 @@ def run_test_evaluation_chromosome2(
     print(f"  (Model trained on '{hic_data_type}' data with log1p transformation)")
     
     # Default cache location (matches training)
-    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr"
+    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr2"
 
     cell_cycle_loader = CellCycleDataLoader(
         data_dir=data_dir,
