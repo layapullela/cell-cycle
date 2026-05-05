@@ -86,9 +86,9 @@ RESUME_CHECKPOINT = None
 # Chip aux target: per phase, DoG(phase) − DoG(bulk).
 # DoG(z) = blur_small(z) − blur_large(z), which tends to emphasize outlines/corners more
 # than a single Gaussian blur.
-CHIP_DOG_KERNEL       = 15  # odd
-CHIP_DOG_SIGMA_SMALL  = 5
-CHIP_DOG_SIGMA_LARGE  = 11
+# CHIP_DOG_KERNEL       = 15  # odd
+# CHIP_DOG_SIGMA_SMALL  = 5
+# CHIP_DOG_SIGMA_LARGE  = 11
 
 
 ############################################
@@ -217,68 +217,68 @@ def _build_targets(batch, device):
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col)
 
 
-def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
-    """Depthwise isotropic Gaussian blur. x: (B, C, H, W)."""
-    _ks = kernel_size
-    if _ks % 2 != 1 or _ks < 1:
-        raise ValueError("kernel_size must be a positive odd integer")
-    B, C, H, W = x.shape
-    device, dtype = x.device, x.dtype
-    coords = torch.arange(_ks, device=device, dtype=dtype) - (_ks - 1) / 2.0
-    g1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
-    g1d = g1d / g1d.sum()
-    k2d = torch.outer(g1d, g1d)
-    k2d = k2d / k2d.sum()
-    weight = k2d.view(1, 1, _ks, _ks).expand(C, 1, _ks, _ks).contiguous()
-    pad = _ks // 2
-    return F.conv2d(x, weight, padding=pad, groups=C)
+# def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+#     """Depthwise isotropic Gaussian blur. x: (B, C, H, W)."""
+#     _ks = kernel_size
+#     if _ks % 2 != 1 or _ks < 1:
+#         raise ValueError("kernel_size must be a positive odd integer")
+#     B, C, H, W = x.shape
+#     device, dtype = x.device, x.dtype
+#     coords = torch.arange(_ks, device=device, dtype=dtype) - (_ks - 1) / 2.0
+#     g1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+#     g1d = g1d / g1d.sum()
+#     k2d = torch.outer(g1d, g1d)
+#     k2d = k2d / k2d.sum()
+#     weight = k2d.view(1, 1, _ks, _ks).expand(C, 1, _ks, _ks).contiguous()
+#     pad = _ks // 2
+#     return F.conv2d(x, weight, padding=pad, groups=C)
 
 
-def high_pass_x0_maps(x0: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
-    """High-pass each channel: x0 - Gaussian_blur(x0). No bulk subtraction."""
-    low = _gaussian_blur_depthwise(x0, kernel_size, sigma)
-    return x0 - low
+# def high_pass_x0_maps(x0: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+#     """High-pass each channel: x0 - Gaussian_blur(x0). No bulk subtraction."""
+#     low = _gaussian_blur_depthwise(x0, kernel_size, sigma)
+#     return x0 - low
 
 
-def gaussian_blur_residual_vs_bulk(
-    x0: torch.Tensor,
-    bulk_map: torch.Tensor,
-    kernel_size: int,
-    sigma: float,
-) -> torch.Tensor:
-    """
-    Per phase c: Gaussian_blur(x0_c) − Gaussian_blur(bulk).
+# def gaussian_blur_residual_vs_bulk(
+#     x0: torch.Tensor,
+#     bulk_map: torch.Tensor,
+#     kernel_size: int,
+#     sigma: float,
+# ) -> torch.Tensor:
+#     """
+#     Per phase c: Gaussian_blur(x0_c) − Gaussian_blur(bulk).
 
-    x0:       (B, 4, H, W)
-    bulk_map: (B, 1, H, W)
-    """
-    low_x0 = _gaussian_blur_depthwise(x0, kernel_size, sigma)
-    low_bulk = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma)
-    return low_x0 - low_bulk
+#     x0:       (B, 4, H, W)
+#     bulk_map: (B, 1, H, W)
+#     """
+#     low_x0 = _gaussian_blur_depthwise(x0, kernel_size, sigma)
+#     low_bulk = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma)
+#     return low_x0 - low_bulk
 
 
-def dog_residual_vs_bulk(
-    x0: torch.Tensor,
-    bulk_map: torch.Tensor,
-    kernel_size: int,
-    sigma_small: float,
-    sigma_large: float,
-) -> torch.Tensor:
-    """
-    Per phase c: DoG(x0_c) − DoG(bulk), where DoG(z)=blur_small(z)−blur_large(z).
+# def dog_residual_vs_bulk(
+#     x0: torch.Tensor,
+#     bulk_map: torch.Tensor,
+#     kernel_size: int,
+#     sigma_small: float,
+#     sigma_large: float,
+# ) -> torch.Tensor:
+#     """
+#     Per phase c: DoG(x0_c) − DoG(bulk), where DoG(z)=blur_small(z)−blur_large(z).
 
-    x0:       (B, 4, H, W)
-    bulk_map: (B, 1, H, W)
-    """
-    low_x0_small = _gaussian_blur_depthwise(x0, kernel_size, sigma_small)
-    low_x0_large = _gaussian_blur_depthwise(x0, kernel_size, sigma_large)
+#     x0:       (B, 4, H, W)
+#     bulk_map: (B, 1, H, W)
+#     """
+#     low_x0_small = _gaussian_blur_depthwise(x0, kernel_size, sigma_small)
+#     low_x0_large = _gaussian_blur_depthwise(x0, kernel_size, sigma_large)
 
-    #low_bulk_small = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma_small)
-    #low_bulk_large = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma_large)
+#     #low_bulk_small = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma_small)
+#     #low_bulk_large = _gaussian_blur_depthwise(bulk_map, kernel_size, sigma_large)
 
-    dog_x0 = low_x0_small - low_x0_large
-    #dog_bulk = low_bulk_small - low_bulk_large
-    return dog_x0 #- dog_bulk
+#     dog_x0 = low_x0_small - low_x0_large
+#     #dog_bulk = low_bulk_small - low_bulk_large
+#     return dog_x0 #- dog_bulk
 
 
 def eval_batch_loss(model, batch, device, generator: torch.Generator | None = None):
@@ -355,27 +355,21 @@ def train_step(model, raw_model, optimizer, batch, device):
         bulk_map,
     )
 
-    # Weighted MSE: anatelo (ch 3) gets 2× weight
     channel_weights  = torch.tensor([0.20, 0.20, 0.20, 0.40], device=device)
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (4,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # Chip aux: predict DoG(phase) − DoG(bulk) from ChIP features.
-    chip_pred = raw_model.chip_aux_pred(h_chip)
-    chip_aux_target = dog_residual_vs_bulk(
-        x0_current,
-        bulk_map,
-        CHIP_DOG_KERNEL,
-        CHIP_DOG_SIGMA_SMALL,
-        CHIP_DOG_SIGMA_LARGE,
-    )
-    chip_aux_loss = F.mse_loss(chip_pred, chip_aux_target)
+    # ---- Chip aux: 50/50 CTCF + H3K27ac (HAC) outer-product weighting ----
+    # CTCF anchors anaphase / cohesin loops; H3K27ac marks G1 active loops.
+    # Mixing them lets the chip features learn both anchor types in the same head.
+    chip_pred         = raw_model.chip_aux_pred(h_chip)
+    chip_ctcf_weight  = chip_ctcf_row[:, :, None] * chip_ctcf_col[:, None, :]   # (B, N, N)
+    chip_hac_weight   = chip_hac_row[:, :, None]  * chip_hac_col[:, None, :]    # (B, N, N)
+    chip_combo_weight = 0.5 * chip_ctcf_weight + 0.5 * chip_hac_weight           # (B, N, N)
+    chip_aux_target   = x0_current * chip_combo_weight.unsqueeze(1)              # (B, 4, N, N)
+    chip_aux_loss     = F.mse_loss(chip_pred, chip_aux_target)
 
-    #breakpoint()
-
-    loss = mse_loss + 1000 * chip_aux_loss
-
-    #breakpoint()
+    loss = mse_loss + chip_aux_loss / 20
 
     optimizer.zero_grad()
     loss.backward()
@@ -438,7 +432,7 @@ def main():
 
     HOLD_OUT_CHROMOSOME = "2"
 
-    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "oe_kr2"
+    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
     if not processed_data_dir.exists():
         raise ValueError(
             f"Cache directory not found at {processed_data_dir}. "
@@ -452,7 +446,7 @@ def main():
         region_size=REGION_SIZE_BP,
         normalization="KR",
         hold_out_chromosome=HOLD_OUT_CHROMOSOME,
-        hic_data_type="oe",
+        hic_data_type="observed",
         use_log_transform=True,
         normalization_stats_file=data_dir / "normalization_stats.csv",
         processed_data_dir=processed_data_dir,
@@ -541,8 +535,10 @@ def main():
             if global_step % 100 == 0:
                 val_loss = compute_validation_loss(model, val_dataloader, DEVICE)
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
-
-            pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'chip': f"{chip * 1000:.4f}"})
+            # Only update the progress bar postfix every 20 iterations to avoid printing every single iteration
+            if global_step % 20 == 0:
+                pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'chip': f"{chip:.4f}"})
+     
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
@@ -553,7 +549,7 @@ def main():
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_4-16_asym-residual-loss.pth")
+                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_5_4_observed.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
