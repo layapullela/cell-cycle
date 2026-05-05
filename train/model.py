@@ -5,9 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "preprocess"))
-from utils import matrix_to_upper_tri_vec, upper_tri_vec_to_matrix
-
 
 ############################################
 # NOISE LEVEL EMBEDDING (Gamma)
@@ -98,10 +95,6 @@ class BigGANResBlock(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x, noise_emb):
-        """
-        x: (batch, in_channels, H, W)
-        noise_emb: (batch, noise_dim) - embedding of noise level γ
-        """
         residual = x
 
         if self.up:
@@ -121,7 +114,6 @@ class BigGANResBlock(nn.Module):
 
         h = self.conv1(h)
 
-        # Adaptive group norm (FiLM)
         noise_params = self.noise_proj(noise_emb)           # (batch, out_channels * 2)
         scale, shift = noise_params.chunk(2, dim=1)
         scale = scale.unsqueeze(-1).unsqueeze(-1)
@@ -156,12 +148,6 @@ class SelfAttentionBlock(nn.Module):
         nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, C, H, W) feature map
-        Returns:
-            x_out: (B, C, H, W) attended feature map
-        """
         B, C, H, W = x.shape
 
         h = self.norm(x)
@@ -183,7 +169,7 @@ class SelfAttentionBlock(nn.Module):
 
 
 ############################################
-# ChIP-SEQ PAIR ENCODER (AlphaFold-style)
+# ChIP-SEQ PAIR ENCODER — axial track attention + bulk cross-attention
 ############################################
 class AdaNorm(nn.Module):
     """
@@ -200,141 +186,343 @@ class AdaNorm(nn.Module):
         return x + self.alpha * self.ln(x)
 
 
-class RowSelfAttentionWithBulkBias(nn.Module):
+class SpatialAxialAttention(nn.Module):
     """
-    Multi-head self-attention over a length-L sequence with a per-head
-    bias matrix derived from the bulk Hi-C map.
+    Self-attention along the spatial (N) axis of a (B, T, N, C) tensor.
+    T is the number of tracks, N is the number of bins, and C is the number of channels.
+    Each track attends to its own neighbors, independently of the other tracks.
+    long range "is there an anchor upstream/downstream?" reasoning lives here.
 
-    Shapes:
-        x:        (B*S, L, C)    # B=batch, S=tracks, L=bins, C=c_msa
-        bulk_map: (B, 1, L, L)   # bulk Hi-C contact map per sample
+    Pre-norm + zero-init out projection ⇒ block starts as identity.
     """
-    def __init__(self, c_msa: int, n_heads: int):
+    def __init__(self, c_in: int, n_heads: int = 4):
         super().__init__()
-        assert c_msa % n_heads == 0, "c_msa must be divisible by n_heads"
-        self.c_msa = c_msa
+        assert c_in % n_heads == 0
         self.n_heads = n_heads
-        self.d_head = c_msa // n_heads
+        self.d_head  = c_in // n_heads
 
-        self.q_proj = nn.Linear(c_msa, c_msa)
-        self.k_proj = nn.Linear(c_msa, c_msa)
-        self.v_proj = nn.Linear(c_msa, c_msa)
-        self.out_proj = nn.Linear(c_msa, c_msa)
-        self.norm = nn.LayerNorm(c_msa)
+        self.norm = nn.LayerNorm(c_in)
+        self.qkv  = nn.Linear(c_in, c_in * 3, bias=False)
+        self.out  = nn.Linear(c_in, c_in, bias=False)
 
-        self.bias_from_bulk = nn.Conv2d(1, n_heads, kernel_size=1)
+        nn.init.zeros_(self.out.weight)
 
-        self.gate_weight = nn.Parameter(
-            torch.empty(n_heads, self.d_head, self.d_head)
-        )
-        self.gate_bias = nn.Parameter(torch.zeros(n_heads, self.d_head))
-        nn.init.xavier_uniform_(self.gate_weight)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, N, C = x.shape
+        H, D = self.n_heads, self.d_head
 
-    def forward(self, x, bulk_map, B, S, L):
-        """
-        x:        (B*S, L, C)
-        bulk_map: (B, 1, L, L)
-        """
-        BS, L_in, C = x.shape
-        assert BS == B * S
-        assert L_in == L
-        assert C == self.c_msa
+        h = self.norm(x)
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        q = q.reshape(B * T, N, H, D).transpose(1, 2)   # (B*T, H, N, D) we do not attend across tracks here 
+        k = k.reshape(B * T, N, H, D).transpose(1, 2)
+        v = v.reshape(B * T, N, H, D).transpose(1, 2)
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        scores = (q @ k.transpose(-2, -1)) / (D ** 0.5)
+        attn   = torch.softmax(scores, dim=-1) # scores are n x n (bins x bins)
+        out    = (attn @ v).transpose(1, 2).contiguous().reshape(B, T, N, C) 
+        return x + self.out(out)
+        # idea is that rep for bin 5, say, is some linear comb of bins 4, 6, 10, etc. in the same track
+        # where the weights are attn scores.
 
-        q = q.view(B * S, L, self.n_heads, self.d_head).transpose(1, 2)
-        k = k.view(B * S, L, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B * S, L, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5)
+class TrackAxialAttention(nn.Module):
+    """
+    Self-attention along the track (T) axis of a (B, T, N, C) tensor.
+    At each genomic bin, the 4 tracks (CTCF, H3K27ac, H3K4me1, H3K4me3) attend
+    to one another so the model can learn "if CTCF AND H3K27ac co-occur, this
+    bin probably anchors a loop" — the cross-mark co-occurrence reasoning.
 
-        bias = self.bias_from_bulk(bulk_map)                     # (B, n_heads, L, L)
-        bias = bias.unsqueeze(1).repeat(1, S, 1, 1, 1)          # (B, S, n_heads, L, L)
-        bias = bias.view(B * S, self.n_heads, L, L)
+    Pre-norm + zero-init out projection ⇒ block starts as identity.
+    """
+    def __init__(self, c_in: int, n_heads: int = 4):
+        super().__init__()
+        assert c_in % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head  = c_in // n_heads
 
-        scores = scores + bias
+        self.norm = nn.LayerNorm(c_in)
+        self.qkv  = nn.Linear(c_in, c_in * 3, bias=False)
+        self.out  = nn.Linear(c_in, c_in, bias=False)
+
+        nn.init.zeros_(self.out.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, N, C = x.shape
+        H, D = self.n_heads, self.d_head
+
+        h = self.norm(x)
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        # Move N to the batch axis so attention runs along T at each bin.
+        q = q.permute(0, 2, 1, 3).reshape(B * N, T, H, D).transpose(1, 2)
+        k = k.permute(0, 2, 1, 3).reshape(B * N, T, H, D).transpose(1, 2)
+        v = v.permute(0, 2, 1, 3).reshape(B * N, T, H, D).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) / (D ** 0.5) # dim of scores is T x T
+        attn   = torch.softmax(scores, dim=-1) 
+        out    = (attn @ v).transpose(1, 2).contiguous()  # (B*N, T, H, D) # stack heads and proj
+        out    = out.reshape(B, N, T, C).permute(0, 2, 1, 3).contiguous()
+        return x + self.out(out)
+
+
+class ChipAxialBlock(nn.Module):
+    """
+    One pass of (within-track spatial attention) + (across-track attention).
+    Operates on (B, T, N, C) tensors. Stack a few of these to mix information
+    along both axes the way an MSA-style trunk does.
+    """
+    def __init__(self, c_msa: int, n_heads: int = 4):
+        super().__init__()
+        self.spatial = SpatialAxialAttention(c_msa, n_heads=n_heads)
+        self.track   = TrackAxialAttention(c_msa, n_heads=n_heads)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.spatial(x)
+        x = self.track(x)
+        return x
+
+
+class AxialCrossAttention(nn.Module):
+    """
+    Cross-attention along one axis of a 2-D pair grid.
+
+    pair (B, N, N, C_q) provides queries.
+    ctx  (B, N, N, C_kv) provides keys/values (here: encoded bulk map).
+
+    axis="row":  pair[i, j] attends to ctx[i, j']  for j' ∈ [N]   (same row of bulk)
+    axis="col":  pair[i, j] attends to ctx[i', j]  for i' ∈ [N]   (same column of bulk)
+
+    Cost is O(N³) per axis (cheaper than the O(N⁴) of full pair-to-bulk attention)
+    while still letting every pair pixel see a full row + a full column of bulk.
+
+    A learned per-head signed relative-position bias is added to the attention
+    scores: score(query @ pos_q, key @ pos_k) += rel_bias[head, pos_k - pos_q].
+    This makes genomic-distance decay an explicit inductive prior — heads can
+    learn near-diagonal vs. long-range biases without having to discover them
+    purely through content matching.
+
+    Returns the residual update only — caller is responsible for adding it back.
+    """
+    def __init__(self, c_q: int, c_kv: int, n_bins: int, n_heads: int = 4, axis: str = "row"):
+        super().__init__()
+        assert axis in ("row", "col")
+        assert c_q % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head  = c_q // n_heads
+        self.n_bins  = n_bins
+        self.axis    = axis
+
+        self.q_norm  = nn.LayerNorm(c_q)
+        self.kv_norm = nn.LayerNorm(c_kv)
+        self.to_q    = nn.Linear(c_q, c_q, bias=False)
+        self.to_kv   = nn.Linear(c_kv, 2 * c_q, bias=False)
+        self.out     = nn.Linear(c_q, c_q, bias=False)
+
+        nn.init.zeros_(self.out.weight)
+
+        # Learned per-head bias indexed by signed offset (pos_k - pos_q) ∈ [-N+1, N-1].
+        # Zero-initialised so the block is identity at start (matches `out` zero-init).
+        self.rel_bias = nn.Embedding(2 * n_bins - 1, n_heads)
+        nn.init.zeros_(self.rel_bias.weight)
+
+        # Precomputed lookup of (pos_k - pos_q) + (N - 1)  ∈ [0, 2N-2] # TODO: we do not need to care about sign if we have flipping augmentation. 
+        positions = torch.arange(n_bins)
+        rel_idx   = (positions[None, :] - positions[:, None]) + (n_bins - 1)   # (N, N)
+        self.register_buffer("rel_idx", rel_idx, persistent=False)
+
+    def forward(self, pair: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        if self.axis == "col":
+            pair = pair.transpose(1, 2)
+            ctx  = ctx.transpose(1, 2)
+
+        B, H, W, C = pair.shape
+        nh, dh = self.n_heads, self.d_head
+
+        q  = self.to_q(self.q_norm(pair))                    # (B, H, W, C)
+        kv = self.to_kv(self.kv_norm(ctx))                   # (B, H, W, 2C)
+        k, v = kv.chunk(2, dim=-1)
+
+        q = q.reshape(B * H, W, nh, dh).transpose(1, 2)      # (B*H, nh, W, dh)
+        k = k.reshape(B * H, W, nh, dh).transpose(1, 2)
+        v = v.reshape(B * H, W, nh, dh).transpose(1, 2)
+
+        scores = (q @ k.transpose(-2, -1)) / (dh ** 0.5)     # (B*H, nh, W, W)
+
+        # Add learned per-head signed relative-position bias.
+        # rel_bias(rel_idx): (W, W, nh) → (nh, W, W) broadcasts over (B*H).
+        rel_pos_bias = self.rel_bias(self.rel_idx).permute(2, 0, 1)
+        scores = scores + rel_pos_bias
+
         attn = torch.softmax(scores, dim=-1)
+        out  = (attn @ v).transpose(1, 2).contiguous().reshape(B, H, W, C)
+        out  = self.out(out)
 
-        out = torch.matmul(attn, v)                              # (B*S, n_heads, L, d_head)
-
-        gate = torch.einsum("hcd,bhld->bhlc", self.gate_weight, out) + self.gate_bias.unsqueeze(0).unsqueeze(2)
-        gate = torch.sigmoid(gate)
-        out = out * gate
-
-        out = out.transpose(1, 2).contiguous().view(B * S, L, C)
-        out = self.out_proj(out)
-        out = self.norm(x + out)
+        if self.axis == "col":
+            out = out.transpose(1, 2)
         return out
+
+
+class PairBulkCrossAttention(nn.Module):
+    """
+    Axial cross-attention block: pair features query encoded bulk-map features
+    along rows then along columns.  After this, every pair pixel (i, j) has
+    pulled in information from the entire bulk row i AND the entire bulk col j.
+
+    Each axis carries its own learned per-head relative-position bias so the
+    model has an explicit "decay-with-distance" inductive prior.
+    """
+    def __init__(self, c_pair: int, n_bins: int, n_heads: int = 4):
+        super().__init__()
+        self.row = AxialCrossAttention(c_pair, c_pair, n_bins=n_bins, n_heads=n_heads, axis="row")
+        self.col = AxialCrossAttention(c_pair, c_pair, n_bins=n_bins, n_heads=n_heads, axis="col")
+
+    def forward(self, pair: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        pair = pair + self.row(pair, ctx)
+        pair = pair + self.col(pair, ctx)
+        return pair
 
 
 class ChipPairEncoderAlpha(nn.Module):
     """
-    AlphaFold-style encoder for 4 ChIP tracks.
+    ChIP-seq pair encoder: per-track embedding → axial track attention →
+    outer product → bulk-map cross-attention.
 
-    1) Stack 4 ChIP tracks into an MSA-style tensor (B, s=4, r=64, c_msa).
-    2) Apply row-wise self-attention over residues (axis r) independently for each track.
-    3) Compute outer-product mean over the MSA (as in AlphaFold):
-           pair[i, j] = mean_s( msa[s, i] ⊗ msa[s, j] )  ∈ ℝ^{c_msa×c_msa}
-       Flatten c_msa×c_msa and project to c_pair, then return (B, c_pair, 64, 64).
+    Flow:
+      1) Per-track embedding.  Each of the 4 tracks (CTCF, H3K27ac, H3K4me1,
+         H3K4me3) gets its own learned identity vector (nn.Embedding) which is
+         added to a value embedding of the per-bin signal.  Output shape
+         (B, T=4, N, c_msa) — track identity is preserved everywhere.
+      2) `n_axial_blocks` rounds of axial attention:
+            - SpatialAxialAttention along N: each track sees its neighbours
+              (long-range "is there an anchor a few bins away?")
+            - TrackAxialAttention along T: at each bin, the 4 tracks attend
+              to one another (cross-mark co-occurrence: "CTCF + H3K27ac → loop")
+      3) Gated softmax-weighted sum across tracks  → (B, N, c_msa).  No max,
+         so co-binding strength is preserved.
+      4) Same pipeline (shared weights) for row and col genomic windows, with
+         separate row / col positional embeddings.
+      5) Outer product → (B, N, N, c_msa²) → linear project → (B, N, N, c_pair).
+         No L2 normalisation: magnitude (= co-binding strength) flows through.
+      6) `bulk_encoder` (small 2-D conv stack) maps the bulk map to
+         (B, c_pair, N, N) features that genuinely see 2-D structure.
+      7) `pair_bulk_xattn`: axial cross-attention from pair (Q) to bulk (K, V)
+         along rows then cols — every pair pixel queries a full bulk row + col.
+      8) AdaNorm + SiLU → (B, c_pair, N, N).
+
+    For diagonal crops the row and col tracks are identical → symmetric outer
+    product.  For off-diagonal crops they differ → asymmetric, as expected.
     """
-    def __init__(self, n_bins: int = 64, c_msa: int = 32, c_pair: int = 16, n_heads: int = 4):
+    N_TRACKS = 4
+
+    def __init__(
+        self,
+        n_bins: int = 64,
+        c_msa: int = 32,
+        c_pair: int = 16,
+        n_heads: int = 4,
+        n_axial_blocks: int = 2,
+    ):
         super().__init__()
         self.n_bins = n_bins
-        self.c_msa = c_msa
+        self.c_msa  = c_msa
         self.c_pair = c_pair
-        self.n_heads = n_heads
-        self.num_tracks = 4
 
-        self.msa_embed = nn.Linear(1, c_msa)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1, n_bins, c_msa))
-        self.msa_norm = nn.LayerNorm(c_msa)
+        T = self.N_TRACKS
 
-        self.row_attn = RowSelfAttentionWithBulkBias(c_msa=c_msa, n_heads=n_heads)
+        # ---- per-track embedding ----
+        self.track_id_embed = nn.Embedding(T, c_msa)                         # track identity
+        self.value_proj     = nn.Linear(1, c_msa)                            # signal magnitude
+        self.pos_embed_row  = nn.Parameter(torch.zeros(1, 1, n_bins, c_msa)) # row positions
+        self.pos_embed_col  = nn.Parameter(torch.zeros(1, 1, n_bins, c_msa)) # col positions
+        self.msa_norm       = nn.LayerNorm(c_msa)
 
+        # ---- axial attention trunk (within-track + across-track) ----
+        self.axial_blocks = nn.ModuleList([
+            ChipAxialBlock(c_msa, n_heads=n_heads) for _ in range(n_axial_blocks)
+        ])
+
+        # ---- gated softmax aggregation over tracks ----
+        self.track_gate = nn.Linear(c_msa, 1)
+
+        # ---- outer-product projection (no L2 normalisation) ----
+        self.outer_proj = nn.Linear(c_msa * c_msa, c_pair)
+
+        # ---- bulk-map encoder ----
+        self.bulk_encoder = nn.Sequential(
+            nn.Conv2d(1,      c_pair, kernel_size=3, padding=1), nn.SiLU(),
+            nn.Conv2d(c_pair, c_pair, kernel_size=3, padding=1), nn.SiLU(),
+            nn.Conv2d(c_pair, c_pair, kernel_size=3, padding=1),
+        )
+
+        # ---- pair ↔ bulk cross-attention (with per-head relative-position bias) ----
+        self.pair_bulk_xattn = PairBulkCrossAttention(c_pair, n_bins=n_bins, n_heads=n_heads)
+
+        # ---- final pair refinement ----
         self.pair_proj = nn.Sequential(
-            nn.Linear(c_msa * c_msa, c_pair),
             AdaNorm(c_pair),
             nn.SiLU(),
         )
 
-    def forward(self, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_map):
+    def _embed_axis(self, ctcf, hac, me1, me3, pos_embed):
+        """
+        Run the per-track-embedding + axial-trunk + gated-aggregation pipeline
+        on one genomic window (either row or col).
+
+        Inputs:  4 tensors of shape (B, N) — CTCF, H3K27ac (HAC), H3K4me1, H3K4me3
+        Returns: (B, N, c_msa)
+        """
+        T = self.N_TRACKS
+
+        sig = torch.stack([ctcf, hac, me1, me3], dim=1).float().unsqueeze(-1)   # (B, T, N, 1)
+        ids = torch.arange(T, device=sig.device)
+        h_id = self.track_id_embed(ids).view(1, T, 1, self.c_msa)               # (1, T, 1, c)
+
+        x = self.value_proj(sig) + h_id + pos_embed                              # (B, T, N, c) # combine track id. vector with actual chip signal and pos embed (bin idx)
+        x = self.msa_norm(x)
+
+        for block in self.axial_blocks:
+            x = block(x)
+
+        # softmax-weighted sum over tracks (preserves co-occurrence magnitude)
+        w = torch.softmax(self.track_gate(x), dim=1)                             # (B, T, N, 1)
+        return (w * x).sum(dim=1)                                                # (B, N, c) # we get rid of track here and have representations of each bin only.
+
+    def forward(
+        self,
+        chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
+        chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
+        bulk_map,
+    ):
         """
         Args:
-            chip_ctcf: (B, 64) CTCF
-            chip_hac:  (B, 64) H3K27ac
-            chip_me1:  (B, 64) H3K4me1
-            chip_me3:  (B, 64) H3K4me3
-            bulk_map:  (B, 1, 64, 64) bulk Hi-C contact map
+            chip_*_row: (B, N) ChIP-seq for the row genomic window
+            chip_*_col: (B, N) ChIP-seq for the col genomic window
+            bulk_map:   (B, 1, N, N) bulk Hi-C contact map
         Returns:
-            pair_map: (B, c_pair, 64, 64)
+            pair_map:   (B, c_pair, N, N)
         """
-        B = chip_ctcf.shape[0]
+        B = chip_ctcf_row.shape[0]
+        N = self.n_bins
 
-        signals = torch.stack(
-            [chip_ctcf.float(), chip_hac.float(), chip_me1.float(), chip_me3.float()],
-            dim=1,
-        )  # (B, 4, 64)
+        # 1)–3) per-axis embedding + axial attention + track aggregation
+        chip_i = self._embed_axis(chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
+                                  self.pos_embed_row)                            # (B, N, c_msa)
+        chip_j = self._embed_axis(chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
+                                  self.pos_embed_col)                            # (B, N, c_msa)
 
-        msa = signals.unsqueeze(-1)   # (B, 4, 64, 1)
-        msa = self.msa_embed(msa)     # (B, 4, 64, c_msa)
-        msa = msa + self.pos_embed
-        msa = self.msa_norm(msa)
+        # 4) outer product (no L2 normalisation — keeps co-binding magnitude)
+        pair_2d   = torch.einsum("bic,bjd->bijcd", chip_i, chip_j)
+        pair_flat = pair_2d.reshape(B, N, N, self.c_msa * self.c_msa)
+        pair      = self.outer_proj(pair_flat)                                   # (B, N, N, c_pair)
 
-        B, S, L, C = msa.shape
-        x = msa.view(B * S, L, C)
-        x = self.row_attn(x, bulk_map, B=B, S=S, L=L)
-        msa = x.view(B, S, L, C)
+        # 5) encode bulk map → channels-last
+        bulk_feat = self.bulk_encoder(bulk_map).permute(0, 2, 3, 1)              # (B, N, N, c_pair)
 
-        msa_mean = msa.max(dim=1).values                            # (B, L, C)
-        pair_2d = torch.einsum("bic,bjd->bijcd", msa_mean, msa_mean)  # (B, L, L, C, C)
-        pair_flat = pair_2d.reshape(B, self.n_bins, self.n_bins, C * C)
-        pair_flat = F.normalize(pair_flat, dim=-1, eps=1e-6)
+        # 6) pair queries bulk along rows then cols
+        pair = self.pair_bulk_xattn(pair, bulk_feat)                             # (B, N, N, c_pair)
 
-        pair_feat = self.pair_proj(pair_flat)        # (B, 64, 64, c_pair)
-        pair_map = pair_feat.permute(0, 3, 1, 2)    # (B, c_pair, 64, 64)
-        return pair_map
+        # 7) final refinement
+        pair = self.pair_proj(pair)                                              # (B, N, N, c_pair)
+        return pair.permute(0, 3, 1, 2)                                          # (B, c_pair, N, N)
 
 
 ############################################
@@ -347,27 +535,16 @@ class PhaseStreamAttention(nn.Module):
     Each stream's feature map is summarised into one token via average pooling,
     then a 4×4 attention matrix lets each phase gather context from the others.
     The attended update is broadcast back to every spatial position via a 1×1 conv.
-
-    This operates on feature maps, not output pixels, so the 4 phases can
-    exchange semantic information (e.g. "anatelo has strong TADs here") before
-    the next decoder level commits to a prediction.
-
-    Shapes (example at 16×16, base_ch*4=256):
-        streams : list of 4 × (B, C, H, W)
-        tokens  : (B, 4, C)               one token per phase (global avg pool)
-        Q,K,V   : (B, 4, d_model)
-        A       : (B, 4, 4)               cross-phase attention weights
-        update  : (B, 4, C) → broadcast → 4 × (B, C, H, W)  via 1×1 conv
     """
     def __init__(self, channels: int, d_model: int = 64, n_phases: int = 4):
         super().__init__()
-        self.scale   = d_model ** -0.5
-        self.norm    = nn.GroupNorm(min(8, channels), channels)
+        self.scale    = d_model ** -0.5
+        self.norm     = nn.GroupNorm(min(8, channels), channels)
         self.to_token = nn.Linear(channels, d_model, bias=False)
-        self.W_q     = nn.Linear(d_model, d_model, bias=False)
-        self.W_k     = nn.Linear(d_model, d_model, bias=False)
-        self.W_v     = nn.Linear(d_model, d_model, bias=False)
-        self.to_feat = nn.Conv2d(d_model, channels, kernel_size=1)
+        self.W_q      = nn.Linear(d_model, d_model, bias=False)
+        self.W_k      = nn.Linear(d_model, d_model, bias=False)
+        self.W_v      = nn.Linear(d_model, d_model, bias=False)
+        self.to_feat  = nn.Conv2d(d_model, channels, kernel_size=1)
 
         # Zero-init: module is identity at training start
         nn.init.zeros_(self.to_feat.weight)
@@ -380,83 +557,74 @@ class PhaseStreamAttention(nn.Module):
         """
         B, C, H, W = streams[0].shape
 
-        # Summarise each stream into one token via global average pool
         tokens = torch.stack(
             [self.norm(s).mean(dim=(2, 3)) for s in streams], dim=1
-        )                                                        # (B, 4, C)
-        tokens = self.to_token(tokens)                           # (B, 4, d_model)
+        )                                        # (B, 4, C)
+        tokens = self.to_token(tokens)           # (B, 4, d_model)
 
-        Q = self.W_q(tokens)                                     # (B, 4, d_model)
-        K = self.W_k(tokens)                                     # (B, 4, d_model)
-        V = self.W_v(tokens)                                     # (B, 4, d_model)
+        Q = self.W_q(tokens)
+        K = self.W_k(tokens)
+        V = self.W_v(tokens)
 
         A = torch.softmax(Q @ K.transpose(-2, -1) * self.scale, dim=-1)  # (B, 4, 4)
         Z = A @ V                                                          # (B, 4, d_model)
 
-        # Broadcast update back to spatial dims via 1×1 conv
         out_streams = []
         for i, s in enumerate(streams):
             update = self.to_feat(
                 Z[:, i].unsqueeze(-1).unsqueeze(-1).expand(B, -1, H, W)
-            )                                                    # (B, C, H, W)
+            )
             out_streams.append(s + update)
         return out_streams
 
 
 ############################################
-# SR3-STYLE U-NET — SPLIT DECODER (Denoised Image Predictor)
+# SR3-STYLE U-NET — SPLIT DECODER
 ############################################
 class SR3UNet(nn.Module):
     """
-    SR3-style U-Net with a shared encoder and 4 parallel phase-specific decoder streams.
+    SR3-style U-Net with shared encoder and 4 parallel phase-specific decoder streams.
+
+    Inputs are now full 2-D contact matrices (B, 4, N, N) rather than flattened
+    upper-triangular vectors, so no vec↔matrix conversion happens inside the model.
 
     Architecture:
         Encoder (shared):
-            (B, 5, 64, 64) → [enc1 → enc2 → enc3 → bottleneck] → (B, 512, 8, 8)
-            Input channels: noisy earlyG1 + midG1 + lateG1 + anatelo + bulk
+            (B, 5, N, N) → enc1 → enc2 → enc3 → bottleneck → (B, 512, N/8, N/8)
+            Input channels: 4 noisy phases + bulk (all as N×N matrices)
 
         Decoder (4 parallel streams, one per phase):
-            bottleneck → split into 4 streams via stream_init
-            Each stream runs its own upsampling BigGAN blocks.
-            Between levels, PhaseStreamAttention lets streams communicate.
-            Skip connections from encoder are shared across all 4 streams.
+            bottleneck → stream_init → 3 up-sampling levels with PhaseStreamAttention
 
         Output:
-            Each stream → GroupNorm → SiLU → Conv2d(base_ch, 1)
-            Stack → (B, 4, vec_dim)
-
-    Cross-phase attention positions (feature-level, not pixel-level):
-        After dec3 (16×16, base_ch*4 channels)
-        After dec2 (32×32, base_ch*2 channels)
-        After dec1 (64×64, base_ch   channels)
+            (B, 4, N, N) predicted denoised matrices
     """
     N_PHASES = 4
 
-    def __init__(self, vec_dim, n, noise_embed_module, base_ch: int = 64, c_pair: int | None = None):
+    def __init__(self, n: int, noise_embed_module: nn.Module, base_ch: int = 64):
         super().__init__()
-        self.vec_dim  = vec_dim
         self.n        = n
         self.base_ch  = base_ch
         self.noise_embed = noise_embed_module
         assert base_ch % 2 == 0
-        self.c_pair   = base_ch // 2
-        P             = self.N_PHASES
+        self.c_pair = base_ch // 2
+        P = self.N_PHASES
 
         noise_dim = self.noise_embed.mlp[-1].out_features
 
         # ---- INPUT ----
-        # 5 channels: 4 noisy phases + bulk
-        self.input_conv      = nn.Conv2d(5, base_ch // 2, kernel_size=3, padding=1)
+        # 5 channels: 4 noisy phases + bulk (all N×N matrices)
+        self.input_conv        = nn.Conv2d(5, base_ch // 2, kernel_size=3, padding=1)
         self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=self.c_pair)
 
         # ---- SHARED ENCODER ----
-        self.enc1          = BigGANResBlock(base_ch,     base_ch,     noise_dim)
-        self.enc1_down     = BigGANResBlock(base_ch,     base_ch * 2, noise_dim, down=True)
-        self.enc2          = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
-        self.enc2_down     = BigGANResBlock(base_ch * 2, base_ch * 4, noise_dim, down=True)
-        self.enc3          = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
-        self.enc3_self_attn= SelfAttentionBlock(base_ch * 4)
-        self.enc3_down     = BigGANResBlock(base_ch * 4, base_ch * 8, noise_dim, down=True)
+        self.enc1           = BigGANResBlock(base_ch,     base_ch,     noise_dim)
+        self.enc1_down      = BigGANResBlock(base_ch,     base_ch * 2, noise_dim, down=True)
+        self.enc2           = BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)
+        self.enc2_down      = BigGANResBlock(base_ch * 2, base_ch * 4, noise_dim, down=True)
+        self.enc3           = BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)
+        self.enc3_self_attn = SelfAttentionBlock(base_ch * 4)
+        self.enc3_down      = BigGANResBlock(base_ch * 4, base_ch * 8, noise_dim, down=True)
 
         # ---- BOTTLENECK ----
         self.bottleneck = nn.ModuleList([
@@ -466,25 +634,24 @@ class SR3UNet(nn.Module):
         ])
 
         # ---- SPLIT: bottleneck → 4 phase streams ----
-        # One 1×1 conv per phase to project (base_ch*8) → (base_ch*4) and give each stream its own start
         self.stream_init = nn.ModuleList([
             nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1) for _ in range(P)
         ])
 
         # ---- PHASE-PARALLEL DECODER ----
-        # Level 3: 8×8 → 16×16
+        # Level 3: → 16×16
         self.dec3_up     = nn.ModuleList([BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim, up=True)  for _ in range(P)])
         self.dec3_reduce = nn.ModuleList([nn.Conv2d(base_ch * 8, base_ch * 4, kernel_size=1)             for _ in range(P)])
         self.dec3        = nn.ModuleList([BigGANResBlock(base_ch * 4, base_ch * 4, noise_dim)             for _ in range(P)])
         self.phase_attn3 = PhaseStreamAttention(base_ch * 4, d_model=64)
 
-        # Level 2: 16×16 → 32×32
+        # Level 2: → 32×32
         self.dec2_up     = nn.ModuleList([BigGANResBlock(base_ch * 4, base_ch * 2, noise_dim, up=True)  for _ in range(P)])
         self.dec2_reduce = nn.ModuleList([nn.Conv2d(base_ch * 4, base_ch * 2, kernel_size=1)             for _ in range(P)])
         self.dec2        = nn.ModuleList([BigGANResBlock(base_ch * 2, base_ch * 2, noise_dim)             for _ in range(P)])
         self.phase_attn2 = PhaseStreamAttention(base_ch * 2, d_model=64)
 
-        # Level 1: 32×32 → 64×64
+        # Level 1: → 64×64
         self.dec1_up     = nn.ModuleList([BigGANResBlock(base_ch * 2, base_ch, noise_dim, up=True)       for _ in range(P)])
         self.dec1_reduce = nn.ModuleList([nn.Conv2d(base_ch * 2, base_ch, kernel_size=1)                  for _ in range(P)])
         self.dec1        = nn.ModuleList([BigGANResBlock(base_ch, base_ch, noise_dim)                      for _ in range(P)])
@@ -503,110 +670,105 @@ class SR3UNet(nn.Module):
             nn.init.zeros_(head[-1].bias)
 
         # ---- AUXILIARY CHIP HEAD ----
+        # Predicts an auxiliary (B,4,N,N) target from chip features.
         self.chip_pred_head = nn.Conv2d(self.c_pair, 4, kernel_size=1)
         nn.init.zeros_(self.chip_pred_head.weight)
         nn.init.zeros_(self.chip_pred_head.bias)
 
     # ------------------------------------------------------------------
-    def chip_aux_pred(self, h_chip):
+    def chip_aux_pred(self, h_chip: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            h_chip: (B, c_pair, 64, 64)
+            h_chip: (B, c_pair, N, N)
         Returns:
-            (B, 4, vec_dim)
+            (B, 4, N, N) predicted auxiliary target (MSE target in training)
         """
-        chip_pred_map = self.chip_pred_head(h_chip)                 # (B, 4, 64, 64)
-        return torch.stack([
-            matrix_to_upper_tri_vec(chip_pred_map[:, i]) for i in range(self.N_PHASES)
-        ], dim=1)                                                    # (B, 4, vec_dim)
+        return self.chip_pred_head(h_chip)
 
     # ------------------------------------------------------------------
-    def forward(self, x_t_vec, gamma, chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_vec):
+    def forward(
+        self,
+        x_t,
+        gamma,
+        chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
+        chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
+        bulk_map,
+    ):
         """
         Args:
-            x_t_vec:  (B, 4, vec_dim)  noisy phases [earlyG1, midG1, lateG1, anatelo]
-            gamma:    (B,)             noise level
-            chip_*:   (B, 64)          ChIP-seq tracks
-            bulk_vec: (B, vec_dim)     bulk Hi-C conditioning
+            x_t:          (B, 4, N, N)  noisy phase matrices [earlyG1, midG1, lateG1, anatelo]
+            gamma:        (B,)           noise level
+            chip_*_row:   (B, N)         ChIP-seq for the row genomic window
+            chip_*_col:   (B, N)         ChIP-seq for the col genomic window
+            bulk_map:     (B, 1, N, N)  bulk Hi-C conditioning (already a 2-D matrix)
         Returns:
-            x0_vec:  (B, 4, vec_dim)
-            h_chip:  (B, c_pair, 64, 64)
+            x0:    (B, 4, N, N)  predicted clean matrices
+            h_chip:(B, c_pair, N, N)  chip pair features (used for aux loss)
         """
-        B  = x_t_vec.shape[0]
-        N  = self.n
-        P  = self.N_PHASES
+        B = x_t.shape[0]
+        P = self.N_PHASES
 
         if gamma.dim() == 2:
             gamma = gamma.squeeze(-1)
         noise_emb = self.noise_embed(gamma * 999.0)
 
-        # ---- Build input maps ----
-        phase_maps = [upper_tri_vec_to_matrix(x_t_vec[:, i], N).unsqueeze(1) for i in range(P)]
-        bulk_map   = upper_tri_vec_to_matrix(bulk_vec, N).unsqueeze(1)         # (B, 1, N, N)
+        # ---- Build 2-D input feature map ----
+        x_in   = torch.cat([x_t, bulk_map], dim=1)                          # (B, 5, N, N)
+        h_bulk = self.input_conv(x_in)                                        # (B, base_ch//2, N, N)
+        h_chip = self.chip_pair_encoder(
+            chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
+            chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col,
+            bulk_map,
+        )                                                                     # (B, c_pair, N, N)
 
-        x_in   = torch.cat(phase_maps + [bulk_map], dim=1)                     # (B, 5, N, N)
-        h_bulk = self.input_conv(x_in)                                          # (B, base_ch//2, N, N)
-        h_chip = self.chip_pair_encoder(chip_ctcf, chip_hac, chip_me1, chip_me3, bulk_map)
-
-        h = torch.cat([h_bulk, h_chip], dim=1)                                 # (B, base_ch, 64, 64)
+        h = torch.cat([h_bulk, h_chip], dim=1)                               # (B, base_ch, N, N)
 
         # ========== SHARED ENCODER ==========
         h     = self.enc1(h, noise_emb)
-        skip1 = h                                                               # (B, base_ch,   64, 64)
+        skip1 = h
         h     = self.enc1_down(h, noise_emb)
 
         h     = self.enc2(h, noise_emb)
-        skip2 = h                                                               # (B, base_ch*2, 32, 32)
+        skip2 = h
         h     = self.enc2_down(h, noise_emb)
 
         h     = self.enc3(h, noise_emb)
         h     = self.enc3_self_attn(h)
-        skip3 = h                                                               # (B, base_ch*4, 16, 16)
-        h     = self.enc3_down(h, noise_emb)                                   # (B, base_ch*8,  8,  8)
+        skip3 = h
+        h     = self.enc3_down(h, noise_emb)
 
         # ========== BOTTLENECK ==========
         for block in self.bottleneck:
             h = block(h, noise_emb) if isinstance(block, BigGANResBlock) else block(h)
-                                                                                # (B, base_ch*8, 8, 8)
 
         # ========== SPLIT INTO 4 PHASE STREAMS ==========
-        # Each stream gets an independent linear projection of the bottleneck
-        streams = [init(h) for init in self.stream_init]                       # 4 × (B, base_ch*4, 8, 8)
+        streams = [init(h) for init in self.stream_init]
 
         # ========== PHASE-PARALLEL DECODER ==========
 
-        # -- Level 3: 8×8 → 16×16 --
-        streams = [self.dec3_up[i](streams[i], noise_emb) for i in range(P)]  # 4 × (B, base_ch*4, 16, 16)
-        streams = [
-            self.dec3_reduce[i](torch.cat([streams[i], skip3], dim=1))
-            for i in range(P)
-        ]
+        # -- Level 3 --
+        streams = [self.dec3_up[i](streams[i], noise_emb) for i in range(P)]
+        streams = [self.dec3_reduce[i](torch.cat([streams[i], skip3], dim=1)) for i in range(P)]
         streams = [self.dec3[i](streams[i], noise_emb) for i in range(P)]
-        streams = self.phase_attn3(streams)                                    # cross-phase communication
+        streams = self.phase_attn3(streams)
 
-        # -- Level 2: 16×16 → 32×32 --
-        streams = [self.dec2_up[i](streams[i], noise_emb) for i in range(P)]  # 4 × (B, base_ch*2, 32, 32)
-        streams = [
-            self.dec2_reduce[i](torch.cat([streams[i], skip2], dim=1))
-            for i in range(P)
-        ]
+        # -- Level 2 --
+        streams = [self.dec2_up[i](streams[i], noise_emb) for i in range(P)]
+        streams = [self.dec2_reduce[i](torch.cat([streams[i], skip2], dim=1)) for i in range(P)]
         streams = [self.dec2[i](streams[i], noise_emb) for i in range(P)]
-        streams = self.phase_attn2(streams)                                    # cross-phase communication
+        streams = self.phase_attn2(streams)
 
-        # -- Level 1: 32×32 → 64×64 --
-        streams = [self.dec1_up[i](streams[i], noise_emb) for i in range(P)]  # 4 × (B, base_ch, 64, 64)
-        streams = [
-            self.dec1_reduce[i](torch.cat([streams[i], skip1], dim=1))
-            for i in range(P)
-        ]
+        # -- Level 1 --
+        streams = [self.dec1_up[i](streams[i], noise_emb) for i in range(P)]
+        streams = [self.dec1_reduce[i](torch.cat([streams[i], skip1], dim=1)) for i in range(P)]
         streams = [self.dec1[i](streams[i], noise_emb) for i in range(P)]
-        streams = self.phase_attn1(streams)                                    # cross-phase communication
+        streams = self.phase_attn1(streams)
 
         # ========== PER-PHASE OUTPUT ==========
-        phase_vecs = []
+        phase_maps = []
         for i in range(P):
-            out_map = self.output_heads[i](streams[i])                         # (B, 1, 64, 64)
-            phase_vecs.append(matrix_to_upper_tri_vec(out_map[:, 0]))         # (B, vec_dim)
+            out_map = self.output_heads[i](streams[i])   # (B, 1, N, N)
+            phase_maps.append(out_map[:, 0])             # (B, N, N)
 
-        x0_vec = torch.stack(phase_vecs, dim=1)                               # (B, 4, vec_dim)
-        return x0_vec, h_chip
+        x0 = torch.stack(phase_maps, dim=1)              # (B, 4, N, N)
+        return x0, h_chip
