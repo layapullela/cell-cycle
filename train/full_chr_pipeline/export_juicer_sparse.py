@@ -78,7 +78,7 @@ def main() -> None:
         for i in range(L):
             row = np.asarray(M[i, i:], dtype=np.float32)
             if thr > 0:
-                nz = np.where(np.abs(row) > thr)[0]
+                nz = np.where(np.abs(row) > thr)[0] # filter out values below zero (no negative counts)
             else:
                 nz = np.where(row != 0)[0]
             if nz.size == 0:

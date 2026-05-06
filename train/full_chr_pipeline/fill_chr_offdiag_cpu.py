@@ -6,13 +6,10 @@ Every bin (i, j) is filled:
   - If near-diagonal diffusion wrote that bin (near_cnt > 0), use
         near_sum / near_cnt
   - Else use the cheap approximation (same as before):
-        phase_map[i,j] = 0.25 * bulk_raw[i,j]
+        phase_map[i,j] approx= bulk_raw[i,j] 
     where bulk_raw = 0.25 * (early + mid + late + anatelo) in **raw** space.
 
-The previous version only wrote 64×64 windows on a sparse patch grid (diagonal
-tiles + sampled off-diagonals from prestore), so almost all off-diagonal bins
-stayed zero and disappeared from sparse Juicer export. This version covers the
-**entire** chromosome grid.
+ This version covers the **entire** chromosome grid not just whats in prestore.
 
 Reads:
   - raw phase arrays from extract_chr_numpy.py
@@ -69,7 +66,7 @@ def main() -> None:
         "--near_band_bp",
         type=float,
         default=0.0,
-        help="Deprecated (ignored). Kept so sbatch / old CLIs still parse.",
+        help="deprecated, not used.",
     )
     p.add_argument(
         "--chunk",
@@ -96,14 +93,14 @@ def main() -> None:
 
     n_i = (L + chunk - 1) // chunk
     n_j = (L + chunk - 1) // chunk
-    total_blocks = n_i * n_j
+    #total_blocks = n_i * n_j
 
     for bi in tqdm(range(n_i), desc="rows (chunked)"):
         i0 = bi * chunk
         i1 = min(i0 + chunk, L)
         for bj in range(n_j):
             j0 = bj * chunk
-            j1 = min(j0 + chunk, L)
+            j1 = min(j0 + chunk, L) # ensure we stay on the grid
 
             bulk_raw = (
                 np.asarray(raw["earlyG1"][i0:i1, j0:j1], dtype=np.float32)

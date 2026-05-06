@@ -2,7 +2,7 @@
 #SBATCH --job-name=chr_full_pipe
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=4
 #SBATCH --output=logs/full_chr_pipeline_%j.out
@@ -17,7 +17,8 @@ PIPE_DIR="${WORKDIR}/full_chr_pipeline"
 
 CHROM="${CHROM:-2}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-16_asym-residual-loss.pth}"
-CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-30.pth}"
+#CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-30.pth}"
+CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_4phase_epoch40_5_5_observed_wide_band.pth}"
 
 # These default to your repo structure; override as needed.
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn}"
@@ -29,7 +30,7 @@ NEAR_DIR="${NEAR_DIR:-${OUT_BASE}/near_pred}"
 FINAL_DIR="${FINAL_DIR:-${OUT_BASE}/final}"
 JUICER_DIR="${JUICER_DIR:-${OUT_BASE}/juicer_txt}"
 
-HIC_UNIT="${HIC_UNIT:-oe}"   # oe or observed
+HIC_UNIT="${HIC_UNIT:-observed}"   # oe or observed
 NORM="${NORM:-KR}"
 NEAR_BAND_BP="${NEAR_BAND_BP:-640000}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
@@ -50,7 +51,7 @@ EXPORT_FORMAT="${EXPORT_FORMAT:-short_with_score}"
 EXPORT_ROUND_INT="${EXPORT_ROUND_INT:-0}"
 
 source ~/.bashrc
-conda activate cell-cycle
+conda activate cell-cycle-v100
 
 set -euo pipefail
 

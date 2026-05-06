@@ -29,7 +29,7 @@ from model import SR3UNet, NoiseEmbedding
 from prestore_hic import (
     CHROMOSOME_SIZES,
     MIN_START,
-    OFFDIAG_NEAR_BAND_BP,
+    OFFDIAG_NEAR_BAND_BP, # this is imported because we need to match the training distribution
     REGION_SIZE,
     STEP_BP,
 )
@@ -83,7 +83,7 @@ def midpoint_gap(rs: int, re: int, cs: int, ce: int) -> float:
 def normalize_patch(raw: np.ndarray, use_log1p: bool) -> tuple[np.ndarray, float, float]:
     x = raw.astype(np.float32, copy=False)
     if use_log1p:
-        x = np.log1p(x)
+        x = np.log1p(x) # note that this is undone in denorm_to_raw
     thr = np.percentile(x, 99.9)
     x = np.where(x > thr, thr, x).astype(np.float32)
     lo, hi = float(x.min()), float(x.max())
@@ -109,6 +109,8 @@ def denorm_batch_to_raw(
 ) -> np.ndarray:
     """
     Vectorized denormalization back to raw space per sample.
+    Note that we are not using each phases own lo and hi, but rather the bulks
+    This is more representative of the actual inference scenario where only bulk data is available.
     """
     lo3 = lo.astype(np.float32, copy=False)[:, None, None]
     hi3 = hi.astype(np.float32, copy=False)[:, None, None]
@@ -176,13 +178,14 @@ def main() -> None:
 
     pred_sum = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_raw.npy", (L, L), np.float32) for ph in PHASES}
     pred_cnt = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_cnt.npy", (L, L), np.int32) for ph in PHASES}
+    # store counts when we sum overlapping tiles so later we can average over them
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_checkpoint(Path(args.checkpoint), device)
     infer = Inference(model, device, T=1000)
 
-    regs_all = regions_for_chrom(chrom, diag_step_bp=args.diag_step_bp)
-    regs = [r for r in regs_all if midpoint_gap(*parse_region(r)[1:]) <= args.near_band_bp]
+    regs_all = regions_for_chrom(chrom, diag_step_bp=args.diag_step_bp) # generate all regions to run (matches training dist)
+    regs = [r for r in regs_all if midpoint_gap(*parse_region(r)[1:]) <= args.near_band_bp] # filter to only near-diag tiles
     print(f"Near-diagonal patches: {len(regs)} / {len(regs_all)}")
 
     with torch.no_grad():
@@ -218,13 +221,15 @@ def main() -> None:
                     j0s[bi] = j0
 
                     norm_ph = {}
+                    # normalize each phase patch
                     for pi, ph in enumerate(PHASES):
                         raw_patch = np.asarray(raw_phase[ph][i0:i0 + N, j0:j0 + N], dtype=np.float32)
                         norm, lo_i, hi_i = normalize_patch(raw_patch, use_log1p)
                         norm_ph[ph] = norm
-                        lo[bi, pi] = lo_i
-                        hi[bi, pi] = hi_i
+                        # lo[bi, pi] = lo_i
+                        # hi[bi, pi] = hi_i
 
+                    # make the bulk
                     bulk[bi] = 0.25 * (norm_ph["earlyG1"] + norm_ph["midG1"] + norm_ph["lateG1"] + norm_ph["anatelo"])
 
                     # Bulk lo/hi for denormalization: derived from the raw bulk patch so that
@@ -260,7 +265,8 @@ def main() -> None:
                 ).cpu().numpy().astype(np.float32)  # (B,4,N,N) normalized
 
                 for pi, ph in enumerate(PHASES):
-                    pred_raw_b = denorm_batch_to_raw(sampled[:, pi, :, :], lo_bulk, hi_bulk, use_log1p)
+                    # denorm each patch by bulk lo and hi
+                    pred_raw_b = denorm_batch_to_raw(sampled[:, pi, :, :], lo_bulk, hi_bulk, use_log1p) 
                     for bi in range(B):
                         i0 = int(i0s[bi])
                         j0 = int(j0s[bi])
