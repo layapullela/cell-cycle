@@ -195,12 +195,13 @@ STEP_PIXELS = 10
 RESOLUTION = 10_000
 REGION_SIZE = 640_000
 STEP_BP = STEP_PIXELS * RESOLUTION
-OFFDIAG_NEAR_BAND_BP = 640_000
+OFFDIAG_NEAR_BAND_BP = 1_000_000
+OFFDIAG_SAMPLES_PER_DIAG = 2
 
 
 def _sample_offdiag(chrom: str, diag_positions: List[int], rng: np.random.Generator) -> List[str]:
     """
-    Generate one upper-triangular off-diagonal crop per diagonal window.
+    Generate upper-triangular off-diagonal crops per diagonal window.
 
     For each diagonal start position, draw an offset (in STEP_BP units) from
     near-diagonal steps up to OFFDIAG_NEAR_BAND_BP, then pair (row, col) windows.
@@ -216,15 +217,31 @@ def _sample_offdiag(chrom: str, diag_positions: List[int], rng: np.random.Genera
     if near_steps.size == 0:
         return []
 
+    split = near_max_steps // 2
+    if split <= 0 or split >= near_max_steps:
+        weights = np.full_like(near_steps, 1.0 / float(near_steps.size), dtype=np.float64)
+    else:
+        low_mask = near_steps <= split
+        high_mask = ~low_mask
+        n_low = int(low_mask.sum())
+        n_high = int(high_mask.sum())
+
+        weights = np.zeros_like(near_steps, dtype=np.float64)
+        weights[low_mask] = 0.70 / n_low
+        weights[high_mask] = 0.30 / n_high
+
     regions: List[str] = []
     for ri in range(n - 1):
-        ds = int(rng.choice(near_steps))
-        ci = ri + ds
-        if ci >= n:
+        k = min(OFFDIAG_SAMPLES_PER_DIAG, int(near_steps.size))
+        if k <= 0:
             continue
-        rs = int(pos[ri])
-        cs = int(pos[ci])
-        regions.append(f"{chrom}:{rs}-{rs + REGION_SIZE}:{cs}-{cs + REGION_SIZE}")
+        for ds in rng.choice(near_steps, size=k, replace=False, p=weights):
+            ci = ri + int(ds)
+            if ci >= n:
+                continue
+            rs = int(pos[ri])
+            cs = int(pos[ci])
+            regions.append(f"{chrom}:{rs}-{rs + REGION_SIZE}:{cs}-{cs + REGION_SIZE}")
     return regions
 
 

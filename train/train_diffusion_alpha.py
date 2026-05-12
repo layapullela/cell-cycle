@@ -27,6 +27,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pytorch_msssim
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
@@ -217,6 +218,41 @@ def _build_targets(batch, device):
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col)
 
 
+# Maps are nominally in [-1, 1]; SSIM `data_range` is max − min = 2 (pytorch_msssim).
+_SSIM_DATA_RANGE = 2.0
+
+
+def ssim_1_minus_mean(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    win_size: int = 11,
+    win_sigma: float = 1.5,
+) -> torch.Tensor:
+    """
+    Differentiable 1 − SSIM via pytorch_msssim. pred and target: (B, C, H, W).
+
+    Fixed data_range for [-1, 1] maps (see _SSIM_DATA_RANGE).
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"ssim: shape mismatch {pred.shape} vs {target.shape}")
+    _, _C, H, W = pred.shape
+    if win_size % 2 != 1 or win_size < 3:
+        raise ValueError("win_size must be an odd integer >= 3")
+    if H < win_size or W < win_size:
+        raise ValueError(f"map spatial size ({H},{W}) must be >= win_size ({win_size})")
+
+    ssim_val = pytorch_msssim.ssim(
+        pred,
+        target,
+        data_range=_SSIM_DATA_RANGE,
+        size_average=True,
+        win_size=win_size,
+        win_sigma=win_sigma,
+    )
+    return 1.0 - ssim_val
+
+
 # def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
 #     """Depthwise isotropic Gaussian blur. x: (B, C, H, W)."""
 #     _ks = kernel_size
@@ -359,17 +395,11 @@ def train_step(model, raw_model, optimizer, batch, device):
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (4,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # ---- Chip aux: 50/50 CTCF + H3K27ac (HAC) outer-product weighting ----
-    # CTCF anchors anaphase / cohesin loops; H3K27ac marks G1 active loops.
-    # Mixing them lets the chip features learn both anchor types in the same head.
-    chip_pred         = raw_model.chip_aux_pred(h_chip)
-    chip_ctcf_weight  = chip_ctcf_row[:, :, None] * chip_ctcf_col[:, None, :]   # (B, N, N)
-    chip_hac_weight   = chip_hac_row[:, :, None]  * chip_hac_col[:, None, :]    # (B, N, N)
-    chip_combo_weight = 0.5 * chip_ctcf_weight + 0.5 * chip_hac_weight           # (B, N, N)
-    chip_aux_target   = x0_current * chip_combo_weight.unsqueeze(1)              # (B, 4, N, N)
-    chip_aux_loss     = F.mse_loss(chip_pred, chip_aux_target)
+    # ---- Chip aux: SSIM between clean phase maps and chip-head prediction ----
+    chip_pred = raw_model.chip_aux_pred(h_chip)
+    chip_aux_loss = ssim_1_minus_mean(chip_pred, x0_current)
 
-    loss = mse_loss + chip_aux_loss / 20
+    loss = mse_loss + chip_aux_loss / 10
 
     optimizer.zero_grad()
     loss.backward()
@@ -549,7 +579,7 @@ def main():
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_5_4_observed.pth")
+                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_5_5_observed_wide_band.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix

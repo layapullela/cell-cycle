@@ -126,11 +126,11 @@ class Inference:
                 y_t - (1.0 - alpha_t) / sqrt_one_minus_gamma_t * eps_pred
             ) + torch.sqrt(1.0 - alpha_t) * z
 
-            y_t = torch.clamp(y_t, min=-1.0, max=1.0)
+            #y_t = torch.clamp(y_t, min=-1.0, max=1.0)
 
         if enforce_symmetry:
             y_t = symmetrize_maps(y_t)
-            y_t = torch.clamp(y_t, min=-1.0, max=1.0)
+            #y_t = torch.clamp(y_t, min=-1.0, max=1.0)
 
         return y_t   # (B, 4, N, N)
 
