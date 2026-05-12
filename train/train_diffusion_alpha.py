@@ -1,7 +1,7 @@
 """
 Cell-Cycle Hi-C Phase Decomposition via SR3-Style Iterative Refinement
 
-Model inputs/outputs are full 2-D contact matrices (B, 4, N, N) – no upper-tri
+Model inputs/outputs are full 2-D contact matrices (B, 5, N, N) – no upper-tri
 vectors.  Training samples now include both diagonal and off-diagonal crops.
 
 NOTATION (γ = signal fraction, NOT noise variance):
@@ -61,8 +61,8 @@ class CellCycleDataset(Dataset):
 ############################################
 # 1) CONFIG
 ############################################
-# Four-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo)
-# Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo.
+# Five-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo, prometa)
+# Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo, 4=prometa.
 
 N = 64                           # contact map size (64 x 64)
 
@@ -187,11 +187,11 @@ def get_validation_regions_chr2(holdout_regions, n=10, seed=42):
 ############################################
 def _build_targets(batch, device):
     """
-    Construct four-channel target matrices and bulk conditioning.
+    Construct five-channel target matrices and bulk conditioning.
 
     Returns:
-        x0_current : (B, 4, N, N)  earlyG1 / midG1 / lateG1 / anatelo matrices
-        bulk_map   : (B, 1, N, N)  average of all four phases
+        x0_current : (B, 5, N, N)  earlyG1 / midG1 / lateG1 / anatelo / prometa matrices
+        bulk_map   : (B, 1, N, N)  average of all five phases
         chip_*_row : (B, N)
         chip_*_col : (B, N)
     """
@@ -199,9 +199,10 @@ def _build_targets(batch, device):
     x0_mid     = batch["midG1"].float().to(device)
     x0_late    = batch["lateG1"].float().to(device)
     x0_anatelo = batch["anatelo"].float().to(device)
+    x0_prometa = batch["prometa"].float().to(device)
 
-    x0_current = torch.stack([x0_early, x0_mid, x0_late, x0_anatelo], dim=1)  # (B, 4, N, N)
-    bulk_map   = (x0_early + x0_mid + x0_late + x0_anatelo).mul(0.25).unsqueeze(1)  # (B, 1, N, N)
+    x0_current = torch.stack([x0_early, x0_mid, x0_late, x0_anatelo, x0_prometa], dim=1)  # (B, 5, N, N)
+    bulk_map   = (x0_early + x0_mid + x0_late + x0_anatelo + x0_prometa).mul(0.2).unsqueeze(1)  # (B, 1, N, N)
 
     chip_ctcf_row = batch["chip_seq_ctcf_row"].float().to(device)
     chip_hac_row  = batch["chip_seq_hac_row"].float().to(device)
@@ -332,7 +333,7 @@ def eval_batch_loss(model, batch, device, generator: torch.Generator | None = No
         gamma_t  = torch.rand(batch_size, device=device) * (GAMMA_MAX - GAMMA_MIN) + GAMMA_MIN
         eps_true = torch.randn_like(x0_current)
 
-    gamma_4d = gamma_t[:, None, None, None]   # (B, 1, 1, 1) broadcasts with (B, 4, N, N)
+    gamma_4d = gamma_t[:, None, None, None]   # (B, 1, 1, 1) broadcasts with (B, 5, N, N)
     y_gamma  = torch.sqrt(gamma_4d) * x0_current + torch.sqrt(1.0 - gamma_4d) * eps_true
 
     eps_pred, _ = model(
@@ -378,7 +379,7 @@ def train_step(model, raw_model, optimizer, batch, device):
 
     # SR3: sample γ ~ Uniform(γ_min, γ_max) continuously
     gamma_t  = torch.rand(batch_size, device=device) * (GAMMA_MAX - GAMMA_MIN) + GAMMA_MIN
-    gamma_4d = gamma_t[:, None, None, None]  # (B, 1, 1, 1) broadcasts with (B, 4, N, N)
+    gamma_4d = gamma_t[:, None, None, None]  # (B, 1, 1, 1) broadcasts with (B, 5, N, N)
 
     eps_true = torch.randn_like(x0_current)
     y_gamma  = torch.sqrt(gamma_4d) * x0_current + torch.sqrt(1.0 - gamma_4d) * eps_true
@@ -391,8 +392,8 @@ def train_step(model, raw_model, optimizer, batch, device):
         bulk_map,
     )
 
-    channel_weights  = torch.tensor([0.20, 0.20, 0.20, 0.40], device=device)
-    mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (4,)
+    channel_weights  = torch.tensor([0.15, 0.15, 0.15, 0.40, 0.15], device=device)
+    mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (5,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
     # ---- Chip aux: SSIM between clean phase maps and chip-head prediction ----
@@ -421,7 +422,7 @@ def main():
     num_epochs        = args.num_epochs if args.num_epochs is not None else NUM_EPOCHS
 
     print("="*80)
-    print("TRAINING: all four phases (matrix I/O, diagonal + off-diagonal crops)")
+    print("TRAINING: all five phases (matrix I/O, diagonal + off-diagonal crops)")
     print("="*80)
     print(f"Device: {DEVICE}")
     print(f"Matrix size: {N}×{N}")
@@ -554,7 +555,7 @@ def main():
         model.train()
 
         total_epochs = start_epoch + num_epochs
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [4-phase]")
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
             loss, mse, chip = train_step(model, raw_model, optimizer, batch, DEVICE)
             epoch_losses.append(loss)
@@ -579,7 +580,7 @@ def main():
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_5_5_observed_wide_band.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_5_observed_wide_band.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
@@ -590,7 +591,7 @@ def main():
             print(f"✓ Saved epoch checkpoint: {checkpoint_path}")
 
     print("\n" + "="*80)
-    print("Training complete for all four phases!")
+    print("Training complete for all five phases!")
     print(f"Best loss: {best_loss:.6f}")
     print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
     print("="*80)
