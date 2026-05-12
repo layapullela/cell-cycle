@@ -21,3 +21,36 @@
         3. this seems to work best and we should not change it.
 
 
+4-5: 
+    we're trying to have multiple outputs simultaneously in the diffusion model 
+    lots of success with two phase outputs which is the first commit in multi-output branch
+    harder task with 4 phase output because one phase seems to collapse while another over compensates
+    we're doing parallel training in the decoder with cross attention -- this really helps!
+
+4-6: 
+   we need to do a major refactor so that the model can output the entire chromosome. this means that we cannot simply
+   restrict to the sliding window along the diagonal. however, those are the most important contacts, so we will 
+   leave the overlapping diagonal sliding windows in the training set as they are. however, we will need to add 
+   at least the same number of training examples that are from off the diagonal. we need to change the dataloader
+   to do the following
+   1. randomly sample training samples from the off diagonal (upper triangular part)
+      with weights inversely proportional to the distance of the crop from the diagonal. (we are more about
+      the model learning images closer to the diagonal than far away)
+
+   1. we should not be converting to upper triangular vectors anymore for any of the input or output samples
+      the model is already equipped to handle this, since upper triangular vectors get unraveled 
+      into a full matrix in the model anyways.we just need to change Dataloader and training, sampling procedure
+ 
+   3. now chip seq processing needs to change. we can't only rely on row attention anymore. we have to 
+   start by taking the outer product of chip_i and chip_j, where each is a B, 64, c_msa dimention vector.
+   then take the outer product, then axial attention with pair bias, then feed it to the linear layer + adanorm
+
+
+4-7: 
+   OOM issues!!
+   a couple of changes, 1. change msa size to 16 instead of 32 (we can prolly change this back)
+   2. num_workers = 4, and make sure each forked process has its own copy of the chip seq file handlers 
+   3. 2 GPUs? adding CPU ram to the sbatch call.
+   4. THIS IS THE BIG: no calling hic.straw anymore, preprocess all HiC into numpy and call that.
+      lets have a folder called zhang/oe/ch#/start-end_start-end.hic
+
