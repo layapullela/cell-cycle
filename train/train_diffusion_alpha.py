@@ -254,6 +254,137 @@ def ssim_1_minus_mean(
     return 1.0 - ssim_val
 
 
+############################################
+# IW-SSIM  (Information-Weighted SSIM)
+############################################
+def _gaussian_kernel_2d(
+    kernel_size: int, sigma: float, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    coords = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+    g = g / g.sum()
+    kernel = torch.outer(g, g)
+    return kernel / kernel.sum()
+
+
+def _depthwise_conv(x: torch.Tensor, kernel: torch.Tensor, pad: int) -> torch.Tensor:
+    """Apply a 2-D kernel independently to every channel of x: (B, C, H, W)."""
+    C = x.shape[1]
+    ks = kernel.shape[0]
+    k = kernel.view(1, 1, ks, ks).expand(C, 1, -1, -1).contiguous()
+    return F.conv2d(x, k, padding=pad, groups=C)
+
+
+def iw_ssim_map(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    win_size: int = 11,
+    win_sigma: float = 1.5,
+    data_range: float = _SSIM_DATA_RANGE,
+    n_scales: int = 4,
+) -> torch.Tensor:
+    """
+    Information-Weighted SSIM following Wang & Simoncelli (2005) as used in Hi-Compass.
+
+    At each scale the per-pixel SSIM values are averaged with weights derived from the
+    local variance of the reference image — regions with higher variance carry more
+    structural information (GSM approximation) and are given proportionally more weight.
+    Scales are combined multiplicatively using the MS-SSIM β exponents from the paper:
+        β = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+
+    Args:
+        pred, target : (B, C, H, W) in [-1, 1]
+        n_scales     : number of pyramid levels (4 recommended for 64×64 maps)
+
+    Returns:
+        (B, C) tensor of IW-SSIM values in (0, 1]
+    """
+    B, C, H, W = pred.shape
+    device, dtype = pred.device, pred.dtype
+
+    # Scale combination weights β (Wang et al. 2003 / Hi-Compass paper)
+    _betas_full = torch.tensor(
+        [0.0448, 0.2856, 0.3001, 0.2363, 0.1333], device=device, dtype=dtype
+    )
+    betas = _betas_full[:n_scales]
+    betas = betas / betas.sum()   # re-normalise in case n_scales < 5
+
+    C1 = (0.01 * data_range) ** 2   # luminance stability constant
+    C2 = (0.03 * data_range) ** 2   # contrast  stability constant
+
+    scale_vals: list[torch.Tensor] = []
+    p, t = pred, target
+
+    for s in range(n_scales):
+        _H, _W = p.shape[2], p.shape[3]
+        # Shrink window if the feature map has become smaller than win_size
+        _ws = min(win_size, _H, _W)
+        if _ws % 2 == 0:
+            _ws -= 1
+        if _ws < 3:
+            break
+        _pad = _ws // 2
+        kern = _gaussian_kernel_2d(_ws, win_sigma, device, dtype)
+
+        mu_p  = _depthwise_conv(p,     kern, _pad)
+        mu_t  = _depthwise_conv(t,     kern, _pad)
+        mu_p2 = mu_p * mu_p
+        mu_t2 = mu_t * mu_t
+        mu_pt = mu_p * mu_t
+
+        # Local variances and cross-covariance via E[x²] - μ²
+        var_p  = (_depthwise_conv(p * p, kern, _pad) - mu_p2).clamp(min=0.0)
+        var_t  = (_depthwise_conv(t * t, kern, _pad) - mu_t2).clamp(min=0.0)
+        cov_pt =  _depthwise_conv(p * t, kern, _pad) - mu_pt
+
+        # Per-pixel SSIM map
+        ssim_map = (
+            (2.0 * mu_pt + C1) * (2.0 * cov_pt + C2)
+        ) / (
+            (mu_p2 + mu_t2 + C1) * (var_p + var_t + C2).clamp(min=1e-8)
+        )  # (B, C, H', W')
+
+        # Information-content weights: local variance of the reference.
+        # Regions with larger signal variance contain more structural information
+        # (the GSM model assigns higher mutual information to high-variance patches).
+        info_w = var_t + 1e-6   # (B, C, H', W')
+
+        # Spatially weighted average of SSIM -> (B, C)
+        iw = (info_w * ssim_map).sum(dim=(-2, -1)) / info_w.sum(dim=(-2, -1))
+        scale_vals.append(iw)
+
+        if s < n_scales - 1:
+            p = F.avg_pool2d(p, kernel_size=2, stride=2)
+            t = F.avg_pool2d(t, kernel_size=2, stride=2)
+
+    n_actual = len(scale_vals)
+    if n_actual == 0:
+        return pred.new_ones(B, C)
+
+    betas_used = betas[:n_actual] / betas[:n_actual].sum()
+    stacked  = torch.stack(scale_vals, dim=0).clamp(min=1e-7, max=1.0)  # (n, B, C)
+    log_iw   = (betas_used[:, None, None] * stacked.log()).sum(dim=0)    # (B, C)
+    return log_iw.exp()
+
+
+def iw_ssim_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    win_size: int = 11,
+    win_sigma: float = 1.5,
+    data_range: float = _SSIM_DATA_RANGE,
+    n_scales: int = 4,
+) -> torch.Tensor:
+    """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels."""
+    return 1.0 - iw_ssim_map(
+        pred, target,
+        win_size=win_size, win_sigma=win_sigma,
+        data_range=data_range, n_scales=n_scales,
+    ).mean()
+
+
 # def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
 #     """Depthwise isotropic Gaussian blur. x: (B, C, H, W)."""
 #     _ks = kernel_size
@@ -369,7 +500,7 @@ def train_step(model, raw_model, optimizer, batch, device):
         raw_model: Underlying SR3UNet (model.module when DataParallel, else model itself).
                    Used directly for chip_aux_pred to avoid DP re-scattering a small tensor.
     Returns:
-        (total_loss, mse_loss, chip_aux_loss) as floats
+        (total_loss, mse_loss, iw_ssim_main_loss, chip_aux_loss) as floats
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -392,21 +523,28 @@ def train_step(model, raw_model, optimizer, batch, device):
         bulk_map,
     )
 
-    channel_weights  = torch.tensor([0.15, 0.15, 0.15, 0.40, 0.15], device=device)
+    channel_weights  = torch.tensor([0.133, 0.133, 0.133, 0.3, 0.3], device=device)
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (5,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # ---- Chip aux: SSIM between clean phase maps and chip-head prediction ----
-    chip_pred = raw_model.chip_aux_pred(h_chip)
-    chip_aux_loss = ssim_1_minus_mean(chip_pred, x0_current)
+    # ---- IW-SSIM on noise residuals: emphasises structurally rich regions ----
+    # iw_ssim_map returns (B, C); weight channels uniformly then reduce.
+    iw_ssim_per_channel = iw_ssim_map(eps_pred, eps_true)       # (B, C=5)
+    iw_ssim_per_channel_mean = iw_ssim_per_channel.mean(dim=0)  # (C=5)
+    iw_ssim_main_loss = (channel_weights * (1.0 - iw_ssim_per_channel_mean)).sum()
 
-    loss = mse_loss + chip_aux_loss / 10
+    # ---- Chip aux: IW-SSIM between clean phase maps and chip-head prediction ----
+    chip_pred = raw_model.chip_aux_pred(h_chip)
+    chip_aux_loss = iw_ssim_loss(chip_pred, x0_current)
+
+
+    loss = mse_loss + iw_ssim_main_loss + chip_aux_loss / 10
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), mse_loss.item(), chip_aux_loss.item()
+    return loss.item(), mse_loss.item(), iw_ssim_main_loss.item(), chip_aux_loss.item()
 
 
 ############################################
@@ -551,15 +689,16 @@ def main():
     print("="*80)
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_chip = [], [], []
+        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip = [], [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, chip = train_step(model, raw_model, optimizer, batch, DEVICE)
+            loss, mse, iw_ssim, chip = train_step(model, raw_model, optimizer, batch, DEVICE)
             epoch_losses.append(loss)
             epoch_mse.append(mse)
+            epoch_iw_ssim.append(iw_ssim)
             epoch_chip.append(chip)
             global_step += 1
 
@@ -568,19 +707,25 @@ def main():
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
             # Only update the progress bar postfix every 20 iterations to avoid printing every single iteration
             if global_step % 20 == 0:
-                pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'chip': f"{chip:.4f}"})
+                pbar.set_postfix({
+                    'total': f"{loss:.4f}",
+                    'mse': f"{mse:.4f}",
+                    'iw_ssim': f"{iw_ssim:.4f}",
+                    'chip': f"{chip:.4f}",
+                })
      
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
-              f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  chip={np.mean(epoch_chip):.6f}")
+              f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
+              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip={np.mean(epoch_chip):.6f}")
 
         # Save only selected epochs to reduce checkpoint churn.
         if (epoch + 1) in (10, 20, 30, 40):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_5_observed_wide_band.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_15.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix

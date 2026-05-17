@@ -195,7 +195,7 @@ STEP_PIXELS = 10
 RESOLUTION = 10_000
 REGION_SIZE = 640_000
 STEP_BP = STEP_PIXELS * RESOLUTION
-OFFDIAG_NEAR_BAND_BP = 1_000_000
+OFFDIAG_NEAR_BAND_BP = 5_000_000
 OFFDIAG_SAMPLES_PER_DIAG = 2
 
 
@@ -217,7 +217,7 @@ def _sample_offdiag(chrom: str, diag_positions: List[int], rng: np.random.Genera
     if near_steps.size == 0:
         return []
 
-    split = near_max_steps // 2
+    split = near_max_steps // 4
     if split <= 0 or split >= near_max_steps:
         weights = np.full_like(near_steps, 1.0 / float(near_steps.size), dtype=np.float64)
     else:

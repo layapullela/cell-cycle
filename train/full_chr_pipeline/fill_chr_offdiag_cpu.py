@@ -5,9 +5,9 @@ Every bin (i, j) is filled:
 
   - If near-diagonal diffusion wrote that bin (near_cnt > 0), use
         near_sum / near_cnt
-  - Else use the cheap approximation (same as before):
+  -   Else use the cheap approximation (same as before):
         phase_map[i,j] approx= bulk_raw[i,j] 
-    where bulk_raw = 0.25 * (early + mid + late + anatelo) in **raw** space.
+    where bulk_raw = 0.2 * (early + mid + late + anatelo + prometa) in **raw** space.
 
  This version covers the **entire** chromosome grid not just whats in prestore.
 
@@ -39,7 +39,7 @@ from prestore_hic import CHROMOSOME_SIZES
 # Keep this pipeline self-contained (avoid import-path issues under Slurm).
 RESOLUTION_BP = 10_000
 
-PHASES = ("earlyG1", "midG1", "lateG1", "anatelo")
+PHASES = ("earlyG1", "midG1", "lateG1", "anatelo", "prometa")
 
 
 def chrom_bins(chrom: str) -> int:
@@ -107,9 +107,10 @@ def main() -> None:
                 + np.asarray(raw["midG1"][i0:i1, j0:j1], dtype=np.float32)
                 + np.asarray(raw["lateG1"][i0:i1, j0:j1], dtype=np.float32)
                 + np.asarray(raw["anatelo"][i0:i1, j0:j1], dtype=np.float32)
+                + np.asarray(raw["prometa"][i0:i1, j0:j1], dtype=np.float32)
             )
-            bulk_raw *= 0.25  # mean of four phases
-            # Each phase ≈ (1/4) × total = (1/4) × (4 × mean) = mean.
+            bulk_raw *= 0.2  # mean of five phases
+            # Each phase ≈ (1/5) × total = (1/5) × (5 × mean) = mean.
             # The diffusion output is also in the same per-phase raw scale,
             # so using bulk_raw here gives a scale-compatible boundary.
             fallback = bulk_raw.astype(np.float32)
