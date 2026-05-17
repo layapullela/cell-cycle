@@ -18,7 +18,7 @@ PIPE_DIR="${WORKDIR}/full_chr_pipeline"
 CHROM="${CHROM:-2}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-16_asym-residual-loss.pth}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-30.pth}"
-CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_4phase_epoch40_5_5_observed_wide_band.pth}"
+CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch20_5_5_observed_wide_band_equal_weights.pth}"
 
 # These default to your repo structure; override as needed.
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn}"
@@ -51,7 +51,7 @@ EXPORT_FORMAT="${EXPORT_FORMAT:-short_with_score}"
 EXPORT_ROUND_INT="${EXPORT_ROUND_INT:-0}"
 
 source ~/.bashrc
-conda activate cell-cycle-v100
+conda activate test_env
 
 set -euo pipefail
 
@@ -120,7 +120,7 @@ fi
 
 if [[ "$SKIP_EXPORT" != "1" ]]; then
   echo "[4/4] Export Juicer sparse text -> $JUICER_DIR"
-  for PHASE in earlyG1 midG1 lateG1 anatelo; do
+  for PHASE in earlyG1 midG1 lateG1 anatelo prometa; do
     extra=()
     if [[ "$EXPORT_ROUND_INT" == "1" ]]; then
       extra+=(--round_int)

@@ -17,8 +17,8 @@ class CellCycleDataLoader:
 
     Each sample contains:
       region  : str, e.g. "1:10000000-10640000:10000000-10640000"
-      earlyG1, lateG1, midG1, anatelo : numpy arrays of shape (N, N) = (64, 64)
-      chip_seq_{mark}_row / _col       : numpy arrays of shape (N,) = (64,)
+      earlyG1, lateG1, midG1, anatelo, prometa : numpy arrays of shape (N, N) = (64, 64)
+      chip_seq_{mark}_row / _col                : numpy arrays of shape (N,) = (64,)
     """
 
     def __init__(
@@ -61,7 +61,7 @@ class CellCycleDataLoader:
                 f.write("region,phase,min,max\n")
             print(f"Saving normalization stats to: {self.normalization_stats_file}")
 
-        self.phase_names = ('earlyG1', 'midG1', 'lateG1', 'anatelo')
+        self.phase_names = ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')
         self.phase_paths: Dict[str, Path] = {}
         self._chipseq_paths: Dict[str, Optional[str]] = {}
         self.chipseq_files: Dict[str, Optional[object]] = {}
@@ -348,7 +348,7 @@ class CellCycleDataLoader:
         sample = {'region': region}
 
         # ---- Hi-C phases (same normalisation as the live path) ----
-        for phase in ('earlyG1', 'midG1', 'lateG1', 'anatelo'):
+        for phase in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa'):
             mat = data[phase].copy()                   # (N, N) raw counts
 
             if self.use_log_transform:
@@ -394,8 +394,8 @@ class CellCycleDataLoader:
         """
         Returns a sample dict with:
           region           : str
-          earlyG1, midG1, lateG1, anatelo : float32 (N, N) matrices, normalised to [-1,1]
-          chip_seq_{mark}_row / _col       : float32 (N,) log1p ChIP-seq signals
+          earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) matrices, normalised to [-1,1]
+          chip_seq_{mark}_row / _col                : float32 (N,) log1p ChIP-seq signals
         """
         if isinstance(idx, str):
             region = idx

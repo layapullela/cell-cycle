@@ -38,7 +38,7 @@ from prestore_hic import (
 N = 64
 RESOLUTION_BP = 10_000
 
-PHASES = ("earlyG1", "midG1", "lateG1", "anatelo")
+PHASES = ("earlyG1", "midG1", "lateG1", "anatelo", "prometa")
 
 
 def chrom_bins(chrom: str) -> int:
@@ -208,8 +208,8 @@ def main() -> None:
                 bulk = np.zeros((B, N, N), dtype=np.float32)
                 chip_row = np.zeros((B, 4, N), dtype=np.float32)
                 chip_col = np.zeros((B, 4, N), dtype=np.float32)
-                lo = np.zeros((B, 4), dtype=np.float32)
-                hi = np.zeros((B, 4), dtype=np.float32)
+                lo = np.zeros((B, 5), dtype=np.float32)
+                hi = np.zeros((B, 5), dtype=np.float32)
                 lo_bulk = np.zeros((B,), dtype=np.float32)
                 hi_bulk = np.zeros((B,), dtype=np.float32)
 
@@ -230,16 +230,17 @@ def main() -> None:
                         # hi[bi, pi] = hi_i
 
                     # make the bulk
-                    bulk[bi] = 0.25 * (norm_ph["earlyG1"] + norm_ph["midG1"] + norm_ph["lateG1"] + norm_ph["anatelo"])
+                    bulk[bi] = 0.2 * (norm_ph["earlyG1"] + norm_ph["midG1"] + norm_ph["lateG1"] + norm_ph["anatelo"] + norm_ph["prometa"])
 
                     # Bulk lo/hi for denormalization: derived from the raw bulk patch so that
                     # all phase outputs are rescaled on a common bulk-anchored scale, matching
                     # the inference scenario where only bulk data is available.
-                    raw_bulk = 0.25 * (
+                    raw_bulk = 0.2 * (
                         np.asarray(raw_phase["earlyG1"][i0:i0 + N, j0:j0 + N], dtype=np.float32)
                         + np.asarray(raw_phase["midG1"][i0:i0 + N, j0:j0 + N], dtype=np.float32)
                         + np.asarray(raw_phase["lateG1"][i0:i0 + N, j0:j0 + N], dtype=np.float32)
                         + np.asarray(raw_phase["anatelo"][i0:i0 + N, j0:j0 + N], dtype=np.float32)
+                        + np.asarray(raw_phase["prometa"][i0:i0 + N, j0:j0 + N], dtype=np.float32)
                     )
                     _, lo_bulk[bi], hi_bulk[bi] = normalize_patch(raw_bulk, use_log1p)
 
@@ -262,7 +263,7 @@ def main() -> None:
                     row_t[0], row_t[1], row_t[2], row_t[3],
                     col_t[0], col_t[1], col_t[2], col_t[3],
                     enforce_symmetry=enforce_sym,
-                ).cpu().numpy().astype(np.float32)  # (B,4,N,N) normalized
+                ).cpu().numpy().astype(np.float32)  # (B,5,N,N) normalized
 
                 for pi, ph in enumerate(PHASES):
                     # denorm each patch by bulk lo and hi
