@@ -40,29 +40,68 @@ RESOLUTION_BP = 10_000
 
 PHASES = ("earlyG1", "midG1", "lateG1", "anatelo", "prometa")
 
+# Boundary separating "near" from "far" off-diagonal tiles.
+# Tiles with midpoint_gap <= this use DIAG_STEP_NEAR_BP row spacing;
+# tiles beyond it use DIAG_STEP_FAR_BP row spacing.
+NEAR_FAR_THRESHOLD_BP = 1_000_000
+
 
 def chrom_bins(chrom: str) -> int:
     return int(math.ceil(CHROMOSOME_SIZES[str(chrom)] / RESOLUTION_BP))
 
 
-def regions_for_chrom(chrom: str, diag_step_bp: int) -> list[str]:
+def regions_for_chrom(
+    chrom: str,
+    diag_step_near_bp: int,
+    diag_step_far_bp: int,
+    near_far_threshold_bp: int = NEAR_FAR_THRESHOLD_BP,
+) -> list[str]:
+    """Generate all near-diagonal tile regions for a chromosome.
+
+    Diagonal row positions are sampled at two different densities:
+      - diag_step_near_bp: step for tiles whose midpoint_gap ≤ near_far_threshold_bp
+        (includes the diagonal tiles themselves, i.e. midpoint_gap = 0)
+      - diag_step_far_bp:  step for tiles whose midpoint_gap > near_far_threshold_bp
+
+    midpoint_gap of an off-diagonal tile is exactly k * STEP_BP, where k is the
+    column offset index. The column offsets always advance in STEP_BP increments to
+    match the training distribution (capped at OFFDIAG_NEAR_BAND_BP).
+    """
     size_bp = CHROMOSOME_SIZES[str(chrom)]
-    diag_step_bp = int(diag_step_bp)
-    if diag_step_bp <= 0:
-        raise ValueError(f"diag_step_bp must be > 0, got {diag_step_bp}")
-    diag_pos = list(range(MIN_START, size_bp - REGION_SIZE + 1, diag_step_bp))
-    diag = [f"{chrom}:{s}-{s + REGION_SIZE}:{s}-{s + REGION_SIZE}" for s in diag_pos]
-    # Generate every off-diagonal tile within OFFDIAG_NEAR_BAND_BP of the diagonal.
-    # Column offsets advance in STEP_BP (100 kb) increments so coverage matches the
-    # training distribution (midpoint_gap = k * STEP_BP ≤ OFFDIAG_NEAR_BAND_BP).
-    off: list[str] = []
-    n_offdiag_steps = OFFDIAG_NEAR_BAND_BP // STEP_BP
-    for rs in diag_pos:
-        for k in range(1, n_offdiag_steps + 1):
+    diag_step_near_bp = int(diag_step_near_bp)
+    diag_step_far_bp  = int(diag_step_far_bp)
+    if diag_step_near_bp <= 0 or diag_step_far_bp <= 0:
+        raise ValueError(
+            f"diag step sizes must be > 0, got near={diag_step_near_bp} far={diag_step_far_bp}"
+        )
+
+    near_diag_pos = list(range(MIN_START, size_bp - REGION_SIZE + 1, diag_step_near_bp))
+    far_diag_pos  = list(range(MIN_START, size_bp - REGION_SIZE + 1, diag_step_far_bp))
+
+    # k bounds: midpoint_gap = k * STEP_BP
+    k_near_max = near_far_threshold_bp // STEP_BP   # last k that is "near"
+    k_far_max  = OFFDIAG_NEAR_BAND_BP   // STEP_BP  # training-distribution cap
+
+    regs: list[str] = []
+
+    # Diagonal tiles (midpoint_gap = 0) and near off-diagonal (gap ≤ threshold)
+    # both use the fine near step.
+    for s in near_diag_pos:
+        regs.append(f"{chrom}:{s}-{s + REGION_SIZE}:{s}-{s + REGION_SIZE}")
+    for rs in near_diag_pos:
+        for k in range(1, k_near_max + 1):
             cs = rs + k * STEP_BP
             if cs + REGION_SIZE <= size_bp:
-                off.append(f"{chrom}:{rs}-{rs + REGION_SIZE}:{cs}-{cs + REGION_SIZE}")
-    return diag + off
+                regs.append(f"{chrom}:{rs}-{rs + REGION_SIZE}:{cs}-{cs + REGION_SIZE}")
+
+    # Far off-diagonal (gap > threshold) uses the coarse far step.
+    for rs in far_diag_pos:
+        for k in range(k_near_max + 1, k_far_max + 1):
+            cs = rs + k * STEP_BP
+            if cs + REGION_SIZE <= size_bp:
+                regs.append(f"{chrom}:{rs}-{rs + REGION_SIZE}:{cs}-{cs + REGION_SIZE}")
+
+    return regs
 
 
 def parse_region(region: str) -> tuple[str, int, int, int, int]:
@@ -153,10 +192,45 @@ def main() -> None:
     p.add_argument("--no_log1p", action="store_true")
     p.add_argument("--batch_size", type=int, default=8, help="Number of patches per diffusion call (default: 8).")
     p.add_argument(
-        "--diag_step_bp",
+        "--diag_step_near_bp",
         type=int,
         default=int(REGION_SIZE),
-        help="Step size for diagonal tiles in base pairs (default: REGION_SIZE = 640000 for non-overlap).",
+        help=(
+            "Row-position step for tiles within NEAR_FAR_THRESHOLD_BP of the diagonal "
+            "(default: REGION_SIZE = 640000, i.e. no overlap). "
+            "Decrease for denser coverage near the diagonal (e.g. 80000 = 87.5%% overlap)."
+        ),
+    )
+    p.add_argument(
+        "--diag_step_far_bp",
+        type=int,
+        default=int(REGION_SIZE),
+        help=(
+            "Row-position step for tiles beyond NEAR_FAR_THRESHOLD_BP from the diagonal "
+            "(default: REGION_SIZE = 640000, i.e. no overlap). "
+            "Typically coarser than --diag_step_near_bp (e.g. 320000 = 50%% overlap)."
+        ),
+    )
+    p.add_argument(
+        "--near_far_threshold_bp",
+        type=int,
+        default=NEAR_FAR_THRESHOLD_BP,
+        help=(
+            "Midpoint-gap boundary (bp) separating near from far off-diagonal tiles "
+            f"(default: {NEAR_FAR_THRESHOLD_BP} = 1 Mbp)."
+        ),
+    )
+    p.add_argument(
+        "--shard_id",
+        type=int,
+        default=0,
+        help="Index of this shard (0-based). Used to split regions across multiple GPUs.",
+    )
+    p.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Total number of shards. Regions are distributed round-robin: shard k processes regs[k::num_shards].",
     )
     args = p.parse_args()
 
@@ -168,6 +242,13 @@ def main() -> None:
     L = chrom_bins(chrom)
     use_log1p = not args.no_log1p
 
+    # Resolve sharding early so shard_suffix is available for output file names.
+    num_shards = max(int(args.num_shards), 1)
+    shard_id   = int(args.shard_id)
+    if shard_id < 0 or shard_id >= num_shards:
+        raise ValueError(f"shard_id {shard_id} out of range [0, {num_shards})")
+    shard_suffix = f"_shard{shard_id}" if num_shards > 1 else ""
+
     raw_phase = {ph: np.load(arrays_dir / f"chr{chrom}_{ph}_raw.npy", mmap_mode="r") for ph in PHASES}
     chip = {
         "ctcf": np.load(arrays_dir / f"chr{chrom}_chip_ctcf.npy", mmap_mode="r"),
@@ -176,17 +257,30 @@ def main() -> None:
         "h3k4me3": np.load(arrays_dir / f"chr{chrom}_chip_h3k4me3.npy", mmap_mode="r"),
     }
 
-    pred_sum = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_raw.npy", (L, L), np.float32) for ph in PHASES}
-    pred_cnt = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_cnt.npy", (L, L), np.int32) for ph in PHASES}
+    pred_sum = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_raw{shard_suffix}.npy", (L, L), np.float32) for ph in PHASES}
+    pred_cnt = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_cnt{shard_suffix}.npy", (L, L), np.int32) for ph in PHASES}
     # store counts when we sum overlapping tiles so later we can average over them
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_checkpoint(Path(args.checkpoint), device)
     infer = Inference(model, device, T=1000)
 
-    regs_all = regions_for_chrom(chrom, diag_step_bp=args.diag_step_bp) # generate all regions to run (matches training dist)
+    regs_all = regions_for_chrom(
+        chrom,
+        diag_step_near_bp=args.diag_step_near_bp,
+        diag_step_far_bp=args.diag_step_far_bp,
+        near_far_threshold_bp=args.near_far_threshold_bp,
+    )  # generate all regions to run (matches training dist)
     regs = [r for r in regs_all if midpoint_gap(*parse_region(r)[1:]) <= args.near_band_bp] # filter to only near-diag tiles
-    print(f"Near-diagonal patches: {len(regs)} / {len(regs_all)}")
+    # Contiguous split: shard k owns a spatially-localised block of regions so that
+    # each worker covers a contiguous coordinate window of the chromosome.
+    chunk = math.ceil(len(regs) / num_shards)
+    regs = regs[shard_id * chunk : (shard_id + 1) * chunk]
+    print(
+        f"Near-diagonal patches (shard {shard_id}/{num_shards}): {len(regs)} "
+        f"[near_step={args.diag_step_near_bp} far_step={args.diag_step_far_bp} "
+        f"threshold={args.near_far_threshold_bp}]"
+    )
 
     with torch.no_grad():
         bs = max(int(args.batch_size), 1)
