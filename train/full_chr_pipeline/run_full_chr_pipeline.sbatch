@@ -1,13 +1,20 @@
 #!/bin/bash
 #SBATCH --job-name=chr_full_pipe
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --time=12:00:00
+#SBATCH --gres=gpu
+#SBATCH --time=30:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=4
 #SBATCH --output=logs/full_chr_pipeline_%j.out
 #SBATCH --error=logs/full_chr_pipeline_%j.err
 #SBATCH --account=minjilab99
+# Recommended invocation (2 GPUs, fine near-diagonal coverage, 5 Mbp band):
+#   CHROM=2 NUM_GPUS=2 BATCH_SIZE=64 \
+#     DIAG_STEP_NEAR_BP=80000 DIAG_STEP_FAR_BP=320000 NEAR_BAND_BP=5000000 \
+#     sbatch --gres=gpu:2 full_chr_pipeline/run_full_chr_pipeline.sbatch
+#
+# Single GPU (slower):
+#   NUM_GPUS=1 sbatch --gres=gpu:1 full_chr_pipeline/run_full_chr_pipeline.sbatch
 
 
 # Do not use `set -u` before sourcing bashrc/conda: /etc/bashrc uses
@@ -15,10 +22,10 @@
 WORKDIR="/nfs/turbo/umms-minjilab/lpullela/cell-cycle/train"
 PIPE_DIR="${WORKDIR}/full_chr_pipeline"
 
-CHROM="${CHROM:-2}"
+CHROM="${CHROM:-14}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-16_asym-residual-loss.pth}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-30.pth}"
-CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch20_5_5_observed_wide_band_equal_weights.pth}"
+CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_5_15.pth}" # chr14
 
 # These default to your repo structure; override as needed.
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn}"
@@ -32,9 +39,21 @@ JUICER_DIR="${JUICER_DIR:-${OUT_BASE}/juicer_txt}"
 
 HIC_UNIT="${HIC_UNIT:-observed}"   # oe or observed
 NORM="${NORM:-KR}"
-NEAR_BAND_BP="${NEAR_BAND_BP:-640000}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
-DIAG_STEP_BP="${DIAG_STEP_BP:-640000}"
+NEAR_BAND_BP="${NEAR_BAND_BP:-5000000}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+# Step sizes for diagonal tile row positions.
+# DIAG_STEP_NEAR_BP applies to tiles within NEAR_FAR_THRESHOLD_BP of the diagonal.
+# DIAG_STEP_FAR_BP  applies to tiles beyond NEAR_FAR_THRESHOLD_BP.
+# Lower step = finer overlap (e.g. 80000 = 87.5%, 320000 = 50%, 640000 = no overlap).
+DIAG_STEP_NEAR_BP="${DIAG_STEP_NEAR_BP:-160000}"
+DIAG_STEP_FAR_BP="${DIAG_STEP_FAR_BP:-240000}"
+NEAR_FAR_THRESHOLD_BP="${NEAR_FAR_THRESHOLD_BP:-2500000}"
+# Number of GPUs to use for the near-diagonal inference step.
+# Each GPU gets a contiguous spatial block of regions (e.g. with 2 GPUs:
+#   GPU 0 → first half of the chromosome, GPU 1 → second half).
+# IMPORTANT: --gres=gpu:NUM_GPUS must match (pass via sbatch --gres=gpu:N or
+# edit the #SBATCH --gres line at the top of this file).
+NUM_GPUS="${NUM_GPUS:-1}"
 
 # Step controls (set to 1 to skip). This script never deletes outputs.
 # Typical Juicer text-only rerun:
@@ -71,8 +90,8 @@ echo "Checkpoint: $CHECKPOINT"
 echo "DATA_DIR: $DATA_DIR"
 echo "OUT_BASE: $OUT_BASE"
 echo "HIC_UNIT: $HIC_UNIT   NORM: $NORM   NEAR_BAND_BP: $NEAR_BAND_BP"
-echo "BATCH_SIZE: $BATCH_SIZE"
-echo "DIAG_STEP_BP: $DIAG_STEP_BP"
+echo "BATCH_SIZE: $BATCH_SIZE   NUM_GPUS: $NUM_GPUS"
+echo "DIAG_STEP_NEAR_BP: $DIAG_STEP_NEAR_BP   DIAG_STEP_FAR_BP: $DIAG_STEP_FAR_BP   NEAR_FAR_THRESHOLD_BP: $NEAR_FAR_THRESHOLD_BP"
 echo "ONLY_EXPORT: $ONLY_EXPORT"
 echo "SKIP_EXTRACT / SKIP_INFER / SKIP_FILL / SKIP_EXPORT: $SKIP_EXTRACT / $SKIP_INFER / $SKIP_FILL / $SKIP_EXPORT"
 echo "EXPORT_FORMAT: $EXPORT_FORMAT"
@@ -93,15 +112,47 @@ else
 fi
 
 if [[ "$SKIP_INFER" != "1" ]]; then
-  echo "[2/4] Near-diagonal GPU inference -> $NEAR_DIR"
-  python "${PIPE_DIR}/infer_chr_near_diag_gpu.py" \
-    --chrom "$CHROM" \
-    --checkpoint "$CHECKPOINT" \
-    --arrays_dir "$ARRAYS_DIR" \
-    --output_dir "$NEAR_DIR" \
-    --near_band_bp "$NEAR_BAND_BP" \
-    --batch_size "$BATCH_SIZE" \
-    --diag_step_bp "$DIAG_STEP_BP"
+  echo "[2/4] Near-diagonal GPU inference -> $NEAR_DIR  (NUM_GPUS=$NUM_GPUS)"
+  if [[ "$NUM_GPUS" -gt 1 ]]; then
+    # Launch one worker per GPU in parallel; each owns every NUM_GPUS-th region.
+    pids=()
+    for (( k=0; k<NUM_GPUS; k++ )); do
+      CUDA_VISIBLE_DEVICES=$k python "${PIPE_DIR}/infer_chr_near_diag_gpu.py" \
+        --chrom "$CHROM" \
+        --checkpoint "$CHECKPOINT" \
+        --arrays_dir "$ARRAYS_DIR" \
+        --output_dir "$NEAR_DIR" \
+        --near_band_bp "$NEAR_BAND_BP" \
+        --batch_size "$BATCH_SIZE" \
+        --diag_step_near_bp "$DIAG_STEP_NEAR_BP" \
+        --diag_step_far_bp "$DIAG_STEP_FAR_BP" \
+        --near_far_threshold_bp "$NEAR_FAR_THRESHOLD_BP" \
+        --shard_id "$k" \
+        --num_shards "$NUM_GPUS" &
+      pids+=($!)
+    done
+    # Wait for all workers; abort the job if any fail.
+    for pid in "${pids[@]}"; do
+      wait "$pid" || { echo "ERROR: inference shard failed (pid $pid)"; exit 1; }
+    done
+    echo "  All shards complete. Merging..."
+    python "${PIPE_DIR}/merge_near_diag_shards.py" \
+      --chrom "$CHROM" \
+      --near_dir "$NEAR_DIR" \
+      --num_shards "$NUM_GPUS" \
+      --delete_shards
+  else
+    python "${PIPE_DIR}/infer_chr_near_diag_gpu.py" \
+      --chrom "$CHROM" \
+      --checkpoint "$CHECKPOINT" \
+      --arrays_dir "$ARRAYS_DIR" \
+      --output_dir "$NEAR_DIR" \
+      --near_band_bp "$NEAR_BAND_BP" \
+      --batch_size "$BATCH_SIZE" \
+      --diag_step_near_bp "$DIAG_STEP_NEAR_BP" \
+      --diag_step_far_bp "$DIAG_STEP_FAR_BP" \
+      --near_far_threshold_bp "$NEAR_FAR_THRESHOLD_BP"
+  fi
 else
   echo "[2/4] SKIP near-diagonal inference (reuse $NEAR_DIR)"
 fi
