@@ -132,54 +132,19 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
 
 
 ############################################
-# 3) VALIDATION SET (chr2, excluding test-eval regions)
+# 3) VALIDATION SET (random holdout sample)
 ############################################
-TEST_EVAL_TARGET_RANGES_CHR2 = [
-    (44700000, 45100000),
-    (18400000, 19400000),
-]
+VAL_SPLIT_SEED = 42
 
 
-def _parse_region(region_str: str):
-    """
-    Parse region string to (chrom, start, end).
-
-    Handles:
-      "chrom:start-end"                           (legacy diagonal)
-      "chrom:row_start-row_end:col_start-col_end" (new format)
-
-    For the new format, start = row_start and end = col_end (full genomic span).
-    """
-    parts = region_str.split(":")
-    chrom = parts[0]
-    row_start, row_end = map(int, parts[1].split("-"))
-    if len(parts) == 3:
-        _, col_end = map(int, parts[2].split("-"))
-        return chrom, row_start, col_end   # full genomic span
-    return chrom, row_start, row_end
-
-
-def _region_overlaps_any(region_str, ranges):
-    """True if region overlaps any (t_start, t_end) in ranges."""
-    _, start, end = _parse_region(region_str)
-    for t_start, t_end in ranges:
-        if start < t_end and end > t_start:
-            return True
-    return False
-
-
-def get_validation_regions_chr2(holdout_regions, n=10, seed=42):
-    """
-    From chr2 holdout regions (diagonal only), exclude test-eval targets,
-    then return n regions for validation.
-    """
+def get_validation_regions(holdout_regions, n=10, seed=VAL_SPLIT_SEED):
+    """Sample ``n`` validation regions from holdout tiles (reproducible via ``seed``)."""
+    if not holdout_regions:
+        return []
     rng = np.random.default_rng(seed)
-    valid = [r for r in holdout_regions
-             if not _region_overlaps_any(r, TEST_EVAL_TARGET_RANGES_CHR2)]
-    if len(valid) <= n:
-        return valid
-    indices = rng.choice(len(valid), size=n, replace=False)
-    return [valid[i] for i in indices]
+    n_val = min(n, len(holdout_regions))
+    indices = rng.choice(len(holdout_regions), size=n_val, replace=False)
+    return [holdout_regions[i] for i in indices]
 
 
 ############################################
@@ -202,7 +167,7 @@ def _build_targets(batch, device):
     x0_prometa = batch["prometa"].float().to(device)
 
     x0_current = torch.stack([x0_early, x0_mid, x0_late, x0_anatelo, x0_prometa], dim=1)  # (B, 5, N, N)
-    bulk_map   = (x0_early + x0_mid + x0_late + x0_anatelo + x0_prometa).mul(0.2).unsqueeze(1)  # (B, 1, N, N)
+    bulk_map   = batch["bulk"].float().to(device).unsqueeze(1)  # (B, 1, N, N)  — sum-then-normalize
 
     chip_ctcf_row = batch["chip_seq_ctcf_row"].float().to(device)
     chip_hac_row  = batch["chip_seq_hac_row"].float().to(device)
@@ -599,7 +564,7 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "2"
+    HOLD_OUT_CHROMOSOME = "14"
 
     processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
     if not processed_data_dir.exists():
@@ -657,10 +622,10 @@ def main():
 
     test_dataset = HoldoutDataset(cell_cycle_loader_eval, holdout_regions)
 
-    NUM_VAL_SAMPLES     = 30
-    validation_regions  = get_validation_regions_chr2(holdout_regions, n=NUM_VAL_SAMPLES)
+    NUM_VAL_SAMPLES = 30
+    validation_regions = get_validation_regions(holdout_regions, n=NUM_VAL_SAMPLES)
     if not validation_regions:
-        raise ValueError("No chr2 regions left for validation after excluding test-eval targets")
+        raise ValueError(f"No holdout regions on chr{HOLD_OUT_CHROMOSOME} for validation")
 
     val_dataset    = HoldoutDataset(cell_cycle_loader_eval, validation_regions)
     val_dataloader = TorchDataLoader(
@@ -670,7 +635,7 @@ def main():
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
-    print(f"Validation regions (chr2, excluding test-eval): "
+    print(f"Validation regions (chr{HOLD_OUT_CHROMOSOME}, seed={VAL_SPLIT_SEED}): "
           f"{validation_regions[:3]}{'...' if len(validation_regions) > 3 else ''} "
           f"(n={len(validation_regions)})")
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}, Val: {len(val_dataset)}")
@@ -721,11 +686,11 @@ def main():
               f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip={np.mean(epoch_chip):.6f}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (10, 20, 30, 40):
+        if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_15.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_30_bulk_norm.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix

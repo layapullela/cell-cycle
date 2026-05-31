@@ -3,7 +3,7 @@ Utility to reverse the normalization applied in the dataloader.
 
 The dataloader normalization process:
 1. (possibly, depending on whether we use observed or observed/expected) log1p(x) - log transform raw counts
-2. Clip at 99.9th percentile
+2. Clip at 99.5th percentile
 3. Min-max normalization to [0, 1]
 4. Scale to [-1, 1]: x * 2 - 1
 
