@@ -63,6 +63,9 @@ class CellCycleDataset(Dataset):
 ############################################
 # Five-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo, prometa)
 # Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo, 4=prometa.
+PHASE_IDX_EARLYG1 = 0
+PHASE_IDX_ANATELO = 3
+PHASE_IDX_PROMETA = 4
 
 N = 64                           # contact map size (64 x 64)
 
@@ -350,6 +353,49 @@ def iw_ssim_loss(
     ).mean()
 
 
+def _phase_flat_vec(maps: torch.Tensor, phase_idx: int) -> torch.Tensor:
+    """Flatten one phase map per sample: (B, N, N) → (B, N*N)."""
+    return maps[:, phase_idx].reshape(maps.shape[0], -1)
+
+
+def _batch_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Per-sample dot product. a, b: (B, D) → (B,)."""
+    return (a * b).sum(dim=-1)
+
+
+def chip_phase_similarity_loss(
+    chip_pred: torch.Tensor,
+    x0_true: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Match pairwise dot-product similarities between earlyG1, anatelo, and prometa.
+
+    Predicted similarities come from per-phase maps produced by the chip aux head
+    (a linear projection of h_chip).  Target similarities use the ground-truth
+    clean Hi-C maps for the same three phases.
+    """
+    pred_early = _phase_flat_vec(chip_pred, PHASE_IDX_EARLYG1)
+    pred_ana   = _phase_flat_vec(chip_pred, PHASE_IDX_ANATELO)
+    pred_pro   = _phase_flat_vec(chip_pred, PHASE_IDX_PROMETA)
+
+    true_early = _phase_flat_vec(x0_true, PHASE_IDX_EARLYG1)
+    true_ana   = _phase_flat_vec(x0_true, PHASE_IDX_ANATELO)
+    true_pro   = _phase_flat_vec(x0_true, PHASE_IDX_PROMETA)
+
+    pred_sims = (
+        _batch_dot(pred_pro, pred_ana),
+        _batch_dot(pred_ana, pred_early),
+        _batch_dot(pred_pro, pred_early),
+    )
+    true_sims = (
+        _batch_dot(true_pro, true_ana).detach(),
+        _batch_dot(true_ana, true_early).detach(),
+        _batch_dot(true_pro, true_early).detach(),
+    )
+
+    return sum(F.mse_loss(p, t) for p, t in zip(pred_sims, true_sims)) / len(pred_sims)
+
+
 # def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
 #     """Depthwise isotropic Gaussian blur. x: (B, C, H, W)."""
 #     _ks = kernel_size
@@ -465,7 +511,7 @@ def train_step(model, raw_model, optimizer, batch, device):
         raw_model: Underlying SR3UNet (model.module when DataParallel, else model itself).
                    Used directly for chip_aux_pred to avoid DP re-scattering a small tensor.
     Returns:
-        (total_loss, mse_loss, iw_ssim_main_loss, chip_aux_loss) as floats
+        (total_loss, mse_loss, iw_ssim_main_loss, chip_aux_loss, chip_sim_loss) as floats
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -502,14 +548,21 @@ def train_step(model, raw_model, optimizer, batch, device):
     chip_pred = raw_model.chip_aux_pred(h_chip)
     chip_aux_loss = iw_ssim_loss(chip_pred, x0_current)
 
+    # ---- Chip phase similarity: match prometa↔anatelo, anatelo↔earlyG1, prometa↔earlyG1 dot products ----
+    chip_sim_loss = chip_phase_similarity_loss(chip_pred, x0_current)
 
-    loss = mse_loss + iw_ssim_main_loss + chip_aux_loss / 10
+    loss = mse_loss + iw_ssim_main_loss + chip_aux_loss + chip_sim_loss * 10e-7
+
+    #breakpoint()
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), mse_loss.item(), iw_ssim_main_loss.item(), chip_aux_loss.item()
+    return (
+        loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
+        chip_aux_loss.item(), chip_sim_loss.item() * 10e-7,
+    )
 
 
 ############################################
@@ -654,17 +707,20 @@ def main():
     print("="*80)
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip = [], [], [], []
+        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip, epoch_chip_sim = [], [], [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, iw_ssim, chip = train_step(model, raw_model, optimizer, batch, DEVICE)
+            loss, mse, iw_ssim, chip, chip_sim = train_step(
+                model, raw_model, optimizer, batch, DEVICE,
+            )
             epoch_losses.append(loss)
             epoch_mse.append(mse)
             epoch_iw_ssim.append(iw_ssim)
             epoch_chip.append(chip)
+            epoch_chip_sim.append(chip_sim)
             global_step += 1
 
             if global_step % 100 == 0:
@@ -677,20 +733,22 @@ def main():
                     'mse': f"{mse:.4f}",
                     'iw_ssim': f"{iw_ssim:.4f}",
                     'chip': f"{chip:.4f}",
+                    'chip_sim': f"{chip_sim:.4f}",
                 })
      
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
-              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip={np.mean(epoch_chip):.6f}")
+              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip={np.mean(epoch_chip):.6f}  "
+              f"chip_sim={np.mean(epoch_chip_sim):.6f}")
 
         # Save only selected epochs to reduce checkpoint churn.
         if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_30_bulk_norm.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_5_30_bulk_norm_ssim_and_phase_sim.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
