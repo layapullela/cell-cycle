@@ -669,21 +669,28 @@ class SR3UNet(nn.Module):
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
 
-        # ---- AUXILIARY CHIP HEAD ----
-        # Predicts an auxiliary (B,5,N,N) target from chip features.
-        self.chip_pred_head = nn.Conv2d(self.c_pair, 5, kernel_size=1)
-        nn.init.zeros_(self.chip_pred_head.weight)
-        nn.init.zeros_(self.chip_pred_head.bias)
+        # ---- LOOP CLASSIFICATION HEAD ----
+        # Predicts loop presence/type in the contact map from ChIP-seq pair features.
+        # Classes: 0=no loop, 1=cluster-1/2 loop, 2=cluster-3 loop.
+        # Input: global-average-pool of h_chip → (B, c_pair).
+        # Output: (B, 3) logits; softmax gives class probabilities.
+        self.loop_class_head = nn.Linear(self.c_pair, 3)
+        nn.init.zeros_(self.loop_class_head.weight)
+        nn.init.zeros_(self.loop_class_head.bias)
 
     # ------------------------------------------------------------------
-    def chip_aux_pred(self, h_chip: torch.Tensor) -> torch.Tensor:
+    def loop_class_logits(self, h_chip: torch.Tensor) -> torch.Tensor:
         """
+        Predict loop presence/type from ChIP-seq pair features.
+
         Args:
             h_chip: (B, c_pair, N, N)
         Returns:
-            (B, 5, N, N) predicted auxiliary target (MSE target in training)
+            (B, 3) logits — apply softmax to get class probabilities.
+            Classes: 0=no loop, 1=cluster-1/2 loop, 2=cluster-3 loop.
         """
-        return self.chip_pred_head(h_chip)
+        pooled = h_chip.mean(dim=(-2, -1))          # (B, c_pair)
+        return self.loop_class_head(pooled)          # (B, 3)
 
     # ------------------------------------------------------------------
     def forward(

@@ -241,6 +241,11 @@ def main() -> None:
         default=1,
         help="Total number of shards. Regions are distributed round-robin: shard k processes regs[k::num_shards].",
     )
+    p.add_argument(
+        "--no_hanning",
+        action="store_true",
+        help="Disable the 2-D Hanning window when merging overlapping tiles (uniform weights).",
+    )
     args = p.parse_args()
 
     chrom = str(args.chrom)
@@ -266,7 +271,7 @@ def main() -> None:
         "h3k4me3": np.load(arrays_dir / f"chr{chrom}_chip_h3k4me3.npy", mmap_mode="r"),
     }
 
-    # 2-D Hanning window for weighted accumulation.
+    # 2-D Hanning window for weighted accumulation (optional).
     # Using hanning(N+2)[1:-1] avoids the exact zeros at the endpoints of the standard
     # window, so every pixel that falls within any tile gets a positive weight.
     # The outer product gives a smooth bell that peaks at the tile centre and tapers
@@ -274,8 +279,12 @@ def main() -> None:
     # by tiles whose *centre* lies close to that pixel's diagonal distance, rather than
     # by diagonal tiles that happen to reach far-off-diagonal corners — which is the
     # root cause of the too-thick diagonal band seen in prometa.
-    _h = np.hanning(N + 2)[1:-1].astype(np.float32)   # (N,) positive bell, no zeros
-    hann_2d = np.outer(_h, _h).astype(np.float32)      # (N, N), symmetric
+    # With --no_hanning, use uniform weights (equivalent to a plain sum/mean over tiles).
+    if args.no_hanning:
+        hann_2d = np.ones((N, N), dtype=np.float32)
+    else:
+        _h = np.hanning(N + 2)[1:-1].astype(np.float32)   # (N,) positive bell, no zeros
+        hann_2d = np.outer(_h, _h).astype(np.float32)      # (N, N), symmetric
 
     # Accumulators — each tile's prediction is denormalized to COUNT space using that tile's
     # own bulk (lo, hi) and accumulated with a Hanning weight.  fill_chr_offdiag_cpu.py forms
@@ -322,7 +331,7 @@ def main() -> None:
     print(
         f"Near-diagonal patches (shard {shard_id}/{num_shards}): {len(regs)} "
         f"[near_step={args.diag_step_near_bp} far_step={args.diag_step_far_bp} "
-        f"threshold={args.near_far_threshold_bp}]"
+        f"threshold={args.near_far_threshold_bp} hanning={not args.no_hanning}]"
     )
 
     with torch.no_grad():

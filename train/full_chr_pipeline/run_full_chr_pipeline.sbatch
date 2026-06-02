@@ -2,7 +2,7 @@
 #SBATCH --job-name=chr_full_pipe
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu
-#SBATCH --time=3:00:00
+#SBATCH --time=40:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=4
 #SBATCH --output=logs/full_chr_pipeline_%j.out
@@ -26,7 +26,7 @@ CHROM="${CHROM:-14}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-16_asym-residual-loss.pth}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-30.pth}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_5_15.pth}" # chr14
-CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch20_5_30_bulk_norm.pth}" # chr14
+CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_5_30_bulk_norm_ssim_and_phase_sim.pth}" # chr14
 
 # These default to your repo structure; override as needed.
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn}"
@@ -47,7 +47,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 # DIAG_STEP_FAR_BP  applies to tiles beyond NEAR_FAR_THRESHOLD_BP.
 # Lower step = finer overlap (e.g. 80000 = 87.5%, 320000 = 50%, 640000 = no overlap).
 DIAG_STEP_NEAR_BP="${DIAG_STEP_NEAR_BP:-160000}"
-DIAG_STEP_FAR_BP="${DIAG_STEP_FAR_BP:-640000}"
+DIAG_STEP_FAR_BP="${DIAG_STEP_FAR_BP:-160000}"
 NEAR_FAR_THRESHOLD_BP="${NEAR_FAR_THRESHOLD_BP:-1000000}"
 # Number of GPUs to use for the near-diagonal inference step.
 # Each GPU gets a contiguous spatial block of regions (e.g. with 2 GPUs:
@@ -63,6 +63,9 @@ NUM_GPUS="${NUM_GPUS:-1}"
 # region.  Leave at 0 (default) to process the whole chromosome.
 #   Example: TEST_FRAC=0.1 sbatch full_chr_pipeline/run_full_chr_pipeline.sbatch
 TEST_FRAC="${TEST_FRAC:-0}"
+
+# Set NO_HANNING=1 to disable Hanning weighting when merging overlapping tiles.
+NO_HANNING="${NO_HANNING:-0}"
 
 # Step controls (set to 1 to skip). This script never deletes outputs.
 # Typical Juicer text-only rerun:
@@ -101,7 +104,7 @@ echo "OUT_BASE: $OUT_BASE"
 echo "HIC_UNIT: $HIC_UNIT   NORM: $NORM   NEAR_BAND_BP: $NEAR_BAND_BP"
 echo "BATCH_SIZE: $BATCH_SIZE   NUM_GPUS: $NUM_GPUS"
 echo "DIAG_STEP_NEAR_BP: $DIAG_STEP_NEAR_BP   DIAG_STEP_FAR_BP: $DIAG_STEP_FAR_BP   NEAR_FAR_THRESHOLD_BP: $NEAR_FAR_THRESHOLD_BP"
-echo "TEST_FRAC: $TEST_FRAC"
+echo "TEST_FRAC: $TEST_FRAC   NO_HANNING: $NO_HANNING"
 echo "ONLY_EXPORT: $ONLY_EXPORT"
 echo "SKIP_EXTRACT / SKIP_INFER / SKIP_FILL / SKIP_EXPORT: $SKIP_EXTRACT / $SKIP_INFER / $SKIP_FILL / $SKIP_EXPORT"
 echo "EXPORT_FORMAT: $EXPORT_FORMAT"
@@ -123,6 +126,10 @@ fi
 
 if [[ "$SKIP_INFER" != "1" ]]; then
   echo "[2/4] Near-diagonal GPU inference -> $NEAR_DIR  (NUM_GPUS=$NUM_GPUS)"
+  infer_extra=()
+  if [[ "$NO_HANNING" == "1" ]]; then
+    infer_extra+=(--no_hanning)
+  fi
   if [[ "$NUM_GPUS" -gt 1 ]]; then
     # Launch one worker per GPU in parallel; each owns every NUM_GPUS-th region.
     pids=()
@@ -139,7 +146,8 @@ if [[ "$SKIP_INFER" != "1" ]]; then
         --near_far_threshold_bp "$NEAR_FAR_THRESHOLD_BP" \
         --test_frac "$TEST_FRAC" \
         --shard_id "$k" \
-        --num_shards "$NUM_GPUS" &
+        --num_shards "$NUM_GPUS" \
+        "${infer_extra[@]}" &
       pids+=($!)
     done
     # Wait for all workers; abort the job if any fail.
@@ -163,7 +171,8 @@ if [[ "$SKIP_INFER" != "1" ]]; then
       --diag_step_near_bp "$DIAG_STEP_NEAR_BP" \
       --diag_step_far_bp "$DIAG_STEP_FAR_BP" \
       --near_far_threshold_bp "$NEAR_FAR_THRESHOLD_BP" \
-      --test_frac "$TEST_FRAC"
+      --test_frac "$TEST_FRAC" \
+      "${infer_extra[@]}"
   fi
 else
   echo "[2/4] SKIP near-diagonal inference (reuse $NEAR_DIR)"
@@ -202,3 +211,6 @@ fi
 
 echo "Done. Juicer text outputs in: $JUICER_DIR"
 
+
+
+# TEST_FRAC=0.10 NO_HANNING=1 sbatch full_chr_pipeline/run_full_chr_pipeline.sbatch
