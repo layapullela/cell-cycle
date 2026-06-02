@@ -9,7 +9,7 @@ Output layout:
   <output_dir>/chr{chrom}/{row_start}-{row_end},{col_start}-{col_end}.npz
 
 Each `.npz` contains:
-  earlyG1, midG1, lateG1, anatelo : float32 (N, N) raw counts (no log transform)
+  earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) raw counts (no log transform)
   chip_ctcf_row/col, chip_hac_row/col, chip_h3k4me1_row/col, chip_h3k4me3_row/col
                                   float32 (N,) log1p(max-per-bin) tracks
 """
@@ -143,7 +143,7 @@ def _process_region(args: Tuple[str, Path]) -> Optional[str]:
         return None
 
     arrays: Dict[str, np.ndarray] = {}
-    for phase in ("earlyG1", "midG1", "lateG1", "anatelo"):
+    for phase in ("earlyG1", "midG1", "lateG1", "anatelo", "prometa"):
         hic_file = _hic_paths.get(phase)
         if hic_file is None:
             arrays[phase] = np.zeros((_image_size, _image_size), dtype=np.float32)
@@ -195,7 +195,7 @@ STEP_PIXELS = 10
 RESOLUTION = 10_000
 REGION_SIZE = 640_000
 STEP_BP = STEP_PIXELS * RESOLUTION
-OFFDIAG_NEAR_BAND_BP = 1_000_000
+OFFDIAG_NEAR_BAND_BP = 5_000_000
 OFFDIAG_SAMPLES_PER_DIAG = 2
 
 
@@ -217,7 +217,7 @@ def _sample_offdiag(chrom: str, diag_positions: List[int], rng: np.random.Genera
     if near_steps.size == 0:
         return []
 
-    split = near_max_steps // 2
+    split = near_max_steps // 4
     if split <= 0 or split >= near_max_steps:
         weights = np.full_like(near_steps, 1.0 / float(near_steps.size), dtype=np.float64)
     else:
@@ -283,6 +283,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "midG1": "midG1.hic",
         "lateG1": "lateG1.hic",
         "anatelo": "anatelo.hic",
+        "prometa": "prometa.hic",
     }
     hic_paths: Dict[str, Optional[str]] = {}
     for phase, fname in phase_files.items():

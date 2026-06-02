@@ -530,13 +530,13 @@ class ChipPairEncoderAlpha(nn.Module):
 ############################################
 class PhaseStreamAttention(nn.Module):
     """
-    Cross-phase attention between 4 parallel decoder streams at a given resolution.
+    Cross-phase attention between n parallel decoder streams at a given resolution.
 
     Each stream's feature map is summarised into one token via average pooling,
-    then a 4×4 attention matrix lets each phase gather context from the others.
+    then an n×n attention matrix lets each phase gather context from the others.
     The attended update is broadcast back to every spatial position via a 1×1 conv.
     """
-    def __init__(self, channels: int, d_model: int = 64, n_phases: int = 4):
+    def __init__(self, channels: int, d_model: int = 64, n_phases: int = 5):
         super().__init__()
         self.scale    = d_model ** -0.5
         self.norm     = nn.GroupNorm(min(8, channels), channels)
@@ -583,23 +583,23 @@ class PhaseStreamAttention(nn.Module):
 ############################################
 class SR3UNet(nn.Module):
     """
-    SR3-style U-Net with shared encoder and 4 parallel phase-specific decoder streams.
+    SR3-style U-Net with shared encoder and 5 parallel phase-specific decoder streams.
 
-    Inputs are now full 2-D contact matrices (B, 4, N, N) rather than flattened
+    Inputs are now full 2-D contact matrices (B, 5, N, N) rather than flattened
     upper-triangular vectors, so no vec↔matrix conversion happens inside the model.
 
     Architecture:
         Encoder (shared):
-            (B, 5, N, N) → enc1 → enc2 → enc3 → bottleneck → (B, 512, N/8, N/8)
-            Input channels: 4 noisy phases + bulk (all as N×N matrices)
+            (B, 6, N, N) → enc1 → enc2 → enc3 → bottleneck → (B, 512, N/8, N/8)
+            Input channels: 5 noisy phases + bulk (all as N×N matrices)
 
-        Decoder (4 parallel streams, one per phase):
+        Decoder (5 parallel streams, one per phase):
             bottleneck → stream_init → 3 up-sampling levels with PhaseStreamAttention
 
         Output:
-            (B, 4, N, N) predicted denoised matrices
+            (B, 5, N, N) predicted denoised matrices
     """
-    N_PHASES = 4
+    N_PHASES = 5
 
     def __init__(self, n: int, noise_embed_module: nn.Module, base_ch: int = 64):
         super().__init__()
@@ -613,8 +613,8 @@ class SR3UNet(nn.Module):
         noise_dim = self.noise_embed.mlp[-1].out_features
 
         # ---- INPUT ----
-        # 5 channels: 4 noisy phases + bulk (all N×N matrices)
-        self.input_conv        = nn.Conv2d(5, base_ch // 2, kernel_size=3, padding=1)
+        # 6 channels: 5 noisy phases + bulk (all N×N matrices)
+        self.input_conv        = nn.Conv2d(6, base_ch // 2, kernel_size=3, padding=1)
         self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=self.c_pair)
 
         # ---- SHARED ENCODER ----
@@ -669,21 +669,28 @@ class SR3UNet(nn.Module):
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
 
-        # ---- AUXILIARY CHIP HEAD ----
-        # Predicts an auxiliary (B,4,N,N) target from chip features.
-        self.chip_pred_head = nn.Conv2d(self.c_pair, 4, kernel_size=1)
-        nn.init.zeros_(self.chip_pred_head.weight)
-        nn.init.zeros_(self.chip_pred_head.bias)
+        # ---- LOOP CLASSIFICATION HEAD ----
+        # Predicts loop presence/type in the contact map from ChIP-seq pair features.
+        # Classes: 0=no loop, 1=cluster-1/2 loop, 2=cluster-3 loop.
+        # Input: global-average-pool of h_chip → (B, c_pair).
+        # Output: (B, 3) logits; softmax gives class probabilities.
+        self.loop_class_head = nn.Linear(self.c_pair, 3)
+        nn.init.zeros_(self.loop_class_head.weight)
+        nn.init.zeros_(self.loop_class_head.bias)
 
     # ------------------------------------------------------------------
-    def chip_aux_pred(self, h_chip: torch.Tensor) -> torch.Tensor:
+    def loop_class_logits(self, h_chip: torch.Tensor) -> torch.Tensor:
         """
+        Predict loop presence/type from ChIP-seq pair features.
+
         Args:
             h_chip: (B, c_pair, N, N)
         Returns:
-            (B, 4, N, N) predicted auxiliary target (MSE target in training)
+            (B, 3) logits — apply softmax to get class probabilities.
+            Classes: 0=no loop, 1=cluster-1/2 loop, 2=cluster-3 loop.
         """
-        return self.chip_pred_head(h_chip)
+        pooled = h_chip.mean(dim=(-2, -1))          # (B, c_pair)
+        return self.loop_class_head(pooled)          # (B, 3)
 
     # ------------------------------------------------------------------
     def forward(
@@ -696,13 +703,13 @@ class SR3UNet(nn.Module):
     ):
         """
         Args:
-            x_t:          (B, 4, N, N)  noisy phase matrices [earlyG1, midG1, lateG1, anatelo]
+            x_t:          (B, 5, N, N)  noisy phase matrices [earlyG1, midG1, lateG1, anatelo, prometa]
             gamma:        (B,)           noise level
             chip_*_row:   (B, N)         ChIP-seq for the row genomic window
             chip_*_col:   (B, N)         ChIP-seq for the col genomic window
             bulk_map:     (B, 1, N, N)  bulk Hi-C conditioning (already a 2-D matrix)
         Returns:
-            x0:    (B, 4, N, N)  predicted clean matrices
+            x0:    (B, 5, N, N)  predicted clean matrices
             h_chip:(B, c_pair, N, N)  chip pair features (used for aux loss)
         """
         B = x_t.shape[0]
@@ -713,7 +720,7 @@ class SR3UNet(nn.Module):
         noise_emb = self.noise_embed(gamma * 999.0)
 
         # ---- Build 2-D input feature map ----
-        x_in   = torch.cat([x_t, bulk_map], dim=1)                          # (B, 5, N, N)
+        x_in   = torch.cat([x_t, bulk_map], dim=1)                          # (B, 6, N, N)
         h_bulk = self.input_conv(x_in)                                        # (B, base_ch//2, N, N)
         h_chip = self.chip_pair_encoder(
             chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -770,5 +777,5 @@ class SR3UNet(nn.Module):
             out_map = self.output_heads[i](streams[i])   # (B, 1, N, N)
             phase_maps.append(out_map[:, 0])             # (B, N, N)
 
-        x0 = torch.stack(phase_maps, dim=1)              # (B, 4, N, N)
+        x0 = torch.stack(phase_maps, dim=1)              # (B, 5, N, N)
         return x0, h_chip

@@ -3,17 +3,20 @@ CPU: build full L×L final matrices for each phase.
 
 Every bin (i, j) is filled:
 
-  - If near-diagonal diffusion wrote that bin (near_cnt > 0), use
-        near_sum / near_cnt
-  - Else use the cheap approximation (same as before):
-        phase_map[i,j] approx= bulk_raw[i,j] 
-    where bulk_raw = 0.25 * (early + mid + late + anatelo) in **raw** space.
+  - If near-diagonal diffusion wrote that bin (pred_wsum > 0):
+        pred_raw = pred_count / pred_wsum   (Hanning-weighted arithmetic mean in count space)
 
- This version covers the **entire** chromosome grid not just whats in prestore.
+    Each tile was denormalized to count space with its own bulk (lo, hi) during inference,
+    so this is the posterior mean of the overlapping diffusion samples.  Arithmetic
+    count-space averaging (rather than a log-space / geometric mean) preserves the sparse,
+    probabilistic off-diagonal contacts instead of collapsing them toward zero.
+
+  - Else: fallback = bulk_raw = 0.2 * (early + mid + late + anatelo + prometa).
 
 Reads:
   - raw phase arrays from extract_chr_numpy.py
-  - near-diagonal accumulators from infer_chr_near_diag_gpu.py
+  - chr{chrom}_{phase}_pred_count.npy  }  from infer_chr_near_diag_gpu.py
+  - chr{chrom}_{phase}_pred_wsum.npy   }    (merged by merge_near_diag_shards.py)
 
 Writes:
   - chr{chrom}_{phase}_final_raw.npy  float32 (L,L)
@@ -39,7 +42,7 @@ from prestore_hic import CHROMOSOME_SIZES
 # Keep this pipeline self-contained (avoid import-path issues under Slurm).
 RESOLUTION_BP = 10_000
 
-PHASES = ("earlyG1", "midG1", "lateG1", "anatelo")
+PHASES = ("earlyG1", "midG1", "lateG1", "anatelo", "prometa")
 
 
 def chrom_bins(chrom: str) -> int:
@@ -56,7 +59,7 @@ def open_memmap(path: Path, shape: tuple[int, ...], dtype) -> np.memmap:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Fill full chromosome matrices (diffusion where available, else 0.25*bulk)."
+        description="Fill full chromosome matrices (diffusion where available, else bulk fallback)."
     )
     p.add_argument("--chrom", default="2")
     p.add_argument("--arrays_dir", required=True)
@@ -66,13 +69,28 @@ def main() -> None:
         "--near_band_bp",
         type=float,
         default=0.0,
-        help="deprecated, not used.",
+        help="Deprecated, not used.",
+    )
+    p.add_argument(
+        "--no_log1p",
+        action="store_true",
+        help="Deprecated/no-op: denormalization (incl. expm1) now happens during inference.",
     )
     p.add_argument(
         "--chunk",
         type=int,
         default=512,
         help="Tile size for streaming over L×L (default 512). Lower if RAM is tight.",
+    )
+    p.add_argument(
+        "--test_frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Testing shortcut: if > 0, only the TRAILING test_frac block of the chromosome "
+            "(rows and cols >= (1-test_frac)*L) is filled; every bin outside that block is set "
+            "to 0 so the exported .hic only contains the tested region. Default 0 = whole matrix."
+        ),
     )
     args = p.parse_args()
 
@@ -85,41 +103,69 @@ def main() -> None:
     L = chrom_bins(chrom)
     chunk = max(int(args.chunk), 32)
 
+    # Testing shortcut: bins before L_start (in either axis) are forced to zero, keeping only
+    # the trailing block [L_start, L).
+    test_frac = float(args.test_frac)
+    L_start = int(math.floor((1.0 - test_frac) * L)) if test_frac > 0.0 else 0
+    if test_frac > 0.0:
+        print(f"[TEST MODE] test_frac={test_frac} -> zeroing everything outside the trailing [{L_start}, {L}) bins.")
+
     raw = {ph: np.load(arrays_dir / f"chr{chrom}_{ph}_raw.npy", mmap_mode="r") for ph in PHASES}
-    near_sum = {ph: np.load(near_dir / f"chr{chrom}_{ph}_pred_raw.npy", mmap_mode="r") for ph in PHASES}
-    near_cnt = {ph: np.load(near_dir / f"chr{chrom}_{ph}_pred_cnt.npy", mmap_mode="r") for ph in PHASES}
+
+    near_count = {ph: np.load(near_dir / f"chr{chrom}_{ph}_pred_count.npy", mmap_mode="r") for ph in PHASES}
+    near_wsum  = {ph: np.load(near_dir / f"chr{chrom}_{ph}_pred_wsum.npy",  mmap_mode="r") for ph in PHASES}
 
     final = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_final_raw.npy", (L, L), np.float32) for ph in PHASES}
 
     n_i = (L + chunk - 1) // chunk
     n_j = (L + chunk - 1) // chunk
-    #total_blocks = n_i * n_j
 
     for bi in tqdm(range(n_i), desc="rows (chunked)"):
         i0 = bi * chunk
         i1 = min(i0 + chunk, L)
         for bj in range(n_j):
             j0 = bj * chunk
-            j1 = min(j0 + chunk, L) # ensure we stay on the grid
+            j1 = min(j0 + chunk, L)
+
+            # In test mode, any chunk entirely outside the trailing [L_start, L) block is zero.
+            if test_frac > 0.0 and (i1 <= L_start or j1 <= L_start):
+                for ph in PHASES:
+                    final[ph][i0:i1, j0:j1] = 0.0
+                continue
 
             bulk_raw = (
                 np.asarray(raw["earlyG1"][i0:i1, j0:j1], dtype=np.float32)
                 + np.asarray(raw["midG1"][i0:i1, j0:j1], dtype=np.float32)
                 + np.asarray(raw["lateG1"][i0:i1, j0:j1], dtype=np.float32)
                 + np.asarray(raw["anatelo"][i0:i1, j0:j1], dtype=np.float32)
+                + np.asarray(raw["prometa"][i0:i1, j0:j1], dtype=np.float32)
             )
-            bulk_raw *= 0.25  # mean of four phases
-            # Each phase ≈ (1/4) × total = (1/4) × (4 × mean) = mean.
-            # The diffusion output is also in the same per-phase raw scale,
-            # so using bulk_raw here gives a scale-compatible boundary.
+            bulk_raw *= 0.2
             fallback = bulk_raw.astype(np.float32)
 
             for ph in PHASES:
-                sm = np.asarray(near_sum[ph][i0:i1, j0:j1], dtype=np.float32)
-                cnt = np.asarray(near_cnt[ph][i0:i1, j0:j1], dtype=np.float32)
-                mask = cnt > 0.0
+                wsum = np.asarray(near_wsum[ph][i0:i1, j0:j1], dtype=np.float32)
+                mask = wsum > 0.0
+                safe_wsum = np.where(mask, wsum, 1.0)
+
+                # Hanning-weighted arithmetic mean in count space (posterior mean of the
+                # overlapping diffusion samples).  Predictions were already converted to
+                # counts during inference, so no expm1 is applied here.
+                pred_raw_diffusion = (
+                    np.asarray(near_count[ph][i0:i1, j0:j1], dtype=np.float32) / safe_wsum
+                ).astype(np.float32)
+
                 out = fallback.copy()
-                out[mask] = (sm[mask] / cnt[mask]).astype(np.float32)
+                out[mask] = pred_raw_diffusion[mask]
+
+                # Zero the portion of a boundary-straddling chunk that lies outside the
+                # trailing [L_start, L) block (global row/col < L_start).
+                if test_frac > 0.0:
+                    if i0 < L_start:
+                        out[:min(L_start - i0, i1 - i0), :] = 0.0
+                    if j0 < L_start:
+                        out[:, :min(L_start - j0, j1 - j0)] = 0.0
+
                 final[ph][i0:i1, j0:j1] = out
 
     for ph in PHASES:

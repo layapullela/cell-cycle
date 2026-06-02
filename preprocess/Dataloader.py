@@ -17,8 +17,8 @@ class CellCycleDataLoader:
 
     Each sample contains:
       region  : str, e.g. "1:10000000-10640000:10000000-10640000"
-      earlyG1, lateG1, midG1, anatelo : numpy arrays of shape (N, N) = (64, 64)
-      chip_seq_{mark}_row / _col       : numpy arrays of shape (N,) = (64,)
+      earlyG1, lateG1, midG1, anatelo, prometa : numpy arrays of shape (N, N) = (64, 64)
+      chip_seq_{mark}_row / _col                : numpy arrays of shape (N,) = (64,)
     """
 
     def __init__(
@@ -61,7 +61,7 @@ class CellCycleDataLoader:
                 f.write("region,phase,min,max\n")
             print(f"Saving normalization stats to: {self.normalization_stats_file}")
 
-        self.phase_names = ('earlyG1', 'midG1', 'lateG1', 'anatelo')
+        self.phase_names = ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')
         self.phase_paths: Dict[str, Path] = {}
         self._chipseq_paths: Dict[str, Optional[str]] = {}
         self.chipseq_files: Dict[str, Optional[object]] = {}
@@ -196,20 +196,38 @@ class CellCycleDataLoader:
 
         sample: Dict[str, object] = {'region': region}
 
+        # First pass: 99.5-pct clip per phase on raw counts.
+        clipped: Dict[str, np.ndarray] = {}
         for phase, hic_path in self.phase_paths.items():
             mat = self._extract_region_matrix_live(hic_path, region)
+            threshold = np.percentile(mat, 99.5)
+            clipped[phase] = np.where(mat > threshold, threshold, mat).astype(np.float32)
+
+        # Average clipped phases, then log-transform.
+        bulk_avg = 0.2 * sum(clipped[ph] for ph in self.phase_paths)
+        if self.use_log_transform:
+            bulk_avg = np.log1p(bulk_avg).astype(np.float32)
+        b_min, b_max = float(bulk_avg.min()), float(bulk_avg.max())
+        self._save_normalization_stat(region, "bulk", b_min, b_max)
+        bulk_norm = (
+            np.zeros_like(bulk_avg, dtype=np.float32)
+            if b_max - b_min < 1e-10
+            else ((bulk_avg - b_min) / (b_max - b_min) * 2.0 - 1.0).astype(np.float32)
+        )
+        if do_flip:
+            bulk_norm = np.flip(bulk_norm, axis=(0, 1)).copy()
+        sample["bulk"] = bulk_norm
+
+        # Per-phase normalization (diffusion targets), using the bulk's scale so that
+        # denormalizing a predicted phase with the bulk lo/hi recovers correct counts.
+        for phase, mat in clipped.items():
             if self.use_log_transform:
-                mat = np.log1p(mat)
-
-            threshold = np.percentile(mat, 99.9)
-            mat = np.where(mat > threshold, threshold, mat)
-            m_min, m_max = mat.min(), mat.max()
-            self._save_normalization_stat(region, phase, float(m_min), float(m_max))
-
+                mat = np.log1p(mat).astype(np.float32)
+            self._save_normalization_stat(region, phase, b_min, b_max)
             normalized = (
                 np.zeros_like(mat, dtype=np.float32)
-                if m_max - m_min < 1e-10
-                else ((mat - m_min) / (m_max - m_min) * 2.0 - 1.0).astype(np.float32)
+                if b_max - b_min < 1e-10
+                else ((mat - b_min) / (b_max - b_min) * 2.0 - 1.0).astype(np.float32)
             )
             if do_flip:
                 normalized = np.flip(normalized, axis=(0, 1)).copy()
@@ -348,22 +366,32 @@ class CellCycleDataLoader:
         sample = {'region': region}
 
         # ---- Hi-C phases (same normalisation as the live path) ----
-        for phase in ('earlyG1', 'midG1', 'lateG1', 'anatelo'):
+        clipped: Dict[str, np.ndarray] = {}
+        for phase in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa'):
             mat = data[phase].copy()                   # (N, N) raw counts
+            threshold = np.percentile(mat, 99.5)
+            clipped[phase] = np.where(mat > threshold, threshold, mat).astype(np.float32)
 
+        bulk_avg = 0.2 * sum(clipped[ph] for ph in clipped)
+        if self.use_log_transform:
+            bulk_avg = np.log1p(bulk_avg).astype(np.float32)
+        b_min, b_max = float(bulk_avg.min()), float(bulk_avg.max())
+        bulk_norm = (
+            np.zeros_like(bulk_avg, dtype=np.float32)
+            if b_max - b_min < 1e-10
+            else ((bulk_avg - b_min) / (b_max - b_min) * 2.0 - 1.0).astype(np.float32)
+        )
+        if do_flip:
+            bulk_norm = np.flip(bulk_norm, axis=(0, 1)).copy()
+        sample["bulk"] = bulk_norm
+
+        for phase, mat in clipped.items():
             if self.use_log_transform:
-                mat = np.log1p(mat)
-
-            threshold = np.percentile(mat, 99.9)
-            mat = np.where(mat > threshold, threshold, mat)
-
-            m_min, m_max = mat.min(), mat.max()
-            #self._save_normalization_stat(region, phase, float(m_min), float(m_max))
-
+                mat = np.log1p(mat).astype(np.float32)
             normalized = (
                 np.zeros_like(mat, dtype=np.float32)
-                if m_max - m_min < 1e-10
-                else ((mat - m_min) / (m_max - m_min) * 2.0 - 1.0).astype(np.float32)
+                if b_max - b_min < 1e-10
+                else ((mat - b_min) / (b_max - b_min) * 2.0 - 1.0).astype(np.float32)
             )
             if do_flip:
                 normalized = np.flip(normalized, axis=(0, 1)).copy()
@@ -394,8 +422,8 @@ class CellCycleDataLoader:
         """
         Returns a sample dict with:
           region           : str
-          earlyG1, midG1, lateG1, anatelo : float32 (N, N) matrices, normalised to [-1,1]
-          chip_seq_{mark}_row / _col       : float32 (N,) log1p ChIP-seq signals
+          earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) matrices, normalised to [-1,1]
+          chip_seq_{mark}_row / _col                : float32 (N,) log1p ChIP-seq signals
         """
         if isinstance(idx, str):
             region = idx

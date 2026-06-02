@@ -31,7 +31,7 @@ from prestore_hic import CHROMOSOME_SIZES
 # Keep this pipeline self-contained (avoid import-path issues under Slurm).
 RESOLUTION_BP = 10_000
 
-PHASES = ("earlyG1", "midG1", "lateG1", "anatelo")
+PHASES = ("earlyG1", "midG1", "lateG1", "anatelo", "prometa")
 
 
 def chrom_bins(chrom: str) -> int:

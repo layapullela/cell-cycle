@@ -1,7 +1,7 @@
 """
 SR3 Inference for Cell-Cycle Hi-C Phase Decomposition
 
-Inputs and outputs are full 2-D contact matrices (B, 4, N, N).
+Inputs and outputs are full 2-D contact matrices (B, 5, N, N).
 """
 
 import torch
@@ -102,10 +102,10 @@ class Inference:
                 (diagonal-block Hi-C should be symmetric). Use False for off-diagonal crops.
 
         Returns:
-            y_0: (B, 4, N, N)  channels: earlyG1, midG1, lateG1, anatelo
+            y_0: (B, 5, N, N)  channels: earlyG1, midG1, lateG1, anatelo, prometa
         """
         B, _, N, N2 = bulk_map.shape
-        y_t = torch.randn(B, 4, N, N2, device=self.device)
+        y_t = torch.randn(B, 5, N, N2, device=self.device)
 
         for t_idx in range(self.T - 1, 0, -1):
             gamma_t = self.gammas[t_idx]
@@ -132,7 +132,7 @@ class Inference:
             y_t = symmetrize_maps(y_t)
             #y_t = torch.clamp(y_t, min=-1.0, max=1.0)
 
-        return y_t   # (B, 4, N, N)
+        return y_t   # (B, 5, N, N)
 
     def visualize(
         self,
@@ -147,7 +147,7 @@ class Inference:
         Run inference and visualize results for all four output channels.
 
         Args:
-            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'anatelo' as (B, N, N),
+            batch: Dict with keys 'earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa' as (B, N, N),
                    'chip_seq_*_row' / '_col' as (B, N), and optionally 'region'
             output_path: Where to save plot (None → display)
             n: Matrix size (default 64)
@@ -156,12 +156,13 @@ class Inference:
                 diagonal blocks where row interval == col interval); True/False overrides.
 
         Returns:
-            sampled: (B, 4, N, N)
+            sampled: (B, 5, N, N)
         """
         x0_early   = batch['earlyG1'].float().to(self.device)           # (B, N, N)
         x0_mid     = batch['midG1'].float().to(self.device)
         x0_late    = batch['lateG1'].float().to(self.device)
         x0_anatelo = batch['anatelo'].float().to(self.device)
+        x0_prometa = batch['prometa'].float().to(self.device)
 
         chip_ctcf_row = batch['chip_seq_ctcf_row'].float().to(self.device)
         chip_hac_row  = batch['chip_seq_hac_row'].float().to(self.device)
@@ -172,7 +173,7 @@ class Inference:
         chip_me1_col  = batch.get('chip_seq_h3k4me1_col', chip_me1_row).float().to(self.device)
         chip_me3_col  = batch.get('chip_seq_h3k4me3_col', chip_me3_row).float().to(self.device)
 
-        bulk_map = (x0_early + x0_mid + x0_late + x0_anatelo).mul(0.25).unsqueeze(1)  # (B, 1, N, N)
+        bulk_map = (x0_early + x0_mid + x0_late + x0_anatelo + x0_prometa).mul(0.2).unsqueeze(1)  # (B, 1, N, N)
 
         chip_histone_1d = chip_hac_row[0].detach().cpu().numpy()
 
@@ -190,10 +191,10 @@ class Inference:
             enforce_symmetry=sym,
         )
 
-        gt_mats   = [x[0].cpu().numpy() for x in [x0_early, x0_mid, x0_late, x0_anatelo]]
-        pred_mats = [sampled[0, i].cpu().numpy() for i in range(4)]
+        gt_mats   = [x[0].cpu().numpy() for x in [x0_early, x0_mid, x0_late, x0_anatelo, x0_prometa]]
+        pred_mats = [sampled[0, i].cpu().numpy() for i in range(5)]
         bulk_mat  = bulk_map[0, 0].cpu().numpy()
-        phase_labels = ['earlyG1', 'midG1', 'lateG1', 'anatelo']
+        phase_labels = ['earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa']
 
         region = batch.get('region', ['unknown'])
         if isinstance(region, (list, tuple)):
@@ -222,7 +223,7 @@ class Inference:
             ins.set_xticks([]); ins.set_yticks([])
             ins.set_xlim(chip_plot.min(), chip_plot.max())
 
-        fig, axes = plt.subplots(4, 3, figsize=(16, 20))
+        fig, axes = plt.subplots(5, 3, figsize=(16, 25))
         metrics = []
         for row, (label, gt, pred) in enumerate(zip(phase_labels, gt_mats, pred_mats)):
             axes[row, 0].imshow(bulk_mat, cmap='Reds', vmin=vmin, vmax=vmax)
@@ -294,7 +295,7 @@ def run_inference_and_visualize(
 
     inference = Inference(model, device, T=1000)
 
-    save_path = output_path / f"inference_4phase_step_{step}_alpha.png"
+    save_path = output_path / f"inference_5phase_step_{step}_alpha.png"
     inference.visualize(
         batch,
         output_path=save_path,

@@ -1,7 +1,7 @@
 """
 Cell-Cycle Hi-C Phase Decomposition via SR3-Style Iterative Refinement
 
-Model inputs/outputs are full 2-D contact matrices (B, 4, N, N) – no upper-tri
+Model inputs/outputs are full 2-D contact matrices (B, 5, N, N) – no upper-tri
 vectors.  Training samples now include both diagonal and off-diagonal crops.
 
 NOTATION (γ = signal fraction, NOT noise variance):
@@ -22,11 +22,13 @@ SAMPLING:
         y_{t-1}  = (1/√α_t)(y_t - (1-α_t)/√(1-γ_t) · ε_θ) + √(1-α_t) · z
 """
 
+import re
 import sys
 import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 import pytorch_msssim
 from pathlib import Path
 from tqdm import tqdm
@@ -61,8 +63,12 @@ class CellCycleDataset(Dataset):
 ############################################
 # 1) CONFIG
 ############################################
-# Four-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo)
-# Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo.
+# Five-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo, prometa)
+# Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo, 4=prometa.
+# (Phase-index constants were used by chip_phase_similarity_loss — now removed.)
+# PHASE_IDX_EARLYG1 = 0
+# PHASE_IDX_ANATELO = 3
+# PHASE_IDX_PROMETA = 4
 
 N = 64                           # contact map size (64 x 64)
 
@@ -93,7 +99,141 @@ RESUME_CHECKPOINT = None
 
 
 ############################################
-# 2) CHECKPOINT LOADING
+# 2) LOOP LABEL DICTIONARY
+############################################
+_ANCHOR_RE = re.compile(r"^chr(\w+):(\d+)-(\d+)$")
+
+
+def _parse_loop_anchor(coord: str):
+    """Parse 'chrN:start-end' → (chrom_no_prefix, start, end) or None."""
+    m = _ANCHOR_RE.match(coord.strip())
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), int(m.group(3))
+
+
+def _mid_in_window(anchor_start: int, anchor_end: int, win_start: int, win_end: int) -> bool:
+    """True if the anchor midpoint falls within [win_start, win_end)."""
+    mid = (anchor_start + anchor_end) // 2
+    return win_start <= mid < win_end
+
+
+def load_loop_label_dict(excel_path: str, all_regions: list) -> dict:
+    """
+    Build a mapping  region_str → loop_label  for every region in *all_regions*.
+
+    Loop labels
+    -----------
+    -1 : ambiguous — region contains both cluster-1/2 AND cluster-3 loops; skip in loss.
+     0 : no loop detected in this window.
+     1 : at least one cluster-1 or cluster-2 loop.
+     2 : at least one cluster-3 loop.
+
+    Region format   : "{chrom}:{row_start}-{row_end}:{col_start}-{col_end}"
+                      chrom has NO 'chr' prefix.
+    Anchor format   : "chrN:start-end"  (with 'chr' prefix, from the Excel file).
+
+    A loop is assigned to a region if the midpoint of each anchor falls within the
+    corresponding row / col window (both orientations are checked because Hi-C is
+    symmetric).
+    """
+    df = pd.read_excel(
+        excel_path,
+        usecols=["loop_coordinate_row_mm10", "loop_coordinate_col_mm10", "cluster_id"],
+    )
+
+    #breakpoint()
+    df = df.dropna(subset=["cluster_id"]).copy()
+    df["cluster_id"] = df["cluster_id"].astype(int)
+
+    # Parse all loop anchors once
+    loops = []  # list of ((chrom, start, end), (chrom, start, end), cluster_id)
+    for _, row in df.iterrows():
+        a1 = _parse_loop_anchor(row["loop_coordinate_row_mm10"])
+        a2 = _parse_loop_anchor(row["loop_coordinate_col_mm10"])
+        if a1 and a2:
+            loops.append((a1, a2, int(row["cluster_id"])))
+
+    print(f"Loaded {len(loops)} loops from {excel_path}")
+
+    # Group loops by chromosome for fast lookup
+    from collections import defaultdict
+    loops_by_chrom = defaultdict(list)
+    for a1, a2, cid in loops:
+        loops_by_chrom[a1[0]].append((a1, a2, cid))
+
+    label_dict = {}
+    for region in all_regions:
+        parts = region.split(":")
+        chrom = parts[0]
+        rs, re_ = map(int, parts[1].split("-"))
+        cs, ce  = map(int, parts[2].split("-")) if len(parts) == 3 else (rs, re_)
+
+        has_12 = False
+        has_3  = False
+
+        for (a1_chrom, a1_s, a1_e), (a2_chrom, a2_s, a2_e), cid in loops_by_chrom.get(chrom, []):
+            if a2_chrom != chrom:
+                continue
+            forward = _mid_in_window(a1_s, a1_e, rs, re_) and _mid_in_window(a2_s, a2_e, cs, ce)
+            reverse = _mid_in_window(a2_s, a2_e, rs, re_) and _mid_in_window(a1_s, a1_e, cs, ce)
+            if forward or reverse:
+                if cid in (1, 2):
+                    has_12 = True
+                elif cid == 3:
+                    has_3 = True
+
+        if has_12 and has_3:
+            label_dict[region] = -1   # ambiguous — skip
+        elif has_3:
+            label_dict[region] = 2
+        elif has_12:
+            label_dict[region] = 1
+        else:
+            label_dict[region] = 0
+
+    n_per_label = {v: sum(1 for l in label_dict.values() if l == v) for v in (-1, 0, 1, 2)}
+    print(f"Loop label distribution: "
+          f"no-loop={n_per_label[0]}  cluster-1/2={n_per_label[1]}  "
+          f"cluster-3={n_per_label[2]}  ambiguous(skip)={n_per_label[-1]}")
+    return label_dict
+
+
+def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) -> torch.Tensor:
+    """
+    Compute inverse-frequency class weights for the loop classification loss so that
+    all three classes contribute equally regardless of their prevalence in training data.
+
+    Only training regions (not holdout) are counted; ambiguous samples (label -1) are
+    excluded from the frequency estimate since they are masked out of the loss anyway.
+
+    Returns a (3,) float32 tensor of per-class weights suitable for passing directly
+    to F.cross_entropy(..., weight=...).
+
+    Weight formula (sklearn convention):
+        weight[c] = n_valid / (n_classes * n_c)
+    where n_valid = total non-ambiguous training samples, n_classes = 3.
+    """
+    counts = [0, 0, 0]  # counts[0], counts[1], counts[2]
+    for region in training_regions:
+        label = loop_label_dict.get(region, 0)
+        if 0 <= label <= 2:
+            counts[label] += 1
+
+    n_valid = sum(counts)
+    if n_valid == 0:
+        return torch.ones(3, dtype=torch.float32)
+
+    weights = [n_valid / (3 * c) if c > 0 else 1.0 for c in counts]
+    w = torch.tensor(weights, dtype=torch.float32)
+    print(f"Loop class weights (training, inv-freq): "
+          f"no-loop={w[0]:.3f}  cluster-1/2={w[1]:.3f}  cluster-3={w[2]:.3f}  "
+          f"(counts: {counts[0]} / {counts[1]} / {counts[2]})")
+    return w
+
+
+############################################
+# 3) CHECKPOINT LOADING  (was §2)
 ############################################
 def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
     if checkpoint_path is None:
@@ -132,54 +272,19 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
 
 
 ############################################
-# 3) VALIDATION SET (chr2, excluding test-eval regions)
+# 3) VALIDATION SET (random holdout sample)
 ############################################
-TEST_EVAL_TARGET_RANGES_CHR2 = [
-    (44700000, 45100000),
-    (18400000, 19400000),
-]
+VAL_SPLIT_SEED = 42
 
 
-def _parse_region(region_str: str):
-    """
-    Parse region string to (chrom, start, end).
-
-    Handles:
-      "chrom:start-end"                           (legacy diagonal)
-      "chrom:row_start-row_end:col_start-col_end" (new format)
-
-    For the new format, start = row_start and end = col_end (full genomic span).
-    """
-    parts = region_str.split(":")
-    chrom = parts[0]
-    row_start, row_end = map(int, parts[1].split("-"))
-    if len(parts) == 3:
-        _, col_end = map(int, parts[2].split("-"))
-        return chrom, row_start, col_end   # full genomic span
-    return chrom, row_start, row_end
-
-
-def _region_overlaps_any(region_str, ranges):
-    """True if region overlaps any (t_start, t_end) in ranges."""
-    _, start, end = _parse_region(region_str)
-    for t_start, t_end in ranges:
-        if start < t_end and end > t_start:
-            return True
-    return False
-
-
-def get_validation_regions_chr2(holdout_regions, n=10, seed=42):
-    """
-    From chr2 holdout regions (diagonal only), exclude test-eval targets,
-    then return n regions for validation.
-    """
+def get_validation_regions(holdout_regions, n=10, seed=VAL_SPLIT_SEED):
+    """Sample ``n`` validation regions from holdout tiles (reproducible via ``seed``)."""
+    if not holdout_regions:
+        return []
     rng = np.random.default_rng(seed)
-    valid = [r for r in holdout_regions
-             if not _region_overlaps_any(r, TEST_EVAL_TARGET_RANGES_CHR2)]
-    if len(valid) <= n:
-        return valid
-    indices = rng.choice(len(valid), size=n, replace=False)
-    return [valid[i] for i in indices]
+    n_val = min(n, len(holdout_regions))
+    indices = rng.choice(len(holdout_regions), size=n_val, replace=False)
+    return [holdout_regions[i] for i in indices]
 
 
 ############################################
@@ -187,11 +292,11 @@ def get_validation_regions_chr2(holdout_regions, n=10, seed=42):
 ############################################
 def _build_targets(batch, device):
     """
-    Construct four-channel target matrices and bulk conditioning.
+    Construct five-channel target matrices and bulk conditioning.
 
     Returns:
-        x0_current : (B, 4, N, N)  earlyG1 / midG1 / lateG1 / anatelo matrices
-        bulk_map   : (B, 1, N, N)  average of all four phases
+        x0_current : (B, 5, N, N)  earlyG1 / midG1 / lateG1 / anatelo / prometa matrices
+        bulk_map   : (B, 1, N, N)  average of all five phases
         chip_*_row : (B, N)
         chip_*_col : (B, N)
     """
@@ -199,9 +304,10 @@ def _build_targets(batch, device):
     x0_mid     = batch["midG1"].float().to(device)
     x0_late    = batch["lateG1"].float().to(device)
     x0_anatelo = batch["anatelo"].float().to(device)
+    x0_prometa = batch["prometa"].float().to(device)
 
-    x0_current = torch.stack([x0_early, x0_mid, x0_late, x0_anatelo], dim=1)  # (B, 4, N, N)
-    bulk_map   = (x0_early + x0_mid + x0_late + x0_anatelo).mul(0.25).unsqueeze(1)  # (B, 1, N, N)
+    x0_current = torch.stack([x0_early, x0_mid, x0_late, x0_anatelo, x0_prometa], dim=1)  # (B, 5, N, N)
+    bulk_map   = batch["bulk"].float().to(device).unsqueeze(1)  # (B, 1, N, N)  — sum-then-normalize
 
     chip_ctcf_row = batch["chip_seq_ctcf_row"].float().to(device)
     chip_hac_row  = batch["chip_seq_hac_row"].float().to(device)
@@ -251,6 +357,158 @@ def ssim_1_minus_mean(
         win_sigma=win_sigma,
     )
     return 1.0 - ssim_val
+
+
+############################################
+# IW-SSIM  (Information-Weighted SSIM)
+############################################
+def _gaussian_kernel_2d(
+    kernel_size: int, sigma: float, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    coords = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
+    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+    g = g / g.sum()
+    kernel = torch.outer(g, g)
+    return kernel / kernel.sum()
+
+
+def _depthwise_conv(x: torch.Tensor, kernel: torch.Tensor, pad: int) -> torch.Tensor:
+    """Apply a 2-D kernel independently to every channel of x: (B, C, H, W)."""
+    C = x.shape[1]
+    ks = kernel.shape[0]
+    k = kernel.view(1, 1, ks, ks).expand(C, 1, -1, -1).contiguous()
+    return F.conv2d(x, k, padding=pad, groups=C)
+
+
+def iw_ssim_map(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    win_size: int = 11,
+    win_sigma: float = 1.5,
+    data_range: float = _SSIM_DATA_RANGE,
+    n_scales: int = 4,
+) -> torch.Tensor:
+    """
+    Information-Weighted SSIM following Wang & Simoncelli (2005) as used in Hi-Compass.
+
+    At each scale the per-pixel SSIM values are averaged with weights derived from the
+    local variance of the reference image — regions with higher variance carry more
+    structural information (GSM approximation) and are given proportionally more weight.
+    Scales are combined multiplicatively using the MS-SSIM β exponents from the paper:
+        β = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+
+    Args:
+        pred, target : (B, C, H, W) in [-1, 1]
+        n_scales     : number of pyramid levels (4 recommended for 64×64 maps)
+
+    Returns:
+        (B, C) tensor of IW-SSIM values in (0, 1]
+    """
+    B, C, H, W = pred.shape
+    device, dtype = pred.device, pred.dtype
+
+    # Scale combination weights β (Wang et al. 2003 / Hi-Compass paper)
+    _betas_full = torch.tensor(
+        [0.0448, 0.2856, 0.3001, 0.2363, 0.1333], device=device, dtype=dtype
+    )
+    betas = _betas_full[:n_scales]
+    betas = betas / betas.sum()   # re-normalise in case n_scales < 5
+
+    C1 = (0.01 * data_range) ** 2   # luminance stability constant
+    C2 = (0.03 * data_range) ** 2   # contrast  stability constant
+
+    scale_vals: list[torch.Tensor] = []
+    p, t = pred, target
+
+    for s in range(n_scales):
+        _H, _W = p.shape[2], p.shape[3]
+        # Shrink window if the feature map has become smaller than win_size
+        _ws = min(win_size, _H, _W)
+        if _ws % 2 == 0:
+            _ws -= 1
+        if _ws < 3:
+            break
+        _pad = _ws // 2
+        kern = _gaussian_kernel_2d(_ws, win_sigma, device, dtype)
+
+        mu_p  = _depthwise_conv(p,     kern, _pad)
+        mu_t  = _depthwise_conv(t,     kern, _pad)
+        mu_p2 = mu_p * mu_p
+        mu_t2 = mu_t * mu_t
+        mu_pt = mu_p * mu_t
+
+        # Local variances and cross-covariance via E[x²] - μ²
+        var_p  = (_depthwise_conv(p * p, kern, _pad) - mu_p2).clamp(min=0.0)
+        var_t  = (_depthwise_conv(t * t, kern, _pad) - mu_t2).clamp(min=0.0)
+        cov_pt =  _depthwise_conv(p * t, kern, _pad) - mu_pt
+
+        # Per-pixel SSIM map
+        ssim_map = (
+            (2.0 * mu_pt + C1) * (2.0 * cov_pt + C2)
+        ) / (
+            (mu_p2 + mu_t2 + C1) * (var_p + var_t + C2).clamp(min=1e-8)
+        )  # (B, C, H', W')
+
+        # Information-content weights: local variance of the reference.
+        # Regions with larger signal variance contain more structural information
+        # (the GSM model assigns higher mutual information to high-variance patches).
+        info_w = var_t + 1e-6   # (B, C, H', W')
+
+        # Spatially weighted average of SSIM -> (B, C)
+        iw = (info_w * ssim_map).sum(dim=(-2, -1)) / info_w.sum(dim=(-2, -1))
+        scale_vals.append(iw)
+
+        if s < n_scales - 1:
+            p = F.avg_pool2d(p, kernel_size=2, stride=2)
+            t = F.avg_pool2d(t, kernel_size=2, stride=2)
+
+    n_actual = len(scale_vals)
+    if n_actual == 0:
+        return pred.new_ones(B, C)
+
+    betas_used = betas[:n_actual] / betas[:n_actual].sum()
+    stacked  = torch.stack(scale_vals, dim=0).clamp(min=1e-7, max=1.0)  # (n, B, C)
+    log_iw   = (betas_used[:, None, None] * stacked.log()).sum(dim=0)    # (B, C)
+    return log_iw.exp()
+
+
+# iw_ssim_loss — was used for the chip aux head (chip_aux_loss); removed when the
+# auxiliary head was replaced by the loop classification head.  Kept here for reference.
+#
+# def iw_ssim_loss(pred, target, *, win_size=11, win_sigma=1.5,
+#                  data_range=_SSIM_DATA_RANGE, n_scales=4):
+#     """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels."""
+#     return 1.0 - iw_ssim_map(
+#         pred, target, win_size=win_size, win_sigma=win_sigma,
+#         data_range=data_range, n_scales=n_scales,
+#     ).mean()
+
+
+# The three helpers below supported chip_phase_similarity_loss, which compared
+# pairwise dot-product similarities between earlyG1/anatelo/prometa phase maps
+# predicted by the old chip aux head.  All removed with that head.
+#
+# def _phase_flat_vec(maps, phase_idx):
+#     return maps[:, phase_idx].reshape(maps.shape[0], -1)
+#
+# def _batch_dot(a, b):
+#     return (a * b).sum(dim=-1)
+#
+# def chip_phase_similarity_loss(chip_pred, x0_true):
+#     pred_early = _phase_flat_vec(chip_pred, PHASE_IDX_EARLYG1)
+#     pred_ana   = _phase_flat_vec(chip_pred, PHASE_IDX_ANATELO)
+#     pred_pro   = _phase_flat_vec(chip_pred, PHASE_IDX_PROMETA)
+#     true_early = _phase_flat_vec(x0_true,  PHASE_IDX_EARLYG1)
+#     true_ana   = _phase_flat_vec(x0_true,  PHASE_IDX_ANATELO)
+#     true_pro   = _phase_flat_vec(x0_true,  PHASE_IDX_PROMETA)
+#     pred_sims = (_batch_dot(pred_pro, pred_ana),
+#                  _batch_dot(pred_ana, pred_early),
+#                  _batch_dot(pred_pro, pred_early))
+#     true_sims = (_batch_dot(true_pro, true_ana).detach(),
+#                  _batch_dot(true_ana, true_early).detach(),
+#                  _batch_dot(true_pro, true_early).detach())
+#     return sum(F.mse_loss(p, t) for p, t in zip(pred_sims, true_sims)) / len(pred_sims)
 
 
 # def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
@@ -332,7 +590,7 @@ def eval_batch_loss(model, batch, device, generator: torch.Generator | None = No
         gamma_t  = torch.rand(batch_size, device=device) * (GAMMA_MAX - GAMMA_MIN) + GAMMA_MIN
         eps_true = torch.randn_like(x0_current)
 
-    gamma_4d = gamma_t[:, None, None, None]   # (B, 1, 1, 1) broadcasts with (B, 4, N, N)
+    gamma_4d = gamma_t[:, None, None, None]   # (B, 1, 1, 1) broadcasts with (B, 5, N, N)
     y_gamma  = torch.sqrt(gamma_4d) * x0_current + torch.sqrt(1.0 - gamma_4d) * eps_true
 
     eps_pred, _ = model(
@@ -359,16 +617,25 @@ def compute_validation_loss(model, val_dataloader, device):
     return total_loss / n_batches if n_batches else 0.0
 
 
-def train_step(model, raw_model, optimizer, batch, device):
+def train_step(model, raw_model, optimizer, batch, device,
+               loop_label_dict: dict, loop_class_weights: torch.Tensor):
     """
     Single training step for SR3-style iterative refinement.
 
     Args:
-        model:     nn.DataParallel-wrapped (or plain) SR3UNet — used for forward pass
-        raw_model: Underlying SR3UNet (model.module when DataParallel, else model itself).
-                   Used directly for chip_aux_pred to avoid DP re-scattering a small tensor.
+        model:              nn.DataParallel-wrapped (or plain) SR3UNet — used for forward pass.
+        raw_model:          Underlying SR3UNet; used directly for loop_class_logits to avoid
+                            DataParallel re-scattering a small tensor.
+        loop_label_dict:    Mapping region_str → label (0/1/2/-1).  Built once at startup from
+                            the loop-feature Excel file.  Labels:
+                              -1 : ambiguous (cluster-1/2 AND cluster-3 present) — skip in loss
+                               0 : no loop
+                               1 : cluster-1 or cluster-2 loop
+                               2 : cluster-3 loop
+        loop_class_weights: (3,) inverse-frequency weights for the cross-entropy loss so that
+                            each loop class contributes equally regardless of prevalence.
     Returns:
-        (total_loss, mse_loss, chip_aux_loss) as floats
+        (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss) as floats
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -378,7 +645,7 @@ def train_step(model, raw_model, optimizer, batch, device):
 
     # SR3: sample γ ~ Uniform(γ_min, γ_max) continuously
     gamma_t  = torch.rand(batch_size, device=device) * (GAMMA_MAX - GAMMA_MIN) + GAMMA_MIN
-    gamma_4d = gamma_t[:, None, None, None]  # (B, 1, 1, 1) broadcasts with (B, 4, N, N)
+    gamma_4d = gamma_t[:, None, None, None]  # (B, 1, 1, 1) broadcasts with (B, 5, N, N)
 
     eps_true = torch.randn_like(x0_current)
     y_gamma  = torch.sqrt(gamma_4d) * x0_current + torch.sqrt(1.0 - gamma_4d) * eps_true
@@ -391,21 +658,48 @@ def train_step(model, raw_model, optimizer, batch, device):
         bulk_map,
     )
 
-    channel_weights  = torch.tensor([0.20, 0.20, 0.20, 0.40], device=device)
-    mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (4,)
+    channel_weights  = torch.tensor([0.133, 0.133, 0.133, 0.3, 0.3], device=device)
+    mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (5,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # ---- Chip aux: SSIM between clean phase maps and chip-head prediction ----
-    chip_pred = raw_model.chip_aux_pred(h_chip)
-    chip_aux_loss = ssim_1_minus_mean(chip_pred, x0_current)
+    # ---- IW-SSIM on noise residuals: emphasises structurally rich regions ----
+    iw_ssim_per_channel      = iw_ssim_map(eps_pred, eps_true)       # (B, C=5)
+    iw_ssim_per_channel_mean = iw_ssim_per_channel.mean(dim=0)       # (C=5,)
+    iw_ssim_main_loss        = (channel_weights * (1.0 - iw_ssim_per_channel_mean)).sum()
 
-    loss = mse_loss + chip_aux_loss / 10
+    # ---- Loop classification: predict loop presence/type from ChIP pair features ----
+    # loop_class_logits: (B, 3) — classes 0/1/2 (no-loop / cluster-1or2 / cluster-3)
+    loop_logits = raw_model.loop_class_logits(h_chip)          # (B, 3)
+
+    regions = batch["region"]                                   # list of B strings
+    loop_labels = torch.tensor(
+        [loop_label_dict.get(r, 0) for r in regions],
+        dtype=torch.long, device=device,
+    )                                                           # (B,)
+
+    # Skip samples where both cluster-1/2 and cluster-3 loops are present (label == -1)
+    valid_mask = loop_labels >= 0
+    if valid_mask.any():
+        chip_loop_loss = F.cross_entropy(
+            loop_logits[valid_mask],
+            loop_labels[valid_mask],
+            weight=loop_class_weights.to(device),
+        )
+    else:
+        chip_loop_loss = loop_logits.new_zeros(())
+
+    #breakpoint()
+
+    loss = mse_loss + iw_ssim_main_loss + chip_loop_loss / 10
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), mse_loss.item(), chip_aux_loss.item()
+    return (
+        loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
+        chip_loop_loss.item() / 10,
+    )
 
 
 ############################################
@@ -421,7 +715,7 @@ def main():
     num_epochs        = args.num_epochs if args.num_epochs is not None else NUM_EPOCHS
 
     print("="*80)
-    print("TRAINING: all four phases (matrix I/O, diagonal + off-diagonal crops)")
+    print("TRAINING: all five phases (matrix I/O, diagonal + off-diagonal crops)")
     print("="*80)
     print(f"Device: {DEVICE}")
     print(f"Matrix size: {N}×{N}")
@@ -460,7 +754,7 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "2"
+    HOLD_OUT_CHROMOSOME = "14"
 
     processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
     if not processed_data_dir.exists():
@@ -518,10 +812,10 @@ def main():
 
     test_dataset = HoldoutDataset(cell_cycle_loader_eval, holdout_regions)
 
-    NUM_VAL_SAMPLES     = 30
-    validation_regions  = get_validation_regions_chr2(holdout_regions, n=NUM_VAL_SAMPLES)
+    NUM_VAL_SAMPLES = 30
+    validation_regions = get_validation_regions(holdout_regions, n=NUM_VAL_SAMPLES)
     if not validation_regions:
-        raise ValueError("No chr2 regions left for validation after excluding test-eval targets")
+        raise ValueError(f"No holdout regions on chr{HOLD_OUT_CHROMOSOME} for validation")
 
     val_dataset    = HoldoutDataset(cell_cycle_loader_eval, validation_regions)
     val_dataloader = TorchDataLoader(
@@ -531,7 +825,7 @@ def main():
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
-    print(f"Validation regions (chr2, excluding test-eval): "
+    print(f"Validation regions (chr{HOLD_OUT_CHROMOSOME}, seed={VAL_SPLIT_SEED}): "
           f"{validation_regions[:3]}{'...' if len(validation_regions) > 3 else ''} "
           f"(n={len(validation_regions)})")
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}, Val: {len(val_dataset)}")
@@ -549,37 +843,52 @@ def main():
     print(f"Batches per epoch: {len(train_dataloader)}")
     print("="*80)
 
+    # Build loop label dictionary and balanced class weights once before training starts.
+    excel_path = data_dir / "41586_2019_1778_MOESM5_ESM_split.xlsx"
+    all_regions = cell_cycle_loader_train.regions + cell_cycle_loader_eval.holdout_regions
+    loop_label_dict     = load_loop_label_dict(str(excel_path), all_regions)
+    loop_class_weights  = compute_loop_class_weights(loop_label_dict,
+                                                      cell_cycle_loader_train.regions)
+
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_chip = [], [], []
+        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop = [], [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [4-phase]")
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, chip = train_step(model, raw_model, optimizer, batch, DEVICE)
+            loss, mse, iw_ssim, chip_loop = train_step(
+                model, raw_model, optimizer, batch, DEVICE,
+                loop_label_dict, loop_class_weights,
+            )
             epoch_losses.append(loss)
             epoch_mse.append(mse)
-            epoch_chip.append(chip)
+            epoch_iw_ssim.append(iw_ssim)
+            epoch_chip_loop.append(chip_loop)
             global_step += 1
 
             if global_step % 100 == 0:
                 val_loss = compute_validation_loss(model, val_dataloader, DEVICE)
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
-            # Only update the progress bar postfix every 20 iterations to avoid printing every single iteration
             if global_step % 20 == 0:
-                pbar.set_postfix({'total': f"{loss:.4f}", 'mse': f"{mse:.4f}", 'chip': f"{chip:.4f}"})
-     
+                pbar.set_postfix({
+                    'total':     f"{loss:.4f}",
+                    'mse':       f"{mse:.4f}",
+                    'iw_ssim':   f"{iw_ssim:.4f}",
+                    'chip_loop': f"{chip_loop:.4f}",
+                })
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
-              f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  chip={np.mean(epoch_chip):.6f}")
+              f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
+              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (10, 20, 30, 40):
+        if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_4phase_epoch{epoch+1}_5_5_observed_wide_band.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-1_chip_loop_loss.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
@@ -590,7 +899,7 @@ def main():
             print(f"✓ Saved epoch checkpoint: {checkpoint_path}")
 
     print("\n" + "="*80)
-    print("Training complete for all four phases!")
+    print("Training complete for all five phases!")
     print(f"Best loss: {best_loss:.6f}")
     print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
     print("="*80)
