@@ -690,15 +690,15 @@ def train_step(model, raw_model, optimizer, batch, device,
 
     #breakpoint()
 
-    loss = mse_loss + iw_ssim_main_loss + chip_loop_loss / 10
+    loss = mse_loss + iw_ssim_main_loss / 2 + chip_loop_loss / 20
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     return (
-        loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
-        chip_loop_loss.item() / 10,
+        loss.item(), mse_loss.item(), iw_ssim_main_loss.item() / 2,
+        chip_loop_loss.item() / 20,
     )
 
 
@@ -756,13 +756,17 @@ def main():
 
     HOLD_OUT_CHROMOSOME = "14"
 
-    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
-    if not processed_data_dir.exists():
-        raise ValueError(
-            f"Cache directory not found at {processed_data_dir}. "
-            "Training is cache-only; run preprocess/prestore_hic.py first."
-        )
-    print(f"Using pre-stored cache (cache-only training): {processed_data_dir}")
+    processed_data_dir = [
+        Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
+        Path(__file__).parent.parent / "processed_data" / "kang",
+    ]
+    for _d in processed_data_dir:
+        if not _d.exists():
+            raise ValueError(
+                f"Cache directory not found at {_d}. "
+                "Run preprocess/prestore_hic.py or preprocess/kang/prestore_kang.py first."
+            )
+    print(f"Using pre-stored caches (cache-only training): {[str(d) for d in processed_data_dir]}")
 
     base_loader_kwargs = dict(
         data_dir=data_dir,
