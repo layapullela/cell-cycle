@@ -22,7 +22,7 @@ Output layout:
 Each .npz contains:
   prometa, anatelo, earlyG1, midG1, lateG1       : float32 (N,N) KR-obs counts
   chip_ctcf_row/col, chip_hac_row/col,
-  chip_h3k4me1_row/col, chip_h3k4me3_row/col    : float32 (N,) log1p(sum-max-per-bin)
+  chip_h3k4me1_row/col, chip_h3k4me3_row/col    : float32 (N,) chrom z-scored log1p(sum-max-per-bin)
 
 Keys match Zhang format exactly, so CellCycleDataLoader loads Kang patches
 with no special-case logic.
@@ -53,6 +53,15 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from preprocess.chip_signal import (
+    apply_chip_zscore,
+    compute_chip_chrom_stats,
+)
 
 # ---------------------------------------------------------------------------
 # Phase → list of .hic filenames to sum (within the raw_data_dir)
@@ -172,7 +181,7 @@ CHROMOSOME_SIZES: Dict[str, int] = {
 MIN_START           = 3_000_000
 RESOLUTION          = 10_000
 REGION_SIZE         = 640_000
-STEP_PIXELS         = 10
+STEP_PIXELS         = 20
 STEP_BP             = STEP_PIXELS * RESOLUTION
 OFFDIAG_NEAR_BAND   = 5_000_000
 OFFDIAG_PER_DIAG    = 2
@@ -183,6 +192,7 @@ OFFDIAG_PER_DIAG    = 2
 _hic_paths: Dict[str, List[str]] = {}
 _chip_paths: Dict[str, List[Optional[str]]] = {}
 _bw_handles: Dict[str, List[object]] = {}
+_chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
 _resolution: int = RESOLUTION
 _image_size: int = REGION_SIZE // RESOLUTION
 _hic_data_type: str = "observed"
@@ -196,8 +206,10 @@ def _init(
     hic_data_type: str,
     normalization: str,
     chrom_prefix: str,
+    chromosomes: Optional[List[str]] = None,
 ) -> None:
-    global _hic_paths, _chip_paths, _bw_handles, _hic_data_type, _normalization, _chrom_prefix
+    global _hic_paths, _chip_paths, _bw_handles, _chip_chrom_stats
+    global _hic_data_type, _normalization, _chrom_prefix
     _hic_paths = hic_paths
     _chip_paths = chip_paths
     _hic_data_type = hic_data_type
@@ -217,6 +229,17 @@ def _init(
                 except Exception:
                     handles.append(None)
         _bw_handles[mark] = handles
+
+    chroms = chromosomes if chromosomes is not None else list(CHROMOSOME_SIZES.keys())
+    _chip_chrom_stats = {}
+    print("\nChIP-seq chromosome stats (log1p, chromosome-wide z-score):")
+    for chrom in chroms:
+        for mark, bw_list in _bw_handles.items():
+            mean, std = compute_chip_chrom_stats(
+                bw_list, chrom, CHROMOSOME_SIZES, RESOLUTION, chrom_prefix=chrom_prefix or "chr",
+            )
+            _chip_chrom_stats[(mark, chrom)] = (mean, std)
+            print(f"  {mark} chr{chrom}: mean={mean:.4f} std={std:.4f}")
 
 
 def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
@@ -288,8 +311,10 @@ def _sum_matrices(
     return total
 
 
-def _extract_chip_1d(chrom: str, start: int, end: int, bw_list: List[object]) -> np.ndarray:
-    """Extract log1p(sum-max) bigWig signal per bin, summed over provided handles."""
+def _extract_chip_1d(
+    chrom: str, start: int, end: int, mark: str, bw_list: List[object],
+) -> np.ndarray:
+    """Extract chromosome z-scored log1p(sum-max) bigWig signal per bin."""
     chrom_name = "chr" + chrom
     accum = np.zeros(_image_size, dtype=np.float64)
     for bw in bw_list:
@@ -303,7 +328,8 @@ def _extract_chip_1d(chrom: str, start: int, end: int, bw_list: List[object]) ->
                 accum[i] += vals[0] if vals and vals[0] is not None else 0.0
             except Exception:
                 pass
-    return np.log1p(accum).astype(np.float32)
+    mean, std = _chip_chrom_stats[(mark, chrom)]
+    return apply_chip_zscore(np.log1p(accum), mean, std)
 
 
 def _process_region(args: Tuple[str, Path]) -> Optional[str]:
@@ -323,8 +349,8 @@ def _process_region(args: Tuple[str, Path]) -> Optional[str]:
 
     is_diagonal = (rs == cs)
     for mark, bw_list in _bw_handles.items():
-        row_sig = _extract_chip_1d(chrom, rs, re, bw_list)
-        col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, bw_list)
+        row_sig = _extract_chip_1d(chrom, rs, re, mark, bw_list)
+        col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, mark, bw_list)
         arrays[f"chip_{mark}_row"] = row_sig
         arrays[f"chip_{mark}_col"] = col_sig
 
@@ -476,6 +502,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         hic_data_type=args.hic_type,
         normalization=args.norm,
         chrom_prefix=chrom_prefix,
+        chromosomes=chromosomes,
     )
 
     for region in tqdm(pending, desc="Caching Kang"):
