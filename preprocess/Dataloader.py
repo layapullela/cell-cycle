@@ -10,6 +10,12 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Union, Optional, Tuple, Sequence
 
+from preprocess.chip_signal import (
+    CHROMOSOME_SIZES_MM10,
+    apply_chip_zscore,
+    compute_chip_chrom_stats,
+)
+
 
 class CellCycleDataLoader:
     """
@@ -64,6 +70,7 @@ class CellCycleDataLoader:
         self.phase_paths: Dict[str, Path] = {}
         self._chipseq_paths: Dict[str, Optional[str]] = {}
         self.chipseq_files: Dict[str, Optional[object]] = {}
+        self._chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
         # Normalise processed_data_dir to a list of Path objects.
         # A single Path or str is wrapped in a list; a sequence is converted element-wise.
@@ -178,14 +185,27 @@ class CellCycleDataLoader:
                 matrix[x2, y2] = val
         return matrix
 
-    def _extract_chipseq_signal_live(self, region_1d: str, bw) -> np.ndarray:
+    def _chip_chrom_stats_for(self, mark: str, chrom: str, bw) -> Tuple[float, float]:
+        chrom_key = chrom[3:] if chrom.startswith("chr") else chrom
+        cache_key = (mark, chrom_key)
+        if cache_key in self._chip_chrom_stats:
+            return self._chip_chrom_stats[cache_key]
+        if bw is None or chrom_key not in CHROMOSOME_SIZES_MM10:
+            stats = (0.0, 1.0)
+        else:
+            stats = compute_chip_chrom_stats(bw, chrom_key, CHROMOSOME_SIZES_MM10, self.resolution)
+        self._chip_chrom_stats[cache_key] = stats
+        return stats
+
+    def _extract_chipseq_signal_live(self, region_1d: str, mark: str, bw) -> np.ndarray:
         if bw is None:
             return np.zeros(self.image_size, dtype=np.float32)
         parts = region_1d.split(':')
         chrom = parts[0]
+        chrom_key = chrom[3:] if chrom.startswith("chr") else chrom
         start, end = map(int, parts[1].split('-'))
         signal = np.zeros(self.image_size, dtype=np.float32)
-        chrom_name = "chr" + chrom
+        chrom_name = chrom if chrom.startswith("chr") else "chr" + chrom
         try:
             for i in range(self.image_size):
                 bin_start = start + i * self.resolution
@@ -194,7 +214,8 @@ class CellCycleDataLoader:
                 signal[i] = np.log1p(values[0] if values[0] is not None else 0.0)
         except Exception:
             pass
-        return signal
+        mean, std = self._chip_chrom_stats_for(mark, chrom_key, bw)
+        return apply_chip_zscore(signal, mean, std)
 
     def _load_from_live(self, region: str, do_flip: bool) -> Dict[str, object]:
         if not self.phase_paths:
@@ -248,8 +269,8 @@ class CellCycleDataLoader:
 
         for mark in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
             bw = self.chipseq_files.get(mark)
-            row = self._extract_chipseq_signal_live(row_1d, bw)
-            col = row.copy() if is_diagonal else self._extract_chipseq_signal_live(col_1d, bw)
+            row = self._extract_chipseq_signal_live(row_1d, mark, bw)
+            col = row.copy() if is_diagonal else self._extract_chipseq_signal_live(col_1d, mark, bw)
             if do_flip:
                 row = np.flip(row).copy()
                 col = np.flip(col).copy()
@@ -379,11 +400,8 @@ class CellCycleDataLoader:
         Load a pre-stored .npz file and return a fully normalised sample dict,
         or None if no cache file exists.
 
-        Supports two .npz formats:
-          Zhang format  : keys earlyG1, midG1, lateG1, anatelo, prometa
-          Kang format   : keys earlyG1_a, earlyG1_b, midG1_a, midG1_b,
-                                lateG1_a, lateG1_b, anatelo, prometa
-                         (detected by presence of 'earlyG1_a'; type a/b chosen 50/50)
+        Both Zhang and Kang caches use the same keys:
+          earlyG1, midG1, lateG1, anatelo, prometa
 
         When multiple source paths exist for the same region (multi-dataset), one is
         chosen uniformly at random so that all sources contribute equally.
@@ -398,21 +416,8 @@ class CellCycleDataLoader:
         data   = np.load(path)
         sample = {'region': region}
 
-        # ---- Detect Kang format and resolve phase keys ----
-        is_kang = 'earlyG1_a' in data
-        if is_kang:
-            ab = '_a' if np.random.rand() < 0.5 else '_b'
-            phase_keys = {
-                'earlyG1': f'earlyG1{ab}',
-                'midG1':   f'midG1{ab}',
-                'lateG1':  f'lateG1{ab}',
-                'anatelo': 'anatelo',
-                'prometa': 'prometa',
-            }
-        else:
-            phase_keys = {ph: ph for ph in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')}
-
         # ---- Hi-C phases ----
+        phase_keys = {ph: ph for ph in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')}
         clipped: Dict[str, np.ndarray] = {}
         for phase, key in phase_keys.items():
             mat = data[key].copy()
@@ -444,7 +449,7 @@ class CellCycleDataLoader:
                 normalized = np.flip(normalized, axis=(0, 1)).copy()
             sample[phase] = normalized
 
-        # ---- ChIP-seq tracks (already log1p in the .npz) ----
+        # ---- ChIP-seq tracks (chromosome z-scored log1p in the .npz) ----
         for mark in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
             row = data[f"chip_{mark}_row"].copy()
             col = data[f"chip_{mark}_col"].copy()
@@ -470,7 +475,7 @@ class CellCycleDataLoader:
         Returns a sample dict with:
           region           : str
           earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) matrices, normalised to [-1,1]
-          chip_seq_{mark}_row / _col                : float32 (N,) log1p ChIP-seq signals
+          chip_seq_{mark}_row / _col                : float32 (N,) chrom z-scored log1p ChIP-seq signals
         """
         if isinstance(idx, str):
             region = idx
