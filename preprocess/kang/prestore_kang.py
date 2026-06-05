@@ -8,35 +8,31 @@ Kang et al. arrest-release time course (U2OS human cells, hg19):
   120/180 min → mid G1
   240/360 min → late G1
 
-Phase composition (type a and type b are a data-augmentation pair):
-  prometa    = Rep1@0min   + Rep2@0min    (same for a and b)
-  anatelo    = Rep1@35min  + Rep2@35min   (same for a and b)
-  earlyG1_a  = Rep1@60min  + Rep2@90min
-  earlyG1_b  = Rep2@60min  + Rep1@90min
-  midG1_a    = Rep1@120min + Rep2@180min
-  midG1_b    = Rep2@120min + Rep1@180min
-  lateG1_a   = Rep1@240min + Rep2@360min
-  lateG1_b   = Rep2@240min + Rep1@360min
+Phase composition (all replicates summed; G1 phases divided by 2 to normalise for
+having 4 input maps instead of 2):
+  prometa  = Rep1@0min   + Rep2@0min
+  anatelo  = Rep1@35min  + Rep2@35min
+  earlyG1  = (Rep1@60min + Rep2@60min + Rep1@90min  + Rep2@90min)  / 2
+  midG1    = (Rep1@120min+ Rep2@120min+ Rep1@180min + Rep2@180min) / 2
+  lateG1   = (Rep1@240min+ Rep2@240min+ Rep1@360min + Rep2@360min) / 2
 
 Output layout:
   <output_dir>/chr{chrom}/{row_start}-{row_end},{col_start}-{col_end}.npz
 
 Each .npz contains:
-  prometa, anatelo                                : float32 (N,N) summed KR-obs counts
-  earlyG1_a, earlyG1_b                           : float32 (N,N)
-  midG1_a,   midG1_b                             : float32 (N,N)
-  lateG1_a,  lateG1_b                            : float32 (N,N)
+  prometa, anatelo, earlyG1, midG1, lateG1       : float32 (N,N) KR-obs counts
   chip_ctcf_row/col, chip_hac_row/col,
-  chip_h3k4me1_row/col, chip_h3k4me3_row/col    : float32 (N,) log1p(avg-max-per-bin)
+  chip_h3k4me1_row/col, chip_h3k4me3_row/col    : float32 (N,) log1p(sum-max-per-bin)
 
-NOTE: The presence of the key 'earlyG1_a' signals Kang format to CellCycleDataLoader,
-which then randomly picks type a or b at load time (50/50 augmentation).
+Keys match Zhang format exactly, so CellCycleDataLoader loads Kang patches
+with no special-case logic.
 
-ChIP-seq marks used (interphase tracks, averaged across two replicates):
-  ctcf     : GSM4194671 + GSM4194672
-  hac      : H3K27ac proxy: GSM4194659 + GSM4194660
-  h3k4me1  : GSM4194665 + GSM4194666
-  h3k4me3  : GSM4194653 + GSM4194654
+ChIP-seq marks used (bulk = sum over interphase + prometaphase + anatelophase,
+two replicates per phase):
+  ctcf     : GSM4194671–676  (I/M/AT × r1/r2)
+  hac      : H3K27ac proxy: GSM4194659–664
+  h3k4me1  : GSM4194665–670
+  h3k4me3  : GSM4194653–658
 
 Usage:
   python preprocess/kang/prestore_kang.py \
@@ -62,23 +58,105 @@ from tqdm import tqdm
 # Phase → list of .hic filenames to sum (within the raw_data_dir)
 # ---------------------------------------------------------------------------
 PHASE_HIC_FILES: Dict[str, List[str]] = {
-    "prometa":   ["GSM4194449_U2OS_0min_Rep1.hic",   "GSM4194450_U2OS_0min_Rep2.hic"],
-    "anatelo":   ["GSM4194451_U2OS_35min_Rep1.hic",  "GSM4194452_U2OS_35min_Rep2.hic"],
-    "earlyG1_a": ["GSM4194453_U2OS_60min_Rep1.hic",  "GSM4194456_U2OS_90min_Rep2.hic"],
-    "earlyG1_b": ["GSM4194454_U2OS_60min_Rep2.hic",  "GSM4194455_U2OS_90min_Rep1.hic"],
-    "midG1_a":   ["GSM4194457_U2OS_120min_Rep1.hic", "GSM4194460_U2OS_180min_Rep2.hic"],
-    "midG1_b":   ["GSM4194458_U2OS_120min_Rep2.hic", "GSM4194459_U2OS_180min_Rep1.hic"],
-    "lateG1_a":  ["GSM4194461_U2OS_240min_Rep1.hic", "GSM4194464_U2OS_360min_Rep2.hic"],
-    "lateG1_b":  ["GSM4194462_U2OS_240min_Rep2.hic", "GSM4194463_U2OS_360min_Rep1.hic"],
+    "prometa": ["GSM4194449_U2OS_0min_Rep1.hic",   "GSM4194450_U2OS_0min_Rep2.hic"],
+    "anatelo": ["GSM4194451_U2OS_35min_Rep1.hic",  "GSM4194452_U2OS_35min_Rep2.hic"],
+    "earlyG1": ["GSM4194453_U2OS_60min_Rep1.hic",  "GSM4194454_U2OS_60min_Rep2.hic",
+                "GSM4194455_U2OS_90min_Rep1.hic",  "GSM4194456_U2OS_90min_Rep2.hic"],
+    "midG1":   ["GSM4194457_U2OS_120min_Rep1.hic", "GSM4194458_U2OS_120min_Rep2.hic",
+                "GSM4194459_U2OS_180min_Rep1.hic", "GSM4194460_U2OS_180min_Rep2.hic"],
+    "lateG1":  ["GSM4194461_U2OS_240min_Rep1.hic", "GSM4194462_U2OS_240min_Rep2.hic",
+                "GSM4194463_U2OS_360min_Rep1.hic", "GSM4194464_U2OS_360min_Rep2.hic"],
 }
 
-# ChIP-seq: two interphase replicates per mark (averaged at extraction time).
+# G1 phases each sum 4 maps; divide by 2 to keep counts on the same scale as
+# prometa/anatelo (which sum 2 maps).
+PHASE_DIVISOR: Dict[str, float] = {
+    "prometa": 1.0,
+    "anatelo": 1.0,
+    "earlyG1": 2.0,
+    "midG1":   2.0,
+    "lateG1":  2.0,
+}
+
+# Per-file depth-normalization scales.
+#
+# KR normalization equalizes bias *within* a file but does nothing for
+# differences in library size *between* files.  If one replicate has fewer
+# reads, its KR matrix has a lower absolute scale, which biases the phase
+# sum toward denser replicates and away from sparser ones.
+#
+# These scale factors normalize every file to the same genome-wide
+# intra-chromosomal contact total (mean across all 16 replicates = 140.6 M),
+# computed from `analysis.py` using 1 Mb / NONE normalization:
+#   scale_i = 140.6e6 / total_intra_i
+#
+# After per-file scaling the simple PHASE_DIVISOR = {1,1,2,2,2} is exact.
+PER_FILE_DEPTH_SCALE: Dict[str, float] = {
+    "GSM4194449_U2OS_0min_Rep1.hic":   140.6e6 / 148_694_517,   # 0.946
+    "GSM4194450_U2OS_0min_Rep2.hic":   140.6e6 / 158_004_507,   # 0.890
+    "GSM4194451_U2OS_35min_Rep1.hic":  140.6e6 / 145_695_432,   # 0.965
+    "GSM4194452_U2OS_35min_Rep2.hic":  140.6e6 / 143_264_696,   # 0.981
+    "GSM4194453_U2OS_60min_Rep1.hic":  140.6e6 / 189_003_393,   # 0.744
+    "GSM4194454_U2OS_60min_Rep2.hic":  140.6e6 /  72_670_396,   # 1.934
+    "GSM4194455_U2OS_90min_Rep1.hic":  140.6e6 / 192_233_225,   # 0.731
+    "GSM4194456_U2OS_90min_Rep2.hic":  140.6e6 / 113_173_598,   # 1.242
+    "GSM4194457_U2OS_120min_Rep1.hic": 140.6e6 / 177_575_981,   # 0.792
+    "GSM4194458_U2OS_120min_Rep2.hic": 140.6e6 /  86_728_482,   # 1.621
+    "GSM4194459_U2OS_180min_Rep1.hic": 140.6e6 / 144_055_628,   # 0.976
+    "GSM4194460_U2OS_180min_Rep2.hic": 140.6e6 /  68_538_581,   # 2.053
+    "GSM4194461_U2OS_240min_Rep1.hic": 140.6e6 / 200_549_901,   # 0.701
+    "GSM4194462_U2OS_240min_Rep2.hic": 140.6e6 /  83_623_304,   # 1.682
+    "GSM4194463_U2OS_360min_Rep1.hic": 140.6e6 / 209_688_282,   # 0.670
+    "GSM4194464_U2OS_360min_Rep2.hic": 140.6e6 / 116_350_899,   # 1.208
+}
+
+# ChIP-seq bulk tracks: sum per-bin max across all phases and replicates.
 # hac slot uses H3K27ac as a functional proxy.
 CHIP_BW_FILES: Dict[str, List[str]] = {
-    "ctcf":    ["GSM4194671_HK81_CTCF_I_S10_both.bw",   "GSM4194672_HK148_CTCF_I_S10_both.bw"],
-    "hac":     ["GSM4194659_HK75_H3K27ac_I_S4_both.bw", "GSM4194660_HK158_H3K27ac_I1_S1_both.bw"],
-    "h3k4me1": ["GSM4194665_HK78_H3K4me1_I_S7_both.bw", "GSM4194666_HK145_H3K4me1_I_S7_both.bw"],
-    "h3k4me3": ["GSM4194653_HK72_H3K4me3_I_S1_both.bw", "GSM4194654_HK139_H3K4me3_I_S1_both.bw"],
+    "ctcf": [
+        # Interphase
+        "GSM4194671_HK81_CTCF_I_S10_both.bw",
+        "GSM4194672_HK148_CTCF_I_S10_both.bw",
+        # Prometaphase
+        "GSM4194673_HK82_CTCF_M_S11_both.bw",
+        "GSM4194674_HK149_CTCF_M_S11_both.bw",
+        # Anaphase/Telophase
+        "GSM4194675_HK83_CTCF_AT_S12_both.bw",
+        "GSM4194676_HK150_CTCF_AT_S12_both.bw",
+    ],
+    "hac": [
+        # Interphase
+        "GSM4194659_HK75_H3K27ac_I_S4_both.bw",
+        "GSM4194660_HK158_H3K27ac_I1_S1_both.bw",
+        # Prometaphase
+        "GSM4194661_HK76_H3K27ac_M_S5_both.bw",
+        "GSM4194662_HK160_H3K27ac_M1_S3_both.bw",
+        # Anaphase/Telophase
+        "GSM4194663_HK77_H3K27ac_AT_S6_both.bw",
+        "GSM4194664_HK162_H3K27ac_AT1_S5_both.bw",
+    ],
+    "h3k4me1": [
+        # Interphase
+        "GSM4194665_HK78_H3K4me1_I_S7_both.bw",
+        "GSM4194666_HK145_H3K4me1_I_S7_both.bw",
+        # Prometaphase
+        "GSM4194667_HK79_H3K4me1_M_S8_both.bw",
+        "GSM4194668_HK146_H3K4me1_M_S8_both.bw",
+        # Anaphase/Telophase
+        "GSM4194669_HK80_H3K4me1_AT_S9_both.bw",
+        "GSM4194670_HK147_H3K4me1_AT_S9_both.bw",
+    ],
+    "h3k4me3": [
+        # Interphase
+        "GSM4194653_HK72_H3K4me3_I_S1_both.bw",
+        "GSM4194654_HK139_H3K4me3_I_S1_both.bw",
+        # Prometaphase
+        "GSM4194655_HK73_H3K4me3_M_S2_both.bw",
+        "GSM4194656_HK140_H3K4me3_M_S2_both.bw",
+        # Anaphase/Telophase
+        "GSM4194657_HK74_H3K4me3_AT_S3_both.bw",
+        "GSM4194658_HK141_H3K4me3_AT_S3_both.bw",
+    ],
 }
 
 # hg19 chromosome sizes
@@ -150,7 +228,11 @@ def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
 
 
 def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: int) -> np.ndarray:
-    """Extract one (N,N) contact matrix from a single .hic file."""
+    """Extract one (N,N) KR-normalized contact matrix from a single .hic file.
+
+    Applies PER_FILE_DEPTH_SCALE so that every replicate is normalised to the
+    same genome-wide intra-chromosomal total before being added to the phase sum.
+    """
     import hicstraw as straw
     qchrom = _chrom_prefix + chrom
     try:
@@ -182,27 +264,37 @@ def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: in
         yj2 = int((rec.binX - cs) // _resolution)
         if 0 <= xi2 < _image_size and 0 <= yj2 < _image_size and (xi2, yj2) != (xi, yj):
             mat[xi2, yj2] = val
+
+    # Apply per-file depth normalization scale (look up by filename only)
+    fname = Path(hic_file).name
+    scale = PER_FILE_DEPTH_SCALE.get(fname, 1.0)
+    if scale != 1.0:
+        mat *= scale
+
     return mat
 
 
-def _sum_matrices(hic_files: List[str], chrom: str, rs: int, re: int, cs: int, ce: int) -> np.ndarray:
-    """Sum contact matrices across a list of .hic files (replicate merging)."""
+def _sum_matrices(
+    hic_files: List[str], chrom: str, rs: int, re: int, cs: int, ce: int,
+    divisor: float = 1.0,
+) -> np.ndarray:
+    """Sum depth-normalized contact matrices across a list of .hic files, then divide by divisor."""
     total = np.zeros((_image_size, _image_size), dtype=np.float32)
     for f in hic_files:
         if f is not None:
             total += _extract_matrix(f, chrom, rs, re, cs, ce)
+    if divisor != 1.0:
+        total /= divisor
     return total
 
 
 def _extract_chip_1d(chrom: str, start: int, end: int, bw_list: List[object]) -> np.ndarray:
-    """Extract log1p(avg-max) bigWig signal per bin, averaged over provided handles."""
+    """Extract log1p(sum-max) bigWig signal per bin, summed over provided handles."""
     chrom_name = "chr" + chrom
-    n_valid = 0
     accum = np.zeros(_image_size, dtype=np.float64)
     for bw in bw_list:
         if bw is None:
             continue
-        n_valid += 1
         for i in range(_image_size):
             b0 = start + i * _resolution
             b1 = start + (i + 1) * _resolution
@@ -211,8 +303,6 @@ def _extract_chip_1d(chrom: str, start: int, end: int, bw_list: List[object]) ->
                 accum[i] += vals[0] if vals and vals[0] is not None else 0.0
             except Exception:
                 pass
-    if n_valid > 0:
-        accum /= n_valid
     return np.log1p(accum).astype(np.float32)
 
 
@@ -228,7 +318,8 @@ def _process_region(args: Tuple[str, Path]) -> Optional[str]:
 
     arrays: Dict[str, np.ndarray] = {}
     for phase_key, hic_files in _hic_paths.items():
-        arrays[phase_key] = _sum_matrices(hic_files, chrom, rs, re, cs, ce)
+        divisor = PHASE_DIVISOR.get(phase_key, 1.0)
+        arrays[phase_key] = _sum_matrices(hic_files, chrom, rs, re, cs, ce, divisor=divisor)
 
     is_diagonal = (rs == cs)
     for mark, bw_list in _bw_handles.items():
@@ -416,3 +507,13 @@ if __name__ == "__main__":
 #   --output=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.out \
 #   --error=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.err \
 #   --wrap="source ~/.bashrc && conda activate test_env && cd /nfs/turbo/umms-minjilab/lpullela/cell-cycle && python preprocess/kang/prestore_kang.py --raw_data_dir raw_data/kang --output_dir processed_data/kang --chrom_prefix chr --chrom 1"
+
+# sbatch --job-name=prestore_kang_chr1 \
+#   --partition=standard \
+#   --account=minjilab99 \
+#   --time=3:00:00 \
+#   --mem=32G \
+#   --cpus-per-task=4 \
+#   --output=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.out \
+#   --error=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.err \
+#   --wrap="source ~/.bashrc && conda activate test_env && cd /nfs/turbo/umms-minjilab/lpullela/cell-cycle && python preprocess/kang/prestore_kang.py --raw_data_dir raw_data/kang --output_dir processed_data/kang --chrom_prefix chr --chrom 3 --no_chr_prefix"
