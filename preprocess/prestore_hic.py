@@ -11,7 +11,7 @@ Output layout:
 Each `.npz` contains:
   earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) raw counts (no log transform)
   chip_ctcf_row/col, chip_hac_row/col, chip_h3k4me1_row/col, chip_h3k4me3_row/col
-                                  float32 (N,) log1p(max-per-bin) tracks
+                                  float32 (N,) chrom z-scored log1p(max-per-bin) tracks
 """
 
 from __future__ import annotations
@@ -25,6 +25,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from preprocess.chip_signal import apply_chip_zscore, compute_chip_chrom_stats
+
 # ---------------------------------------------------------------------------
 # Single-process globals (initialized once in main)
 # ---------------------------------------------------------------------------
@@ -35,6 +41,7 @@ _image_size: int = 64
 _hic_data_type: str = "oe"
 _normalization: str = "KR"
 _bw_handles: Dict[str, object] = {}
+_chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
 
 def _init_single_process(
@@ -46,7 +53,8 @@ def _init_single_process(
     normalization: str,
 ) -> None:
     """Initialize globals and open bigWig handles once (single process)."""
-    global _hic_paths, _chip_paths, _resolution, _image_size, _hic_data_type, _normalization, _bw_handles
+    global _hic_paths, _chip_paths, _resolution, _image_size, _hic_data_type, _normalization
+    global _bw_handles, _chip_chrom_stats
     _hic_paths = hic_paths
     _chip_paths = chip_paths
     _resolution = int(resolution)
@@ -65,6 +73,14 @@ def _init_single_process(
             _bw_handles[key] = pyBigWig.open(path)
         except Exception:
             _bw_handles[key] = None
+
+    _chip_chrom_stats = {}
+    print("\nChIP-seq chromosome stats (log1p, chromosome-wide z-score):")
+    for chrom in CHROMOSOME_SIZES:
+        for mark, bw in _bw_handles.items():
+            mean, std = compute_chip_chrom_stats(bw, chrom, CHROMOSOME_SIZES, _resolution)
+            _chip_chrom_stats[(mark, chrom)] = (mean, std)
+            print(f"  {mark} chr{chrom}: mean={mean:.4f} std={std:.4f}")
 
 
 def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
@@ -113,8 +129,8 @@ def _extract_matrix(hic_file: str, region: str) -> np.ndarray:
     return mat
 
 
-def _extract_chip_1d(chrom: str, start: int, end: int, bw) -> np.ndarray:
-    """Extract log1p(max) bigWig signal per Hi-C bin across [start,end)."""
+def _extract_chip_1d(chrom: str, start: int, end: int, mark: str, bw) -> np.ndarray:
+    """Extract chromosome z-scored log1p(max) bigWig signal per Hi-C bin across [start,end)."""
     signal = np.zeros(_image_size, dtype=np.float32)
     if bw is None:
         return signal
@@ -124,7 +140,8 @@ def _extract_chip_1d(chrom: str, start: int, end: int, bw) -> np.ndarray:
         b1 = start + (i + 1) * _resolution
         values = bw.stats(chrom_name, b0, b1, type="max")
         signal[i] = np.log1p(values[0] if values and values[0] is not None else 0.0)
-    return signal
+    mean, std = _chip_chrom_stats[(mark, chrom)]
+    return apply_chip_zscore(signal, mean, std)
 
 
 def _process_region(args: Tuple[str, Path]) -> Optional[str]:
@@ -152,8 +169,8 @@ def _process_region(args: Tuple[str, Path]) -> Optional[str]:
 
     for mark in ("ctcf", "hac", "h3k4me1", "h3k4me3"):
         bw = _bw_handles.get(mark)
-        row_sig = _extract_chip_1d(chrom, rs, re, bw)
-        col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, bw)
+        row_sig = _extract_chip_1d(chrom, rs, re, mark, bw)
+        col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, mark, bw)
         arrays[f"chip_{mark}_row"] = row_sig
         arrays[f"chip_{mark}_col"] = col_sig
 
