@@ -65,10 +65,12 @@ class CellCycleDataset(Dataset):
 ############################################
 # Five-channel decomposition: bulk = average(earlyG1, midG1, lateG1, anatelo, prometa)
 # Model outputs channel 0=earlyG1, 1=midG1, 2=lateG1, 3=anatelo, 4=prometa.
-# (Phase-index constants were used by chip_phase_similarity_loss — now removed.)
-# PHASE_IDX_EARLYG1 = 0
-# PHASE_IDX_ANATELO = 3
-# PHASE_IDX_PROMETA = 4
+PHASE_IDX_EARLYG1 = 0
+PHASE_IDX_ANATELO = 3
+PHASE_IDX_PROMETA = 4
+
+# Weight on chip_phase_similarity_loss (cosine MSE; typical raw magnitude ≲ 1).
+CHIP_PHASE_SIM_WEIGHT = 0.1
 
 N = 64                           # contact map size (64 x 64)
 
@@ -256,7 +258,11 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if load_result.missing_keys:
+        print(f"  New params (random init): {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"  Ignored keys: {load_result.unexpected_keys}")
     if 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -485,30 +491,34 @@ def iw_ssim_map(
 #     ).mean()
 
 
-# The three helpers below supported chip_phase_similarity_loss, which compared
-# pairwise dot-product similarities between earlyG1/anatelo/prometa phase maps
-# predicted by the old chip aux head.  All removed with that head.
-#
-# def _phase_flat_vec(maps, phase_idx):
-#     return maps[:, phase_idx].reshape(maps.shape[0], -1)
-#
-# def _batch_dot(a, b):
-#     return (a * b).sum(dim=-1)
-#
-# def chip_phase_similarity_loss(chip_pred, x0_true):
-#     pred_early = _phase_flat_vec(chip_pred, PHASE_IDX_EARLYG1)
-#     pred_ana   = _phase_flat_vec(chip_pred, PHASE_IDX_ANATELO)
-#     pred_pro   = _phase_flat_vec(chip_pred, PHASE_IDX_PROMETA)
-#     true_early = _phase_flat_vec(x0_true,  PHASE_IDX_EARLYG1)
-#     true_ana   = _phase_flat_vec(x0_true,  PHASE_IDX_ANATELO)
-#     true_pro   = _phase_flat_vec(x0_true,  PHASE_IDX_PROMETA)
-#     pred_sims = (_batch_dot(pred_pro, pred_ana),
-#                  _batch_dot(pred_ana, pred_early),
-#                  _batch_dot(pred_pro, pred_early))
-#     true_sims = (_batch_dot(true_pro, true_ana).detach(),
-#                  _batch_dot(true_ana, true_early).detach(),
-#                  _batch_dot(true_pro, true_early).detach())
-#     return sum(F.mse_loss(p, t) for p, t in zip(pred_sims, true_sims)) / len(pred_sims)
+def _phase_flat_vec(maps, phase_idx):
+    return maps[:, phase_idx].reshape(maps.shape[0], -1)
+
+
+def _pair_cosine(flat_a: torch.Tensor, flat_b: torch.Tensor) -> torch.Tensor:
+    """Cosine similarity per batch item between two flattened phase vectors: (B,)."""
+    return F.cosine_similarity(flat_a, flat_b, dim=-1, eps=1e-8)
+
+
+def chip_phase_similarity_loss(chip_pred, x0_true):
+    """
+    Match pairwise cosine similarities between earlyG1 / anatelo / prometa phase vectors
+    predicted by the chip aux head vs ground-truth Hi-C (prometa↔anatelo, anatelo↔earlyG1,
+    prometa↔earlyG1).
+    """
+    pred_early = _phase_flat_vec(chip_pred, PHASE_IDX_EARLYG1)
+    pred_ana   = _phase_flat_vec(chip_pred, PHASE_IDX_ANATELO)
+    pred_pro   = _phase_flat_vec(chip_pred, PHASE_IDX_PROMETA)
+    true_early = _phase_flat_vec(x0_true,  PHASE_IDX_EARLYG1)
+    true_ana   = _phase_flat_vec(x0_true,  PHASE_IDX_ANATELO)
+    true_pro   = _phase_flat_vec(x0_true,  PHASE_IDX_PROMETA)
+    pred_sims = (_pair_cosine(pred_pro, pred_ana),
+                 _pair_cosine(pred_ana, pred_early),
+                 _pair_cosine(pred_pro, pred_early))
+    true_sims = (_pair_cosine(true_pro, true_ana).detach(),
+                 _pair_cosine(true_ana, true_early).detach(),
+                 _pair_cosine(true_pro, true_early).detach())
+    return sum(F.mse_loss(p, t) for p, t in zip(pred_sims, true_sims)) / len(pred_sims)
 
 
 # def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
@@ -624,8 +634,8 @@ def train_step(model, raw_model, optimizer, batch, device,
 
     Args:
         model:              nn.DataParallel-wrapped (or plain) SR3UNet — used for forward pass.
-        raw_model:          Underlying SR3UNet; used directly for loop_class_logits to avoid
-                            DataParallel re-scattering a small tensor.
+        raw_model:          Underlying SR3UNet; used for chip_aux_pred and loop_class_logits
+                            without DataParallel re-scattering small tensors.
         loop_label_dict:    Mapping region_str → label (0/1/2/-1).  Built once at startup from
                             the loop-feature Excel file.  Labels:
                               -1 : ambiguous (cluster-1/2 AND cluster-3 present) — skip in loss
@@ -635,7 +645,7 @@ def train_step(model, raw_model, optimizer, batch, device,
         loop_class_weights: (3,) inverse-frequency weights for the cross-entropy loss so that
                             each loop class contributes equally regardless of prevalence.
     Returns:
-        (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss) as floats
+        (total_loss, mse_loss, weighted_chip_sim_loss, chip_loop_loss) as floats
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -662,10 +672,9 @@ def train_step(model, raw_model, optimizer, batch, device,
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (5,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # ---- IW-SSIM on noise residuals: emphasises structurally rich regions ----
-    iw_ssim_per_channel      = iw_ssim_map(eps_pred, eps_true)       # (B, C=5)
-    iw_ssim_per_channel_mean = iw_ssim_per_channel.mean(dim=0)       # (C=5,)
-    iw_ssim_main_loss        = (channel_weights * (1.0 - iw_ssim_per_channel_mean)).sum()
+    # ---- Chip phase similarity: pairwise cosine on flattened earlyG1 / anatelo / prometa ----
+    chip_pred     = raw_model.chip_aux_pred(h_chip)                     # (B, 5, N, N)
+    chip_sim_loss = chip_phase_similarity_loss(chip_pred, x0_current)
 
     # ---- Loop classification: predict loop presence/type from ChIP pair features ----
     # loop_class_logits: (B, 3) — classes 0/1/2 (no-loop / cluster-1or2 / cluster-3)
@@ -690,14 +699,22 @@ def train_step(model, raw_model, optimizer, batch, device,
 
     #breakpoint()
 
-    loss = mse_loss + iw_ssim_main_loss / 2 + chip_loop_loss / 20
+    loss = (
+        mse_loss
+        + CHIP_PHASE_SIM_WEIGHT * chip_sim_loss
+        + 0 * chip_loop_loss / 20  # loop CE off until kang labels are ready
+    )
+
+    #breakpoint()
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     return (
-        loss.item(), mse_loss.item(), iw_ssim_main_loss.item() / 2,
+        loss.item(),
+        mse_loss.item(),
+        (CHIP_PHASE_SIM_WEIGHT * chip_sim_loss).item(),
         chip_loop_loss.item() / 20,
     )
 
@@ -855,19 +872,19 @@ def main():
                                                       cell_cycle_loader_train.regions)
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop = [], [], [], []
+        epoch_losses, epoch_mse, epoch_chip_sim, epoch_chip_loop = [], [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, iw_ssim, chip_loop = train_step(
+            loss, mse, chip_sim, chip_loop = train_step(
                 model, raw_model, optimizer, batch, DEVICE,
                 loop_label_dict, loop_class_weights,
             )
             epoch_losses.append(loss)
             epoch_mse.append(mse)
-            epoch_iw_ssim.append(iw_ssim)
+            epoch_chip_sim.append(chip_sim)
             epoch_chip_loop.append(chip_loop)
             global_step += 1
 
@@ -878,21 +895,21 @@ def main():
                 pbar.set_postfix({
                     'total':     f"{loss:.4f}",
                     'mse':       f"{mse:.4f}",
-                    'iw_ssim':   f"{iw_ssim:.4f}",
+                    'chip_sim':  f"{chip_sim:.6f}",
                     'chip_loop': f"{chip_loop:.4f}",
                 })
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
-              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}")
+              f"chip_sim={np.mean(epoch_chip_sim):.8f}  chip_loop={np.mean(epoch_chip_loop):.6f}")
 
         # Save only selected epochs to reduce checkpoint churn.
         if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-1_chip_loop_loss.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-3-kang-2.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
