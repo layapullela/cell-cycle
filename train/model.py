@@ -671,10 +671,10 @@ class SR3UNet(nn.Module):
 
         # ---- LOOP CLASSIFICATION HEAD ----
         # Predicts loop presence/type in the contact map from ChIP-seq pair features.
-        # Classes: 0=no loop, 1=cluster-1/2 loop, 2=cluster-3 loop.
+        # Classes: 0=no loop, 1=E/P cluster-1/2, 2=E/P cluster-3, 3=structural loop.
         # Input: global-average-pool of h_chip → (B, c_pair).
-        # Output: (B, 3) logits; softmax gives class probabilities.
-        self.loop_class_head = nn.Linear(self.c_pair, 3)
+        # Output: (B, 4) logits; softmax gives class probabilities.
+        self.loop_class_head = nn.Linear(self.c_pair, 4)
         nn.init.zeros_(self.loop_class_head.weight)
         nn.init.zeros_(self.loop_class_head.bias)
 
@@ -686,11 +686,11 @@ class SR3UNet(nn.Module):
         Args:
             h_chip: (B, c_pair, N, N)
         Returns:
-            (B, 3) logits — apply softmax to get class probabilities.
-            Classes: 0=no loop, 1=cluster-1/2 loop, 2=cluster-3 loop.
+            (B, 4) logits — apply softmax to get class probabilities.
+            Classes: 0=no loop, 1=E/P cluster-1/2, 2=E/P cluster-3, 3=structural loop.
         """
         pooled = h_chip.mean(dim=(-2, -1))          # (B, c_pair)
-        return self.loop_class_head(pooled)          # (B, 3)
+        return self.loop_class_head(pooled)          # (B, 4)
 
     # ------------------------------------------------------------------
     def forward(
