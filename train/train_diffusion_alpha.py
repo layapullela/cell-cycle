@@ -82,9 +82,10 @@ L          = 2                   # (kept for reference; bottleneck depth in U-Ne
 HIDDEN_DIM = 128                 # base channel dimension for U-Net
 d_t        = 256                 # time embedding dimension
 
-BATCH_SIZE  = 32
-LR          = 1e-4
-NUM_EPOCHS  = 40
+BATCH_SIZE   = 32
+LR           = 1e-4
+WARMUP_STEPS = 500   # linear ramp-up before cosine decay kicks in
+NUM_EPOCHS   = 40
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
@@ -237,7 +238,7 @@ def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) ->
 ############################################
 # 3) CHECKPOINT LOADING  (was §2)
 ############################################
-def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, scheduler=None):
     if checkpoint_path is None:
         return 0, 0, float('inf')
 
@@ -265,6 +266,9 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
         print(f"  Ignored keys: {load_result.unexpected_keys}")
     if 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"  Scheduler state restored (last_epoch={scheduler.last_epoch})")
 
     start_epoch  = checkpoint['epoch'] + 1
     global_step  = checkpoint.get('global_step', 0)
@@ -754,11 +758,9 @@ def main():
 
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=LR)
 
-    # Load checkpoint into raw_model BEFORE wrapping with DataParallel so that
-    # state-dict keys never have the "module." prefix.
-    start_epoch, global_step, best_loss = load_checkpoint_for_training(
-        resume_checkpoint, raw_model, optimizer, DEVICE
-    )
+    # Checkpoint is loaded later (after scheduler creation) so the scheduler
+    # state can be restored in the same call.
+    start_epoch, global_step, best_loss = 0, 0, float('inf')
 
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
@@ -864,6 +866,33 @@ def main():
     print(f"Batches per epoch: {len(train_dataloader)}")
     print("="*80)
 
+    # ------------------------------------------------------------------
+    # LR schedule: linear warmup → cosine decay
+    # Created here so len(train_dataloader) is available.
+    # ------------------------------------------------------------------
+    steps_per_epoch = len(train_dataloader)
+    total_steps     = num_epochs * steps_per_epoch
+    _warmup         = min(WARMUP_STEPS, total_steps // 10)
+
+    _warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=_warmup
+    )
+    _cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_steps - _warmup), eta_min=LR * 1e-2
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[_warmup_sched, _cosine_sched],
+        milestones=[_warmup],
+    )
+    print(f"LR schedule: {_warmup}-step warmup → cosine decay "
+          f"to {LR * 1e-2:.1e} over {total_steps} total steps")
+
+    # Load checkpoint now that scheduler exists so its state is restored too.
+    start_epoch, global_step, best_loss = load_checkpoint_for_training(
+        resume_checkpoint, raw_model, optimizer, DEVICE, scheduler=scheduler
+    )
+
     # Build loop label dictionary and balanced class weights once before training starts.
     excel_path = data_dir / "41586_2019_1778_MOESM5_ESM_split.xlsx"
     all_regions = cell_cycle_loader_train.regions + cell_cycle_loader_eval.holdout_regions
@@ -882,6 +911,7 @@ def main():
                 model, raw_model, optimizer, batch, DEVICE,
                 loop_label_dict, loop_class_weights,
             )
+            scheduler.step()
             epoch_losses.append(loss)
             epoch_mse.append(mse)
             epoch_chip_sim.append(chip_sim)
@@ -890,30 +920,35 @@ def main():
 
             if global_step % 100 == 0:
                 val_loss = compute_validation_loss(model, val_dataloader, DEVICE)
-                print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
+                cur_lr   = scheduler.get_last_lr()[0]
+                print(f"  [step {global_step}] val_loss = {val_loss:.6f}  lr = {cur_lr:.2e}")
             if global_step % 20 == 0:
                 pbar.set_postfix({
                     'total':     f"{loss:.4f}",
                     'mse':       f"{mse:.4f}",
                     'chip_sim':  f"{chip_sim:.6f}",
                     'chip_loop': f"{chip_loop:.4f}",
+                    'lr':        f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
         avg_loss = np.mean(epoch_losses)
+        cur_lr   = scheduler.get_last_lr()[0]
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
-              f"chip_sim={np.mean(epoch_chip_sim):.8f}  chip_loop={np.mean(epoch_chip_loop):.6f}")
+              f"chip_sim={np.mean(epoch_chip_sim):.8f}  chip_loop={np.mean(epoch_chip_loop):.6f}  "
+              f"lr={cur_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
+        if (epoch + 1) in (5, 10, 15, 20, 30, 40, 50, 60):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-3-kang-2.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-5-kang-3.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss':                 avg_loss,
                 'global_step':          global_step,
             }, checkpoint_path)

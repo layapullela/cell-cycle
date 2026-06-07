@@ -6,9 +6,14 @@ pre-stored `.npz` files under `processed_data` and serves them as training or
 holdout samples based on the chromosome split.
 """
 
+import sys
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Union, Optional, Tuple, Sequence
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from preprocess.chip_signal import (
     CHROMOSOME_SIZES_MM10,
