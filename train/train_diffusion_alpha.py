@@ -112,6 +112,17 @@ def _parse_loop_anchor(coord: str):
     return m.group(1), int(m.group(2)), int(m.group(3))
 
 
+def _is_diagonal_region(region: str) -> bool:
+    """True when row and col windows share the same start (main-diagonal crop)."""
+    parts = region.split(":")
+    rs, _ = map(int, parts[1].split("-"))
+    if len(parts) == 3:
+        cs, _ = map(int, parts[2].split("-"))
+    else:
+        cs = rs
+    return rs == cs
+
+
 def _mid_in_window(anchor_start: int, anchor_end: int, win_start: int, win_end: int) -> bool:
     """True if the anchor midpoint falls within [win_start, win_end)."""
     mid = (anchor_start + anchor_end) // 2
@@ -226,21 +237,21 @@ def load_loop_label_dict(excel_path: str, all_regions: list) -> dict:
 
 def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) -> torch.Tensor:
     """
-    Compute inverse-frequency class weights for the loop classification loss so that
-    all four classes contribute equally regardless of their prevalence in training data.
+    Compute inverse-frequency class weights for the loop classification loss.
 
-    Only training regions (not holdout) are counted; ambiguous samples (label -1) are
-    excluded from the frequency estimate since they are masked out of the loss anyway.
+    Counts are restricted to main-diagonal training regions only (the same subset
+    that contributes to chip_loop_loss).  Ambiguous samples (label -1) are excluded.
 
-    Returns a (4,) float32 tensor of per-class weights suitable for passing directly
-    to F.cross_entropy(..., weight=...).
+    Returns a (4,) float32 tensor for F.cross_entropy(..., weight=...).
 
     Weight formula (sklearn convention):
         weight[c] = n_valid / (n_classes * n_c)
-    where n_valid = total non-ambiguous training samples, n_classes = 4.
+    where n_valid = total non-ambiguous diagonal training samples, n_classes = 4.
     """
-    counts = [0, 0, 0, 0]  # counts[0], counts[1], counts[2], counts[3]
+    counts = [0, 0, 0, 0]
     for region in training_regions:
+        if not _is_diagonal_region(region):
+            continue
         label = loop_label_dict.get(region, 0)
         if 0 <= label <= 3:
             counts[label] += 1
@@ -251,7 +262,7 @@ def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) ->
 
     weights = [n_valid / (4 * c) if c > 0 else 1.0 for c in counts]
     w = torch.tensor(weights, dtype=torch.float32)
-    print(f"Loop class weights (training, inv-freq): "
+    print(f"Loop class weights (diagonal training, inv-freq): "
           f"no-loop={w[0]:.3f}  E/P-cluster-1/2={w[1]:.3f}  "
           f"E/P-cluster-3={w[2]:.3f}  structural={w[3]:.3f}  "
           f"(counts: {counts[0]} / {counts[1]} / {counts[2]} / {counts[3]})")
@@ -659,8 +670,8 @@ def train_step(model, raw_model, optimizer, batch, device,
                                1 : E/P cluster-1 or cluster-2 loop
                                2 : E/P cluster-3 loop
                                3 : structural loop (any cluster)
-        loop_class_weights: (4,) inverse-frequency weights for the cross-entropy loss so that
-                            each loop class contributes equally regardless of prevalence.
+        loop_class_weights: (4,) inverse-frequency weights computed on diagonal training
+                            regions only; applied to chip_loop_loss on diagonal samples.
     Returns:
         (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss) as floats
     """
@@ -704,12 +715,16 @@ def train_step(model, raw_model, optimizer, batch, device,
         dtype=torch.long, device=device,
     )                                                           # (B,)
 
-    # Skip samples where both E/P cluster-1/2 and E/P cluster-3 loops are present (label == -1)
-    valid_mask = loop_labels >= 0
-    if valid_mask.any():
+    # Loop loss only on main-diagonal crops; skip ambiguous labels (label == -1).
+    diagonal_mask = torch.tensor(
+        [_is_diagonal_region(r) for r in regions],
+        dtype=torch.bool, device=device,
+    )
+    loss_mask = (loop_labels >= 0) & diagonal_mask
+    if loss_mask.any():
         chip_loop_loss = F.cross_entropy(
-            loop_logits[valid_mask],
-            loop_labels[valid_mask],
+            loop_logits[loss_mask],
+            loop_labels[loss_mask],
             weight=loop_class_weights.to(device),
         )
     else:
@@ -870,12 +885,13 @@ def main():
     print(f"Batches per epoch: {len(train_dataloader)}")
     print("="*80)
 
-    # Build loop label dictionary and balanced class weights once before training starts.
+    # Build loop label dictionary and diagonal-only class weights before training.
     excel_path = data_dir / "41586_2019_1778_MOESM5_ESM_split.xlsx"
     all_regions = cell_cycle_loader_train.regions + cell_cycle_loader_eval.holdout_regions
-    loop_label_dict     = load_loop_label_dict(str(excel_path), all_regions)
-    loop_class_weights  = compute_loop_class_weights(loop_label_dict,
-                                                      cell_cycle_loader_train.regions)
+    loop_label_dict    = load_loop_label_dict(str(excel_path), all_regions)
+    loop_class_weights = compute_loop_class_weights(
+        loop_label_dict, cell_cycle_loader_train.regions,
+    )
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
         epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop = [], [], [], []
