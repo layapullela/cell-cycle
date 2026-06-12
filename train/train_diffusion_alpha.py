@@ -272,7 +272,7 @@ def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) ->
 ############################################
 # 3) CHECKPOINT LOADING  (was §2)
 ############################################
-def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, scheduler, device):
     if checkpoint_path is None:
         return 0, 0, float('inf')
 
@@ -296,13 +296,17 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
     model.load_state_dict(checkpoint['model_state_dict'])
     if 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if 'scheduler_state_dict' in checkpoint and scheduler is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     start_epoch  = checkpoint['epoch'] + 1
     global_step  = checkpoint.get('global_step', 0)
     best_loss    = checkpoint.get('loss', float('inf'))
 
+    current_lr = optimizer.param_groups[0]['lr']
     print(f"✓ Resuming from epoch {checkpoint['epoch'] + 1}")
     print(f"  Loss: {checkpoint['loss']:.6f}, Global step: {global_step}")
+    print(f"  Learning rate: {current_lr:.2e}")
     print("="*80 + "\n")
 
     return start_epoch, global_step, best_loss
@@ -732,7 +736,7 @@ def train_step(model, raw_model, optimizer, batch, device,
 
     #breakpoint()
 
-    loss = mse_loss + iw_ssim_main_loss + chip_loop_loss / 10
+    loss = mse_loss + iw_ssim_main_loss + chip_loop_loss / 20
 
     optimizer.zero_grad()
     loss.backward()
@@ -740,7 +744,7 @@ def train_step(model, raw_model, optimizer, batch, device,
 
     return (
         loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
-        chip_loop_loss.item() / 10,
+        chip_loop_loss.item() / 20,
     )
 
 
@@ -779,10 +783,20 @@ def main():
 
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=LR)
 
+    # Cosine annealing over the total planned epochs (T_max).
+    # --num_epochs sets the window length; the scheduler decays LR from LR → LR/100
+    # over that many epochs.  On resume the saved state_dict restores the exact
+    # position in the schedule so LR continues smoothly rather than restarting.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=LR / 100,
+    )
+
     # Load checkpoint into raw_model BEFORE wrapping with DataParallel so that
     # state-dict keys never have the "module." prefix.
     start_epoch, global_step, best_loss = load_checkpoint_for_training(
-        resume_checkpoint, raw_model, optimizer, DEVICE
+        resume_checkpoint, raw_model, optimizer, scheduler, DEVICE
     )
 
     n_gpus = torch.cuda.device_count()
@@ -796,7 +810,7 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "14"
+    HOLD_OUT_CHROMOSOME = "2"
 
     processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
     if not processed_data_dir.exists():
@@ -921,21 +935,26 @@ def main():
                     'chip_loop': f"{chip_loop:.4f}",
                 })
 
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
-              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}")
+              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}  "
+              f"lr={current_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
+        if (epoch + 1) in (40, 60):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-6_chip_loop_loss.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-6_chip_loop_loss_holdout_2.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss':                 avg_loss,
                 'global_step':          global_step,
             }, checkpoint_path)
