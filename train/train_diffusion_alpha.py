@@ -39,6 +39,7 @@ from Dataloader import CellCycleDataLoader
 
 from schedule import T, gammas, alphas, GAMMA_MIN, GAMMA_MAX
 from model import SR3UNet, NoiseEmbedding
+from chip_loss_helpers import chip_oe_similarity_loss
 
 torch.manual_seed(42)
 
@@ -677,7 +678,7 @@ def train_step(model, raw_model, optimizer, batch, device,
         loop_class_weights: (4,) inverse-frequency weights computed on diagonal training
                             regions only; applied to chip_loop_loss on diagonal samples.
     Returns:
-        (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss) as floats
+        (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss, chip_oe_sim_loss) as floats
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -713,30 +714,37 @@ def train_step(model, raw_model, optimizer, batch, device,
     # loop_class_logits: (B, 4) — classes 0/1/2/3 (no-loop / E/P-1or2 / E/P-3 / structural)
     loop_logits = raw_model.loop_class_logits(h_chip)          # (B, 4)
 
-    regions = batch["region"]                                   # list of B strings
-    loop_labels = torch.tensor(
-        [loop_label_dict.get(r, 0) for r in regions],
-        dtype=torch.long, device=device,
-    )                                                           # (B,)
+    regions = batch["region"]     
+    
+    chip_loop_loss = torch.tensor(0.0, device=device)                              # list of B strings
+    # loop_labels = torch.tensor(
+    #     [loop_label_dict.get(r, 0) for r in regions],
+    #     dtype=torch.long, device=device,
+    # )                                                           # (B,)
 
-    # Loop loss only on main-diagonal crops; skip ambiguous labels (label == -1).
-    diagonal_mask = torch.tensor(
-        [_is_diagonal_region(r) for r in regions],
-        dtype=torch.bool, device=device,
-    )
-    loss_mask = (loop_labels >= 0) & diagonal_mask
-    if loss_mask.any():
-        chip_loop_loss = F.cross_entropy(
-            loop_logits[loss_mask],
-            loop_labels[loss_mask],
-            weight=loop_class_weights.to(device),
-        )
-    else:
-        chip_loop_loss = loop_logits.new_zeros(())
+    # # Loop loss only on main-diagonal crops; skip ambiguous labels (label == -1).
+    # diagonal_mask = torch.tensor(
+    #     [_is_diagonal_region(r) for r in regions],
+    #     dtype=torch.bool, device=device,
+    # )
+    # loss_mask = (loop_labels >= 0) & diagonal_mask
+    # if loss_mask.any():
+    #     chip_loop_loss = F.cross_entropy(
+    #         loop_logits[loss_mask],
+    #         loop_labels[loss_mask],
+    #         weight=loop_class_weights.to(device),
+    #     )
+    # else:
+    #     chip_loop_loss = loop_logits.new_zeros(())
 
     #breakpoint()
 
-    loss = mse_loss + iw_ssim_main_loss + chip_loop_loss / 20
+    # ---- OE phase-similarity loss from chip-aux head ----
+    chip_pred        = raw_model.chip_aux_pred(h_chip)          # (B, 5, N, N)
+    chip_oe_sim_loss = chip_oe_similarity_loss(chip_pred, x0_current)
+    #breakpoint()
+
+    loss = mse_loss + iw_ssim_main_loss + 0 * chip_loop_loss / 20 + chip_oe_sim_loss / 10
 
     optimizer.zero_grad()
     loss.backward()
@@ -744,7 +752,7 @@ def train_step(model, raw_model, optimizer, batch, device,
 
     return (
         loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
-        chip_loop_loss.item() / 20,
+        chip_loop_loss.item() / 20, chip_oe_sim_loss.item() / 10,
     )
 
 
@@ -810,7 +818,7 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "2"
+    HOLD_OUT_CHROMOSOME = "14"
 
     processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
     if not processed_data_dir.exists():
@@ -908,13 +916,13 @@ def main():
     )
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop = [], [], [], []
+        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop, epoch_chip_oe = [], [], [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, iw_ssim, chip_loop = train_step(
+            loss, mse, iw_ssim, chip_loop, chip_oe = train_step(
                 model, raw_model, optimizer, batch, DEVICE,
                 loop_label_dict, loop_class_weights,
             )
@@ -922,6 +930,7 @@ def main():
             epoch_mse.append(mse)
             epoch_iw_ssim.append(iw_ssim)
             epoch_chip_loop.append(chip_loop)
+            epoch_chip_oe.append(chip_oe)
             global_step += 1
 
             if global_step % 100 == 0:
@@ -929,10 +938,11 @@ def main():
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
             if global_step % 20 == 0:
                 pbar.set_postfix({
-                    'total':     f"{loss:.4f}",
-                    'mse':       f"{mse:.4f}",
-                    'iw_ssim':   f"{iw_ssim:.4f}",
+                    'total':    f"{loss:.4f}",
+                    'mse':      f"{mse:.4f}",
+                    'iw_ssim':  f"{iw_ssim:.4f}",
                     'chip_loop': f"{chip_loop:.4f}",
+                    'chip_oe':  f"{chip_oe:.4f}",
                 })
 
         scheduler.step()
@@ -942,6 +952,7 @@ def main():
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
               f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}  "
+              f"chip_oe={np.mean(epoch_chip_oe):.6f}  "
               f"lr={current_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
@@ -949,7 +960,7 @@ def main():
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-6_chip_loop_loss_holdout_2.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-12_chip_oe_loss_holdout_14.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix

@@ -669,6 +669,12 @@ class SR3UNet(nn.Module):
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
 
+        # ---- AUXILIARY CHIP HEAD (per-phase maps for chip similarity loss) ----
+        # Default kaiming-uniform init (not zero) so chip_oe_similarity_loss gets
+        # non-zero, phase-varying predictions from step 1.  Zero init caused a dead
+        # gradient: |0 - 0| = 0 and sign(0) = 0, so weights never moved.
+        self.chip_pred_head = nn.Conv2d(self.c_pair, 5, kernel_size=1)
+
         # ---- LOOP CLASSIFICATION HEAD ----
         # Predicts loop presence/type in the contact map from ChIP-seq pair features.
         # Classes: 0=no loop, 1=E/P cluster-1/2, 2=E/P cluster-3, 3=structural loop.
@@ -677,6 +683,16 @@ class SR3UNet(nn.Module):
         self.loop_class_head = nn.Linear(self.c_pair, 4)
         nn.init.zeros_(self.loop_class_head.weight)
         nn.init.zeros_(self.loop_class_head.bias)
+
+    # ------------------------------------------------------------------
+    def chip_aux_pred(self, h_chip: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h_chip: (B, c_pair, N, N)
+        Returns:
+            (B, 5, N, N) per-phase maps from chip pair features
+        """
+        return self.chip_pred_head(h_chip)
 
     # ------------------------------------------------------------------
     def loop_class_logits(self, h_chip: torch.Tensor) -> torch.Tensor:
