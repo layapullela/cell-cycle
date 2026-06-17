@@ -8,13 +8,13 @@ Kang et al. arrest-release time course (U2OS human cells, hg19):
   120/180 min → mid G1
   240/360 min → late G1
 
-Phase composition (all replicates summed; G1 phases divided by 2 to normalise for
-having 4 input maps instead of 2):
-  prometa  = Rep1@0min   + Rep2@0min
-  anatelo  = Rep1@35min  + Rep2@35min
-  earlyG1  = (Rep1@60min + Rep2@60min + Rep1@90min  + Rep2@90min)  / 2
-  midG1    = (Rep1@120min+ Rep2@120min+ Rep1@180min + Rep2@180min) / 2
-  lateG1   = (Rep1@240min+ Rep2@240min+ Rep1@360min + Rep2@360min) / 2
+Phase composition (replicates chosen to equalise raw read totals across all 5 phases;
+no per-file depth scaling applied):
+  prometa  = Rep1@0min   + Rep2@0min           (~306 M reads)
+  anatelo  = Rep1@35min  + Rep2@35min           (~288 M reads)
+  earlyG1  = Rep1@60min  + Rep2@90min           (~302 M reads)
+  midG1    = Rep1@120min + Rep1@180min          (~321 M reads)
+  lateG1   = Rep1@240min + Rep2@360min          (~316 M reads)
 
 Output layout:
   <output_dir>/chr{chrom}/{row_start}-{row_end},{col_start}-{col_end}.npz
@@ -69,54 +69,20 @@ from preprocess.chip_signal import (
 PHASE_HIC_FILES: Dict[str, List[str]] = {
     "prometa": ["GSM4194449_U2OS_0min_Rep1.hic",   "GSM4194450_U2OS_0min_Rep2.hic"],
     "anatelo": ["GSM4194451_U2OS_35min_Rep1.hic",  "GSM4194452_U2OS_35min_Rep2.hic"],
-    "earlyG1": ["GSM4194453_U2OS_60min_Rep1.hic",  "GSM4194454_U2OS_60min_Rep2.hic",
-                "GSM4194455_U2OS_90min_Rep1.hic",  "GSM4194456_U2OS_90min_Rep2.hic"],
-    "midG1":   ["GSM4194457_U2OS_120min_Rep1.hic", "GSM4194458_U2OS_120min_Rep2.hic",
-                "GSM4194459_U2OS_180min_Rep1.hic", "GSM4194460_U2OS_180min_Rep2.hic"],
-    "lateG1":  ["GSM4194461_U2OS_240min_Rep1.hic", "GSM4194462_U2OS_240min_Rep2.hic",
-                "GSM4194463_U2OS_360min_Rep1.hic", "GSM4194464_U2OS_360min_Rep2.hic"],
+    # One replicate per timepoint, chosen so that raw read totals are balanced
+    # across all 5 phases (~288–321 M per phase) without per-file depth scaling.
+    "earlyG1": ["GSM4194453_U2OS_60min_Rep1.hic",  "GSM4194456_U2OS_90min_Rep2.hic"],
+    "midG1":   ["GSM4194457_U2OS_120min_Rep1.hic", "GSM4194459_U2OS_180min_Rep1.hic"],
+    "lateG1":  ["GSM4194461_U2OS_240min_Rep1.hic", "GSM4194464_U2OS_360min_Rep2.hic"],
 }
 
-# G1 phases each sum 4 maps; divide by 2 to keep counts on the same scale as
-# prometa/anatelo (which sum 2 maps).
+# All phases now sum exactly 2 files; no divisor needed.
 PHASE_DIVISOR: Dict[str, float] = {
     "prometa": 1.0,
     "anatelo": 1.0,
-    "earlyG1": 2.0,
-    "midG1":   2.0,
-    "lateG1":  2.0,
-}
-
-# Per-file depth-normalization scales.
-#
-# KR normalization equalizes bias *within* a file but does nothing for
-# differences in library size *between* files.  If one replicate has fewer
-# reads, its KR matrix has a lower absolute scale, which biases the phase
-# sum toward denser replicates and away from sparser ones.
-#
-# These scale factors normalize every file to the same genome-wide
-# intra-chromosomal contact total (mean across all 16 replicates = 140.6 M),
-# computed from `analysis.py` using 1 Mb / NONE normalization:
-#   scale_i = 140.6e6 / total_intra_i
-#
-# After per-file scaling the simple PHASE_DIVISOR = {1,1,2,2,2} is exact.
-PER_FILE_DEPTH_SCALE: Dict[str, float] = {
-    "GSM4194449_U2OS_0min_Rep1.hic":   140.6e6 / 148_694_517,   # 0.946
-    "GSM4194450_U2OS_0min_Rep2.hic":   140.6e6 / 158_004_507,   # 0.890
-    "GSM4194451_U2OS_35min_Rep1.hic":  140.6e6 / 145_695_432,   # 0.965
-    "GSM4194452_U2OS_35min_Rep2.hic":  140.6e6 / 143_264_696,   # 0.981
-    "GSM4194453_U2OS_60min_Rep1.hic":  140.6e6 / 189_003_393,   # 0.744
-    "GSM4194454_U2OS_60min_Rep2.hic":  140.6e6 /  72_670_396,   # 1.934
-    "GSM4194455_U2OS_90min_Rep1.hic":  140.6e6 / 192_233_225,   # 0.731
-    "GSM4194456_U2OS_90min_Rep2.hic":  140.6e6 / 113_173_598,   # 1.242
-    "GSM4194457_U2OS_120min_Rep1.hic": 140.6e6 / 177_575_981,   # 0.792
-    "GSM4194458_U2OS_120min_Rep2.hic": 140.6e6 /  86_728_482,   # 1.621
-    "GSM4194459_U2OS_180min_Rep1.hic": 140.6e6 / 144_055_628,   # 0.976
-    "GSM4194460_U2OS_180min_Rep2.hic": 140.6e6 /  68_538_581,   # 2.053
-    "GSM4194461_U2OS_240min_Rep1.hic": 140.6e6 / 200_549_901,   # 0.701
-    "GSM4194462_U2OS_240min_Rep2.hic": 140.6e6 /  83_623_304,   # 1.682
-    "GSM4194463_U2OS_360min_Rep1.hic": 140.6e6 / 209_688_282,   # 0.670
-    "GSM4194464_U2OS_360min_Rep2.hic": 140.6e6 / 116_350_899,   # 1.208
+    "earlyG1": 1.0,
+    "midG1":   1.0,
+    "lateG1":  1.0,
 }
 
 # ChIP-seq bulk tracks: sum per-bin max across all phases and replicates.
@@ -251,11 +217,7 @@ def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
 
 
 def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: int) -> np.ndarray:
-    """Extract one (N,N) KR-normalized contact matrix from a single .hic file.
-
-    Applies PER_FILE_DEPTH_SCALE so that every replicate is normalised to the
-    same genome-wide intra-chromosomal total before being added to the phase sum.
-    """
+    """Extract one (N,N) KR-normalized contact matrix from a single .hic file."""
     import hicstraw as straw
     qchrom = _chrom_prefix + chrom
     try:
@@ -288,12 +250,6 @@ def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: in
         if 0 <= xi2 < _image_size and 0 <= yj2 < _image_size and (xi2, yj2) != (xi, yj):
             mat[xi2, yj2] = val
 
-    # Apply per-file depth normalization scale (look up by filename only)
-    fname = Path(hic_file).name
-    scale = PER_FILE_DEPTH_SCALE.get(fname, 1.0)
-    if scale != 1.0:
-        mat *= scale
-
     return mat
 
 
@@ -301,7 +257,7 @@ def _sum_matrices(
     hic_files: List[str], chrom: str, rs: int, re: int, cs: int, ce: int,
     divisor: float = 1.0,
 ) -> np.ndarray:
-    """Sum depth-normalized contact matrices across a list of .hic files, then divide by divisor."""
+    """Sum contact matrices across a list of .hic files, then divide by divisor."""
     total = np.zeros((_image_size, _image_size), dtype=np.float32)
     for f in hic_files:
         if f is not None:
@@ -528,19 +484,9 @@ if __name__ == "__main__":
 # sbatch --job-name=prestore_kang_chr1 \
 #   --partition=standard \
 #   --account=minjilab99 \
-#   --time=08:00:00 \
-#   --mem=32G \
-#   --cpus-per-task=4 \
-#   --output=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.out \
-#   --error=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.err \
-#   --wrap="source ~/.bashrc && conda activate test_env && cd /nfs/turbo/umms-minjilab/lpullela/cell-cycle && python preprocess/kang/prestore_kang.py --raw_data_dir raw_data/kang --output_dir processed_data/kang --chrom_prefix chr --chrom 1"
-
-# sbatch --job-name=prestore_kang_chr1 \
-#   --partition=standard \
-#   --account=minjilab99 \
 #   --time=3:00:00 \
 #   --mem=32G \
 #   --cpus-per-task=4 \
 #   --output=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.out \
 #   --error=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.err \
-#   --wrap="source ~/.bashrc && conda activate test_env && cd /nfs/turbo/umms-minjilab/lpullela/cell-cycle && python preprocess/kang/prestore_kang.py --raw_data_dir raw_data/kang --output_dir processed_data/kang --chrom_prefix chr --chrom 3 --no_chr_prefix"
+#   --wrap="source ~/.bashrc && conda activate test_env && cd /nfs/turbo/umms-minjilab/lpullela/cell-cycle && python preprocess/kang/prestore_kang.py --raw_data_dir raw_data/kang --output_dir processed_data/kang --chrom_prefix chr --chrom 1 --no_chr_prefix"
