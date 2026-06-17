@@ -366,8 +366,8 @@ def _build_targets(batch, device):
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col)
 
 
-# Maps are nominally in [-1, 1]; SSIM `data_range` is max − min = 2 (pytorch_msssim).
-_SSIM_DATA_RANGE = 2.0
+# Log-normalised Hi-C maps span roughly [-2, 2]; data_range = max - min = 4.
+_SSIM_DATA_RANGE = 4.0
 
 
 def ssim_1_minus_mean(
@@ -515,16 +515,19 @@ def iw_ssim_map(
     return log_iw.exp()
 
 
-# iw_ssim_loss — was used for the chip aux head (chip_aux_loss); removed when the
-# auxiliary head was replaced by the loop classification head.  Kept here for reference.
-#
-# def iw_ssim_loss(pred, target, *, win_size=11, win_sigma=1.5,
-#                  data_range=_SSIM_DATA_RANGE, n_scales=4):
-#     """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels."""
-#     return 1.0 - iw_ssim_map(
-#         pred, target, win_size=win_size, win_sigma=win_sigma,
-#         data_range=data_range, n_scales=n_scales,
-#     ).mean()
+def iw_ssim_loss(pred, target, *, win_size=11, win_sigma=1.5,
+                 data_range=_SSIM_DATA_RANGE, n_scales=4):
+    """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels.
+
+    Note: data_range=2.0 assumes inputs in [-1, 1].  When applied to x0_current
+    (log-normalised Hi-C maps) and chip_pred (unconstrained 1×1 conv), the actual
+    range may exceed ±1.  The effect is a rescaling of SSIM stability constants C1/C2;
+    consider increasing data_range if maps routinely exceed [-1, 1].
+    """
+    return 1.0 - iw_ssim_map(
+        pred, target, win_size=win_size, win_sigma=win_sigma,
+        data_range=data_range, n_scales=n_scales,
+    ).mean()
 
 
 # The three helpers below supported chip_phase_similarity_loss, which compared
@@ -678,7 +681,9 @@ def train_step(model, raw_model, optimizer, batch, device,
         loop_class_weights: (4,) inverse-frequency weights computed on diagonal training
                             regions only; applied to chip_loop_loss on diagonal samples.
     Returns:
-        (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss, chip_oe_sim_loss) as floats
+        (total_loss, mse_loss, chip_aux_loss) as floats
+        mse_loss:     channel-weighted MSE on noise residuals (main diffusion objective).
+        chip_aux_loss: IW-SSIM loss between chip_aux_pred(h_chip) and x0_current.
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -705,55 +710,23 @@ def train_step(model, raw_model, optimizer, batch, device,
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (5,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # ---- IW-SSIM on noise residuals: emphasises structurally rich regions ----
-    iw_ssim_per_channel      = 0 # iw_ssim_map(eps_pred, eps_true)       # (B, C=5)
-    iw_ssim_per_channel_mean = 0 # iw_ssim_per_channel.mean(dim=0)       # (C=5,)
-    iw_ssim_main_loss        = torch.tensor(0.0, device=device) # TODO: for checking (channel_weights * (1.0 - iw_ssim_per_channel_mean)).sum()
+    # loop_class_logits and chip_loop_loss are disabled; kept commented for reference.
+    # loop_logits    = raw_model.loop_class_logits(h_chip)
+    # chip_loop_loss = F.cross_entropy(loop_logits[loss_mask], loop_labels[loss_mask], ...)
 
-    # ---- Loop classification: predict loop presence/type from ChIP pair features ----
-    # loop_class_logits: (B, 4) — classes 0/1/2/3 (no-loop / E/P-1or2 / E/P-3 / structural)
-    loop_logits = raw_model.loop_class_logits(h_chip)          # (B, 4)
+    # ---- ChIP aux head: predict phase maps, supervise with IW-SSIM ----
+    # chip_pred outputs (B, 5, N, N) phase-map predictions from ChIP pair features.
+    # Compared directly against x0_current (log-normalised Hi-C targets).
+    chip_pred     = raw_model.chip_aux_pred(h_chip)          # (B, 5, N, N)
+    chip_aux_loss = iw_ssim_loss(chip_pred, x0_current)
 
-    regions = batch["region"]     
-    
-    chip_loop_loss = torch.tensor(0.0, device=device)                              # list of B strings
-    # loop_labels = torch.tensor(
-    #     [loop_label_dict.get(r, 0) for r in regions],
-    #     dtype=torch.long, device=device,
-    # )                                                           # (B,)
-
-    # # Loop loss only on main-diagonal crops; skip ambiguous labels (label == -1).
-    # diagonal_mask = torch.tensor(
-    #     [_is_diagonal_region(r) for r in regions],
-    #     dtype=torch.bool, device=device,
-    # )
-    # loss_mask = (loop_labels >= 0) & diagonal_mask
-    # if loss_mask.any():
-    #     chip_loop_loss = F.cross_entropy(
-    #         loop_logits[loss_mask],
-    #         loop_labels[loss_mask],
-    #         weight=loop_class_weights.to(device),
-    #     )
-    # else:
-    #     chip_loop_loss = loop_logits.new_zeros(())
-
-    #breakpoint()
-
-    # ---- OE phase-similarity loss from chip-aux head ----
-    chip_pred        = raw_model.chip_aux_pred(h_chip)          # (B, 5, N, N)
-    chip_oe_sim_loss = chip_oe_similarity_loss(chip_pred, x0_current)
-    #breakpoint()
-
-    loss = mse_loss + iw_ssim_main_loss + 0 * chip_loop_loss / 20 + chip_oe_sim_loss / 10
+    loss = mse_loss + chip_aux_loss
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return (
-        loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
-        chip_loop_loss.item() / 20, chip_oe_sim_loss.item() / 10,
-    )
+    return loss.item(), mse_loss.item(), chip_aux_loss.item()
 
 
 ############################################
@@ -916,21 +889,19 @@ def main():
     )
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop, epoch_chip_oe = [], [], [], [], []
+        epoch_losses, epoch_mse, epoch_chip_aux = [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, iw_ssim, chip_loop, chip_oe = train_step(
+            loss, mse, chip_aux = train_step(
                 model, raw_model, optimizer, batch, DEVICE,
                 loop_label_dict, loop_class_weights,
             )
             epoch_losses.append(loss)
             epoch_mse.append(mse)
-            epoch_iw_ssim.append(iw_ssim)
-            epoch_chip_loop.append(chip_loop)
-            epoch_chip_oe.append(chip_oe)
+            epoch_chip_aux.append(chip_aux)
             global_step += 1
 
             if global_step % 100 == 0:
@@ -940,9 +911,7 @@ def main():
                 pbar.set_postfix({
                     'total':    f"{loss:.4f}",
                     'mse':      f"{mse:.4f}",
-                    'iw_ssim':  f"{iw_ssim:.4f}",
-                    'chip_loop': f"{chip_loop:.4f}",
-                    'chip_oe':  f"{chip_oe:.4f}",
+                    'chip_aux': f"{chip_aux:.4f}",
                 })
 
         scheduler.step()
@@ -951,8 +920,7 @@ def main():
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
-              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}  "
-              f"chip_oe={np.mean(epoch_chip_oe):.6f}  "
+              f"chip_aux={np.mean(epoch_chip_aux):.6f}  "
               f"lr={current_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
@@ -960,7 +928,7 @@ def main():
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-12_chip_oe_loss_holdout_14.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-16-iwssim-aux_holdout_14.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
