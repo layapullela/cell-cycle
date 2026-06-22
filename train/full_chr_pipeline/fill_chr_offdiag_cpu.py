@@ -92,9 +92,17 @@ def main() -> None:
             "to 0 so the exported .hic only contains the tested region. Default 0 = whole matrix."
         ),
     )
+    p.add_argument(
+        "--chrom_size_bp",
+        type=int,
+        default=None,
+        help="Override chromosome size in bp (use for non-mouse genomes, e.g. human hg19).",
+    )
     args = p.parse_args()
 
     chrom = str(args.chrom)
+    if args.chrom_size_bp is not None:
+        CHROMOSOME_SIZES[chrom] = args.chrom_size_bp
     arrays_dir = Path(args.arrays_dir)
     near_dir = Path(args.near_dir)
     out_dir = Path(args.output_dir)
