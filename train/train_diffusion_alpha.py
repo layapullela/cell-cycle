@@ -76,10 +76,9 @@ L          = 2                   # (kept for reference; bottleneck depth in U-Ne
 HIDDEN_DIM = 128                 # base channel dimension for U-Net
 d_t        = 256                 # time embedding dimension
 
-BATCH_SIZE   = 32
-LR           = 1e-4
-WARMUP_STEPS = 500   # linear ramp-up before cosine decay kicks in
-NUM_EPOCHS   = 40
+BATCH_SIZE  = 32
+LR          = 1e-5
+NUM_EPOCHS  = 40
 DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
@@ -269,7 +268,8 @@ RESUME_CHECKPOINT = None
 ############################################
 # 3) CHECKPOINT LOADING  (was §2)
 ############################################
-def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, scheduler=None):
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, scheduler=None,
+                                finetune_lr=None):
     if checkpoint_path is None:
         return 0, 0, float('inf')
 
@@ -297,7 +297,11 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, sche
         print(f"  Ignored keys: {load_result.unexpected_keys}")
     if 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+    if finetune_lr is not None:
+        for pg in optimizer.param_groups:
+            pg['lr'] = finetune_lr
+        print(f"  Finetune: LR reset to {finetune_lr:.2e} (scheduler will restart)")
+    elif scheduler is not None and 'scheduler_state_dict' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         print(f"  Scheduler state restored (last_epoch={scheduler.last_epoch})")
 
@@ -695,10 +699,18 @@ def main():
     parser = argparse.ArgumentParser(description='Train diffusion model for Hi-C phase decomposition')
     parser.add_argument('--resume_checkpoint', type=str, default=None)
     parser.add_argument('--num_epochs', type=int, default=None)
+    parser.add_argument(
+        '--finetune_lr', nargs='?', const=-1.0, default=None, type=float, metavar='LR',
+        help='After resume, reset LR and restart cosine scheduler over --num_epochs. '
+             'Optional LR value (default: config LR).',
+    )
     args = parser.parse_args()
 
     resume_checkpoint = args.resume_checkpoint if args.resume_checkpoint is not None else RESUME_CHECKPOINT
     num_epochs        = args.num_epochs if args.num_epochs is not None else NUM_EPOCHS
+    finetune_lr       = None
+    if args.finetune_lr is not None:
+        finetune_lr = LR if args.finetune_lr < 0 else args.finetune_lr
 
     print("="*80)
     print("TRAINING: all five phases (matrix I/O, diagonal + off-diagonal crops)")
@@ -708,6 +720,8 @@ def main():
     print(f"Batch size: {BATCH_SIZE}, Epochs: {num_epochs}")
     if resume_checkpoint:
         print(f"Resume checkpoint: {resume_checkpoint}")
+    if finetune_lr is not None:
+        print(f"Finetune LR: {finetune_lr:.2e} (fresh cosine over {num_epochs} epochs)")
 
     noise_embed_module = NoiseEmbedding(d_t, max_value=1000)
 
@@ -723,9 +737,28 @@ def main():
 
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=LR)
 
-    # Checkpoint is loaded later (after scheduler creation) so the scheduler
-    # state can be restored in the same call.
-    start_epoch, global_step, best_loss = 0, 0, float('inf')
+    # Cosine annealing over the total planned epochs (T_max).
+    # On resume the saved state_dict restores the exact position in the schedule.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=LR / 100,
+    )
+
+    # Load checkpoint into raw_model BEFORE wrapping with DataParallel so that
+    # state-dict keys never have the "module." prefix.
+    start_epoch, global_step, best_loss = load_checkpoint_for_training(
+        resume_checkpoint, raw_model, optimizer, DEVICE, scheduler=scheduler,
+        finetune_lr=finetune_lr if resume_checkpoint else None,
+    )
+    if finetune_lr is not None and resume_checkpoint:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=num_epochs,
+            eta_min=finetune_lr / 100,
+        )
+        print(f"Scheduler restarted: cosine {finetune_lr:.1e} → {finetune_lr / 100:.1e} "
+              f"over {num_epochs} epochs\n")
 
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
@@ -738,10 +771,10 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "14"
+    HOLD_OUT_CHROMOSOME = "20"
 
     processed_data_dir = [
-        Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
+        #Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
         Path(__file__).parent.parent / "processed_data" / "kang",
     ]
     for _d in processed_data_dir:
@@ -829,34 +862,8 @@ def main():
     )
 
     print(f"Batches per epoch: {len(train_dataloader)}")
+    print(f"LR schedule: cosine annealing {LR:.1e} → {LR / 100:.1e} over {num_epochs} epochs")
     print("="*80)
-
-    # ------------------------------------------------------------------
-    # LR schedule: linear warmup → cosine decay
-    # Created here so len(train_dataloader) is available.
-    # ------------------------------------------------------------------
-    steps_per_epoch = len(train_dataloader)
-    total_steps     = num_epochs * steps_per_epoch
-    _warmup         = min(WARMUP_STEPS, total_steps // 10)
-
-    _warmup_sched = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=_warmup
-    )
-    _cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - _warmup), eta_min=LR * 1e-2
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[_warmup_sched, _cosine_sched],
-        milestones=[_warmup],
-    )
-    print(f"LR schedule: {_warmup}-step warmup → cosine decay "
-          f"to {LR * 1e-2:.1e} over {total_steps} total steps")
-
-    # Load checkpoint now that scheduler exists so its state is restored too.
-    start_epoch, global_step, best_loss = load_checkpoint_for_training(
-        resume_checkpoint, raw_model, optimizer, DEVICE, scheduler=scheduler
-    )
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
         epoch_losses, epoch_mse, epoch_chip_aux = [], [], []
@@ -868,7 +875,6 @@ def main():
             loss, mse, chip_aux = train_step(
                 model, raw_model, optimizer, batch, DEVICE,
             )
-            scheduler.step()
             epoch_losses.append(loss)
             epoch_mse.append(mse)
             epoch_chip_aux.append(chip_aux)
@@ -886,6 +892,8 @@ def main():
                     'lr':       f"{scheduler.get_last_lr()[0]:.2e}",
                 })
 
+        scheduler.step()
+
         avg_loss = np.mean(epoch_losses)
         cur_lr   = scheduler.get_last_lr()[0]
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
@@ -894,11 +902,11 @@ def main():
               f"lr={cur_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (5, 10, 15, 20, 30, 40, 50, 60):
+        if (epoch + 1) in (60, 80):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-5-kang-3.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-22-kang-finetune.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix

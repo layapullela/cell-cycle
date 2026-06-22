@@ -669,20 +669,11 @@ class SR3UNet(nn.Module):
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
 
-<<<<<<< HEAD
-        # ---- AUXILIARY CHIP HEAD ----
-        # Predicts per-phase Hi-C maps from ChIP pair features (phase-similarity aux loss).
-        self.chip_pred_head = nn.Conv2d(self.c_pair, P, kernel_size=1)
-        # Small random init so pairwise cosine loss has nonzero gradients at step 0.
-        nn.init.normal_(self.chip_pred_head.weight, std=1e-3)
-        nn.init.zeros_(self.chip_pred_head.bias)
-=======
         # ---- AUXILIARY CHIP HEAD (per-phase maps for chip similarity loss) ----
         # Default kaiming-uniform init (not zero) so chip_oe_similarity_loss gets
         # non-zero, phase-varying predictions from step 1.  Zero init caused a dead
         # gradient: |0 - 0| = 0 and sign(0) = 0, so weights never moved.
         self.chip_pred_head = nn.Conv2d(self.c_pair, 5, kernel_size=1)
->>>>>>> origin/master
 
         # ---- LOOP CLASSIFICATION HEAD ----
         # Predicts loop presence/type in the contact map from ChIP-seq pair features.
@@ -695,16 +686,12 @@ class SR3UNet(nn.Module):
 
     # ------------------------------------------------------------------
     def chip_aux_pred(self, h_chip: torch.Tensor) -> torch.Tensor:
-<<<<<<< HEAD
-        """(B, c_pair, N, N) chip features → (B, 5, N, N) auxiliary phase maps."""
-=======
         """
         Args:
             h_chip: (B, c_pair, N, N)
         Returns:
             (B, 5, N, N) per-phase maps from chip pair features
         """
->>>>>>> origin/master
         return self.chip_pred_head(h_chip)
 
     # ------------------------------------------------------------------

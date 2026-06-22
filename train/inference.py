@@ -176,12 +176,7 @@ class Inference:
 
         #bulk_map = (x0_early + x0_mid + x0_late + x0_anatelo + x0_prometa).mul(0.2).unsqueeze(1)  # (B, 1, N, N)
         bulk_map = batch['bulk'].float().to(self.device)
-<<<<<<< HEAD
-        #breakpoint()
-        bulk_map = bulk_map.unsqueeze(1)
-=======
         bulk_map = bulk_map.unsqueeze(1)  # (B, 1, N, N)
->>>>>>> origin/master
 
         chip_histone_1d = chip_hac_row[0].detach().cpu().numpy()
 
