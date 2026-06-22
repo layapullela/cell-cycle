@@ -728,13 +728,13 @@ def train_step(model, raw_model, optimizer, batch, device):
     chip_pred     = raw_model.chip_aux_pred(h_chip)          # (B, 5, N, N)
     chip_aux_loss = iw_ssim_loss(chip_pred, x0_current)
 
-    loss = mse_loss + chip_aux_loss
+    loss = mse_loss + chip_aux_loss / 5
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return loss.item(), mse_loss.item(), chip_aux_loss.item()
+    return loss.item(), mse_loss.item(), chip_aux_loss.item() / 5
 
 
 ############################################
