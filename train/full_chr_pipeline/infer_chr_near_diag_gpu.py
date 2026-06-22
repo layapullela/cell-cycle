@@ -1,7 +1,8 @@
 """
 GPU: run diffusion inference on near-diagonal patches only.
 
-Inputs: arrays_dir from extract_chr_numpy.py (raw phase matrices + chip tracks).
+Inputs: arrays_dir from extract_chr_numpy.py (raw phase matrices + chromosome
+z-scored ChIP tracks).
 
 Bulk-only inference contract
 ----------------------------
@@ -17,7 +18,7 @@ The model is conditioned on `bulk` only; phase outputs are rescaled with the bul
 Tile merging (non-patchy stitching)
 -----------------------------------
 The model output for each phase is in [-1,1].  We denormalize it to COUNT space *inside* the
-loop using that tile's bulk (lo, hi), then accumulate with a 2-D Hanning weight so overlapping
+loop using that tile's bulk (lo, hi), then accumulate with a 2-D Tukey weight so overlapping
 tiles blend smoothly and each pixel is dominated by tiles centred near it.
 
 Count-space (arithmetic) averaging is used on purpose.  Each diffusion sample is one
@@ -28,8 +29,8 @@ count mean is the posterior mean and reproduces the off-diagonal density of the 
 ground truth much better; the diagonal is consistent across samples and is unaffected.
 
 Outputs (per phase, accumulated over overlapping tiles):
-  - chr{chrom}_{phase}_pred_count.npy  float32 (L,L)  Hanning-weighted sum of count-space predictions
-  - chr{chrom}_{phase}_pred_wsum.npy   float32 (L,L)  sum of Hanning weights
+  - chr{chrom}_{phase}_pred_count.npy  float32 (L,L)  Tukey-weighted sum of count-space predictions
+  - chr{chrom}_{phase}_pred_wsum.npy   float32 (L,L)  sum of Tukey weights
 
 fill_chr_offdiag_cpu.py forms pred_count / pred_wsum to recover the per-pixel weighted mean.
 """
@@ -48,6 +49,7 @@ from tqdm import tqdm
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _TRAIN_DIR = _SCRIPT_DIR.parent
 _REPO_ROOT = _TRAIN_DIR.parent
+sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "preprocess"))
 sys.path.insert(0, str(_TRAIN_DIR))
 
@@ -66,6 +68,7 @@ N = 64
 RESOLUTION_BP = 10_000
 
 PHASES = ("earlyG1", "midG1", "lateG1", "anatelo", "prometa")
+CHIP_MARKS = ("ctcf", "hac", "h3k4me1", "h3k4me3")
 
 # Boundary separating "near" from "far" off-diagonal tiles.
 # Tiles with midpoint_gap <= this use DIAG_STEP_NEAR_BP row spacing;
@@ -146,6 +149,19 @@ def midpoint_gap(rs: int, re: int, cs: int, ce: int) -> float:
     return abs(0.5 * (rs + re) - 0.5 * (cs + ce))
 
 
+def load_chip_tracks(arrays_dir: Path, chrom: str) -> dict[str, np.ndarray]:
+    """Load chromosome z-scored ChIP tracks written by extract_chr_numpy.py."""
+    return {
+        mark: np.load(arrays_dir / f"chr{chrom}_chip_{mark}.npy", mmap_mode="r")
+        for mark in CHIP_MARKS
+    }
+
+
+def chip_patch(track: np.ndarray, i0: int) -> np.ndarray:
+    """Slice a 64-bin window from a chromosome z-scored ChIP track."""
+    return np.asarray(track[i0:i0 + N], dtype=np.float32)
+
+
 def normalize_patch(raw: np.ndarray, use_log1p: bool) -> tuple[np.ndarray, float, float]:
     """Normalize a bulk patch: expects per-phase clipping already applied, then summed."""
     x = raw.astype(np.float32, copy=False)
@@ -167,9 +183,45 @@ def load_checkpoint(path: Path, device: torch.device) -> SR3UNet:
     state = ckpt["model_state_dict"]
     if any(k.startswith("module.") for k in state):
         state = {k.replace("module.", "", 1): v for k, v in state.items()}
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
     return model
+
+
+def tukey_1d(m: int, taper_frac: float, min_weight: float) -> np.ndarray:
+    """1-D Tukey window scaled to [min_weight, 1] (matches scipy.signal.windows.tukey)."""
+    taper_frac = float(taper_frac)
+    min_weight = float(min_weight)
+    if m <= 1:
+        return np.ones(m, dtype=np.float32)
+    if taper_frac <= 0.0:
+        w = np.ones(m, dtype=np.float32)
+    elif taper_frac >= 1.0:
+        w = np.hanning(m).astype(np.float32)
+    else:
+        n = np.arange(m, dtype=np.float64)
+        width = int(np.floor(taper_frac * (m - 1) / 2.0))
+        w = np.ones(m, dtype=np.float64)
+        n1 = n[: width + 1]
+        n2 = n[m - width - 1 :]
+        w[: width + 1] = 0.5 * (
+            1.0 + np.cos(np.pi * (-1.0 + 2.0 * n1 / (taper_frac * (m - 1))))
+        )
+        w[m - width - 1 :] = 0.5 * (
+            1.0 + np.cos(np.pi * (-1.0 + 2.0 * (n2 - (m - 1)) / (taper_frac * (m - 1))))
+        )
+        w = w.astype(np.float32)
+    return (min_weight + (1.0 - min_weight) * w).astype(np.float32)
+
+
+def tile_weight_2d(
+    n: int,
+    taper_frac: float,
+    min_weight: float,
+) -> np.ndarray:
+    """2-D Tukey weight for tile merging; outer product of scaled 1-D Tukey windows."""
+    w1d = tukey_1d(n, taper_frac=taper_frac, min_weight=min_weight)
+    return np.outer(w1d, w1d).astype(np.float32)
 
 
 def open_memmap(path: Path, shape: tuple[int, ...], dtype) -> np.memmap:
@@ -242,9 +294,24 @@ def main() -> None:
         help="Total number of shards. Regions are distributed round-robin: shard k processes regs[k::num_shards].",
     )
     p.add_argument(
+        "--tukey_min_weight",
+        type=float,
+        default=0.25,
+        help="Minimum tile weight at patch edges when using the Tukey window (default: 0.25).",
+    )
+    p.add_argument(
+        "--tukey_taper_frac",
+        type=float,
+        default=0.08,
+        help=(
+            "Fraction of each patch edge tapered by the Tukey window "
+            "(default: 0.08 = 8%% cosine taper on each side)."
+        ),
+    )
+    p.add_argument(
         "--no_hanning",
         action="store_true",
-        help="Disable the 2-D Hanning window when merging overlapping tiles (uniform weights).",
+        help="Disable tile weighting when merging overlapping tiles (uniform weights).",
     )
     p.add_argument(
         "--chrom_size_bp",
@@ -272,33 +339,34 @@ def main() -> None:
     shard_suffix = f"_shard{shard_id}" if num_shards > 1 else ""
 
     raw_phase = {ph: np.load(arrays_dir / f"chr{chrom}_{ph}_raw.npy", mmap_mode="r") for ph in PHASES}
-    chip = {
-        "ctcf": np.load(arrays_dir / f"chr{chrom}_chip_ctcf.npy", mmap_mode="r"),
-        "hac": np.load(arrays_dir / f"chr{chrom}_chip_hac.npy", mmap_mode="r"),
-        "h3k4me1": np.load(arrays_dir / f"chr{chrom}_chip_h3k4me1.npy", mmap_mode="r"),
-        "h3k4me3": np.load(arrays_dir / f"chr{chrom}_chip_h3k4me3.npy", mmap_mode="r"),
-    }
+    chip = load_chip_tracks(arrays_dir, chrom)
 
-    # 2-D Hanning window for weighted accumulation (optional).
-    # Using hanning(N+2)[1:-1] avoids the exact zeros at the endpoints of the standard
-    # window, so every pixel that falls within any tile gets a positive weight.
-    # The outer product gives a smooth bell that peaks at the tile centre and tapers
-    # to ~0.07 at the edges.  This ensures each output pixel is determined primarily
-    # by tiles whose *centre* lies close to that pixel's diagonal distance, rather than
-    # by diagonal tiles that happen to reach far-off-diagonal corners — which is the
-    # root cause of the too-thick diagonal band seen in prometa.
+    # 2-D Tukey window for weighted accumulation (optional).
+    # A scaled Tukey window keeps a broad flat plateau (weight = 1) over most of the tile
+    # and only tapers the outer taper_frac fraction on each edge down to min_weight.
+    # Every pixel that falls within any tile therefore gets a positive weight (no zeros).
+    # Compared with Hanning, the plateau lets nearby tile centres contribute more evenly
+    # while still down-weighting far-corner contributions from off-centre tiles.
     # With --no_hanning, use uniform weights (equivalent to a plain sum/mean over tiles).
     if args.no_hanning:
-        hann_2d = np.ones((N, N), dtype=np.float32)
+        tile_weight_2d_arr = np.ones((N, N), dtype=np.float32)
+        weight_desc = "uniform"
     else:
-        _h = np.hanning(N + 2)[1:-1].astype(np.float32)   # (N,) positive bell, no zeros
-        hann_2d = np.outer(_h, _h).astype(np.float32)      # (N, N), symmetric
+        tile_weight_2d_arr = tile_weight_2d(
+            N,
+            taper_frac=args.tukey_taper_frac,
+            min_weight=args.tukey_min_weight,
+        )
+        weight_desc = (
+            f"tukey(min_weight={args.tukey_min_weight}, "
+            f"taper_frac={args.tukey_taper_frac})"
+        )
 
     # Accumulators — each tile's prediction is denormalized to COUNT space using that tile's
-    # own bulk (lo, hi) and accumulated with a Hanning weight.  fill_chr_offdiag_cpu.py forms
-    # pred_count / pred_wsum = the Hanning-weighted arithmetic (posterior) mean in count space.
-    #   pred_count: Hanning-weighted sum of per-tile count-space predictions
-    #   pred_wsum : sum of Hanning weights (float32, not an integer count)
+    # own bulk (lo, hi) and accumulated with a Tukey weight.  fill_chr_offdiag_cpu.py forms
+    # pred_count / pred_wsum = the Tukey-weighted arithmetic (posterior) mean in count space.
+    #   pred_count: Tukey-weighted sum of per-tile count-space predictions
+    #   pred_wsum : sum of Tukey weights (float32, not an integer count)
     pred_count = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_count{shard_suffix}.npy", (L, L), np.float32) for ph in PHASES}
     pred_wsum  = {ph: open_memmap(out_dir / f"chr{chrom}_{ph}_pred_wsum{shard_suffix}.npy",  (L, L), np.float32) for ph in PHASES}
 
@@ -339,7 +407,7 @@ def main() -> None:
     print(
         f"Near-diagonal patches (shard {shard_id}/{num_shards}): {len(regs)} "
         f"[near_step={args.diag_step_near_bp} far_step={args.diag_step_far_bp} "
-        f"threshold={args.near_far_threshold_bp} hanning={not args.no_hanning}]"
+        f"threshold={args.near_far_threshold_bp} tile_weight={weight_desc}]"
     )
 
     with torch.no_grad():
@@ -394,15 +462,15 @@ def main() -> None:
                     raw_bulk_patch = 0.2 * sum(clipped_patches[ph] for ph in PHASES)
                     bulk[bi], lo_bulk[bi], hi_bulk[bi] = normalize_patch(raw_bulk_patch, use_log1p)
 
-                    chip_row[bi, 0] = np.asarray(chip["ctcf"][i0:i0 + N],     dtype=np.float32)
-                    chip_row[bi, 1] = np.asarray(chip["hac"][i0:i0 + N],      dtype=np.float32)
-                    chip_row[bi, 2] = np.asarray(chip["h3k4me1"][i0:i0 + N],  dtype=np.float32)
-                    chip_row[bi, 3] = np.asarray(chip["h3k4me3"][i0:i0 + N],  dtype=np.float32)
+                    chip_row[bi, 0] = chip_patch(chip["ctcf"],    i0)
+                    chip_row[bi, 1] = chip_patch(chip["hac"],     i0)
+                    chip_row[bi, 2] = chip_patch(chip["h3k4me1"],  i0)
+                    chip_row[bi, 3] = chip_patch(chip["h3k4me3"],  i0)
 
-                    chip_col[bi, 0] = np.asarray(chip["ctcf"][j0:j0 + N],     dtype=np.float32)
-                    chip_col[bi, 1] = np.asarray(chip["hac"][j0:j0 + N],      dtype=np.float32)
-                    chip_col[bi, 2] = np.asarray(chip["h3k4me1"][j0:j0 + N],  dtype=np.float32)
-                    chip_col[bi, 3] = np.asarray(chip["h3k4me3"][j0:j0 + N],  dtype=np.float32)
+                    chip_col[bi, 0] = chip_patch(chip["ctcf"],    j0)
+                    chip_col[bi, 1] = chip_patch(chip["hac"],     j0)
+                    chip_col[bi, 2] = chip_patch(chip["h3k4me1"],  j0)
+                    chip_col[bi, 3] = chip_patch(chip["h3k4me3"],  j0)
 
                 bulk_t = torch.from_numpy(bulk).to(device).unsqueeze(1)  # (B,1,N,N)
                 row_t = [torch.from_numpy(chip_row[:, k, :]).to(device) for k in range(4)]
@@ -416,8 +484,8 @@ def main() -> None:
                 ).cpu().numpy().astype(np.float32)  # (B,5,N,N) in [-1,1]
 
                 # Denormalize each tile to COUNT space using that tile's own bulk (lo, hi),
-                # then accumulate the Hanning-weighted count.  fill_chr_offdiag_cpu.py forms
-                # pred_count / pred_wsum = the Hanning-weighted arithmetic mean of the tile
+                # then accumulate the Tukey-weighted count.  fill_chr_offdiag_cpu.py forms
+                # pred_count / pred_wsum = the Tukey-weighted arithmetic mean of the tile
                 # predictions, i.e. the posterior mean in count space.
                 #
                 # Count-space (arithmetic) averaging is used deliberately instead of
@@ -429,12 +497,12 @@ def main() -> None:
                 # density of the (high-coverage) ground truth much better.  The diagonal, being
                 # consistent across overlapping samples, is unaffected by the choice.
                 #
-                # The Hanning weight makes each pixel primarily reflect tiles centred near it,
+                # The Tukey weight makes each pixel primarily reflect tiles centred near it,
                 # suppressing the far-corner contribution of tiles that only barely reach the
                 # pixel (the cause of the too-thick diagonal band).
                 #
                 # For off-diagonal tiles we also mirror into the lower triangle so both sides
-                # of the diagonal are diffusion-predicted.  hann_2d is symmetric, so only the
+                # of the diagonal are diffusion-predicted.  tile_weight_2d_arr is symmetric,
                 # prediction needs transposing.
                 for pi, ph in enumerate(PHASES):
                     for bi in range(B):
@@ -447,12 +515,12 @@ def main() -> None:
                             log_pred = ((sampled[bi, pi] + 1.0) * 0.5 * span + lo_bulk[bi]).astype(np.float32)
                         count_pred = np.expm1(log_pred).astype(np.float32) if use_log1p else log_pred
 
-                        pred_count[ph][i0:i0 + N, j0:j0 + N] += count_pred * hann_2d
-                        pred_wsum[ph][i0:i0 + N, j0:j0 + N]  += hann_2d
+                        pred_count[ph][i0:i0 + N, j0:j0 + N] += count_pred * tile_weight_2d_arr
+                        pred_wsum[ph][i0:i0 + N, j0:j0 + N]  += tile_weight_2d_arr
 
                         if i0 != j0:  # off-diagonal: mirror into lower triangle
-                            pred_count[ph][j0:j0 + N, i0:i0 + N] += count_pred.T * hann_2d
-                            pred_wsum[ph][j0:j0 + N, i0:i0 + N]  += hann_2d
+                            pred_count[ph][j0:j0 + N, i0:i0 + N] += count_pred.T * tile_weight_2d_arr
+                            pred_wsum[ph][j0:j0 + N, i0:i0 + N]  += tile_weight_2d_arr
 
     for ph in PHASES:
         pred_count[ph].flush()

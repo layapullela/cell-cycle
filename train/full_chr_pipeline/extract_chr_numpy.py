@@ -3,7 +3,7 @@ Extract a full chromosome from per-phase .hic + ChIP bigWigs into NumPy arrays.
 
 Writes (in output_dir):
   - chr{chrom}_{phase}_raw.npy        float32 (L, L)  raw matrix from hicstraw (symmetric filled)
-  - chr{chrom}_chip_{mark}.npy        float32 (L,)    log1p(max per bin) track
+  - chr{chrom}_chip_{mark}.npy        float32 (L,)    chrom z-scored log1p(max per bin) track
 
 This is intentionally simple: one-time extraction so later scripts only slice
 NumPy arrays instead of calling hicstraw repeatedly.
@@ -21,12 +21,14 @@ import numpy as np
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _TRAIN_DIR = _SCRIPT_DIR.parent
 _REPO_ROOT = _TRAIN_DIR.parent
+sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "preprocess"))
 
 import hicstraw as straw
 import pyBigWig
 
 from prestore_hic import CHROMOSOME_SIZES
+from preprocess.chip_signal import apply_chip_zscore, chrom_chip_mean_std
 
 # Keep this pipeline self-contained (avoid import-path issues under Slurm).
 RESOLUTION_BP = 10_000
@@ -93,6 +95,8 @@ def extract_chip_track(bw_path: Path, chrom: str, out_path: Path) -> None:
             bw.close()
         except Exception:
             pass
+    mean, std = chrom_chip_mean_std(mm)
+    mm[:] = apply_chip_zscore(mm, mean, std)
     mm.flush()
 
 

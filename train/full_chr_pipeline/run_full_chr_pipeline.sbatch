@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=chr_full_pipe
+#SBATCH --job-name=chr_14
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu
-#SBATCH --time=40:00:00
+#SBATCH --time=20:00:00
 #SBATCH --mem=80G
 #SBATCH --cpus-per-task=4
 #SBATCH --output=logs/full_chr_pipeline_%j.out
@@ -26,13 +26,15 @@ CHROM="${CHROM:-14}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-16_asym-residual-loss.pth}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/oe_log_4phase_epoch40_4-30.pth}"
 #CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_5_15.pth}" # chr14
-CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_5_30_bulk_norm_ssim_and_phase_sim.pth}" # chr14
+#CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_5_30_bulk_norm_ssim_and_phase_sim.pth}" # chr14
+#CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_6-6_chip_loop_loss_holdout_2.pth}" # chr14
+CHECKPOINT="${CHECKPOINT:-${WORKDIR}/checkpoints/observed_log_5phase_epoch40_6-12_chip_oe_loss_holdout_14.pth}" # chr14
 
 # These default to your repo structure; override as needed.
 DATA_DIR="${DATA_DIR:-/nfs/turbo/umms-minjilab/lpullela/cell-cycle/raw_data/zhang_4dn}"
 CHIP_DIR="${CHIP_DIR:-$DATA_DIR}"
 
-OUT_BASE="${OUT_BASE:-${WORKDIR}/full_chr_outputs_new/chr${CHROM}}"
+OUT_BASE="${OUT_BASE:-${WORKDIR}/full_chr_outputs_zhang/tukey/no_window_actual/chr${CHROM}}"
 ARRAYS_DIR="${ARRAYS_DIR:-${OUT_BASE}/arrays}"
 NEAR_DIR="${NEAR_DIR:-${OUT_BASE}/near_pred}"
 FINAL_DIR="${FINAL_DIR:-${OUT_BASE}/final}"
@@ -47,7 +49,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 # DIAG_STEP_FAR_BP  applies to tiles beyond NEAR_FAR_THRESHOLD_BP.
 # Lower step = finer overlap (e.g. 80000 = 87.5%, 320000 = 50%, 640000 = no overlap).
 DIAG_STEP_NEAR_BP="${DIAG_STEP_NEAR_BP:-160000}"
-DIAG_STEP_FAR_BP="${DIAG_STEP_FAR_BP:-160000}"
+DIAG_STEP_FAR_BP="${DIAG_STEP_FAR_BP:-320000}"
 NEAR_FAR_THRESHOLD_BP="${NEAR_FAR_THRESHOLD_BP:-1000000}"
 # Number of GPUs to use for the near-diagonal inference step.
 # Each GPU gets a contiguous spatial block of regions (e.g. with 2 GPUs:
@@ -64,7 +66,10 @@ NUM_GPUS="${NUM_GPUS:-1}"
 #   Example: TEST_FRAC=0.1 sbatch full_chr_pipeline/run_full_chr_pipeline.sbatch
 TEST_FRAC="${TEST_FRAC:-0}"
 
-# Set NO_HANNING=1 to disable Hanning weighting when merging overlapping tiles.
+# Tile merge weights: Tukey window (default) or uniform if NO_HANNING=1.
+TUKEY_MIN_WEIGHT="${TUKEY_MIN_WEIGHT:-0.25}"
+TUKEY_TAPER_FRAC="${TUKEY_TAPER_FRAC:-0.08}"
+# Set NO_HANNING=1 to disable tile weighting (uniform weights over overlapping tiles).
 NO_HANNING="${NO_HANNING:-0}"
 
 # Step controls (set to 1 to skip). This script never deletes outputs.
@@ -104,7 +109,7 @@ echo "OUT_BASE: $OUT_BASE"
 echo "HIC_UNIT: $HIC_UNIT   NORM: $NORM   NEAR_BAND_BP: $NEAR_BAND_BP"
 echo "BATCH_SIZE: $BATCH_SIZE   NUM_GPUS: $NUM_GPUS"
 echo "DIAG_STEP_NEAR_BP: $DIAG_STEP_NEAR_BP   DIAG_STEP_FAR_BP: $DIAG_STEP_FAR_BP   NEAR_FAR_THRESHOLD_BP: $NEAR_FAR_THRESHOLD_BP"
-echo "TEST_FRAC: $TEST_FRAC   NO_HANNING: $NO_HANNING"
+echo "TEST_FRAC: $TEST_FRAC   TILE_WEIGHT: tukey(min=$TUKEY_MIN_WEIGHT,taper=$TUKEY_TAPER_FRAC)   NO_HANNING: $NO_HANNING"
 echo "ONLY_EXPORT: $ONLY_EXPORT"
 echo "SKIP_EXTRACT / SKIP_INFER / SKIP_FILL / SKIP_EXPORT: $SKIP_EXTRACT / $SKIP_INFER / $SKIP_FILL / $SKIP_EXPORT"
 echo "EXPORT_FORMAT: $EXPORT_FORMAT"
@@ -126,7 +131,10 @@ fi
 
 if [[ "$SKIP_INFER" != "1" ]]; then
   echo "[2/4] Near-diagonal GPU inference -> $NEAR_DIR  (NUM_GPUS=$NUM_GPUS)"
-  infer_extra=()
+  infer_extra=(
+    --tukey_min_weight "$TUKEY_MIN_WEIGHT"
+    --tukey_taper_frac "$TUKEY_TAPER_FRAC"
+  )
   if [[ "$NO_HANNING" == "1" ]]; then
     infer_extra+=(--no_hanning)
   fi
