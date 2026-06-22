@@ -22,13 +22,13 @@ SAMPLING:
         y_{t-1}  = (1/√α_t)(y_t - (1-α_t)/√(1-γ_t) · ε_θ) + √(1-α_t) · z
 """
 
-import re
+# import re  # loop label parsing (disabled)
 import sys
 import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
+# import pandas as pd  # loop label Excel I/O (disabled)
 import pytorch_msssim
 from pathlib import Path
 from tqdm import tqdm
@@ -101,141 +101,178 @@ RESUME_CHECKPOINT = None
 ############################################
 # 2) LOOP LABEL DICTIONARY
 ############################################
-_ANCHOR_RE = re.compile(r"^chr(\w+):(\d+)-(\d+)$")
+# _ANCHOR_RE = re.compile(r"^chr(\w+):(\d+)-(\d+)$")
 
 
-def _parse_loop_anchor(coord: str):
-    """Parse 'chrN:start-end' → (chrom_no_prefix, start, end) or None."""
-    m = _ANCHOR_RE.match(coord.strip())
-    if not m:
-        return None
-    return m.group(1), int(m.group(2)), int(m.group(3))
+# def _parse_loop_anchor(coord: str):
+#     """Parse 'chrN:start-end' → (chrom_no_prefix, start, end) or None."""
+#     m = _ANCHOR_RE.match(coord.strip())
+#     if not m:
+#         return None
+#     return m.group(1), int(m.group(2)), int(m.group(3))
 
 
-def _mid_in_window(anchor_start: int, anchor_end: int, win_start: int, win_end: int) -> bool:
-    """True if the anchor midpoint falls within [win_start, win_end)."""
-    mid = (anchor_start + anchor_end) // 2
-    return win_start <= mid < win_end
+# def _is_diagonal_region(region: str) -> bool:
+#     """True when row and col windows share the same start (main-diagonal crop)."""
+#     parts = region.split(":")
+#     rs, _ = map(int, parts[1].split("-"))
+#     if len(parts) == 3:
+#         cs, _ = map(int, parts[2].split("-"))
+#     else:
+#         cs = rs
+#     return rs == cs
 
 
-def load_loop_label_dict(excel_path: str, all_regions: list) -> dict:
-    """
-    Build a mapping  region_str → loop_label  for every region in *all_regions*.
+# def _mid_in_window(anchor_start: int, anchor_end: int, win_start: int, win_end: int) -> bool:
+#     """True if the anchor midpoint falls within [win_start, win_end)."""
+#     mid = (anchor_start + anchor_end) // 2
+#     return win_start <= mid < win_end
 
-    Loop labels
-    -----------
-    -1 : ambiguous — region contains both cluster-1/2 AND cluster-3 loops; skip in loss.
-     0 : no loop detected in this window.
-     1 : at least one cluster-1 or cluster-2 loop.
-     2 : at least one cluster-3 loop.
 
-    Region format   : "{chrom}:{row_start}-{row_end}:{col_start}-{col_end}"
-                      chrom has NO 'chr' prefix.
-    Anchor format   : "chrN:start-end"  (with 'chr' prefix, from the Excel file).
+# def _is_ep_loop(class_val) -> bool:
+#     """True for enhancer-promoter loops (class contains 'E/P' or 'EP')."""
+#     s = str(class_val)
+#     return "E/P" in s or "EP" in s
 
-    A loop is assigned to a region if the midpoint of each anchor falls within the
-    corresponding row / col window (both orientations are checked because Hi-C is
-    symmetric).
-    """
-    df = pd.read_excel(
-        excel_path,
-        usecols=["loop_coordinate_row_mm10", "loop_coordinate_col_mm10", "cluster_id"],
-    )
 
-    #breakpoint()
-    df = df.dropna(subset=["cluster_id"]).copy()
-    df["cluster_id"] = df["cluster_id"].astype(int)
+# def _is_structural_loop(class_val) -> bool:
+#     """True for structural loops (class contains 'structural')."""
+#     return "structural" in str(class_val).lower()
+
+
+# def load_loop_label_dict(excel_path: str, all_regions: list) -> dict:
+#     """
+#     Build a mapping  region_str → loop_label  for every region in *all_regions*.
+
+#     Loop labels
+#     -----------
+#     -1 : ambiguous — region contains both E/P cluster-1/2 AND E/P cluster-3 loops; skip in loss.
+#      0 : no loop detected in this window.
+#      1 : at least one E/P cluster-1 or cluster-2 loop.
+#      2 : at least one E/P cluster-3 loop.
+#      3 : at least one structural loop (cluster ignored).
+
+#     Region format   : "{chrom}:{row_start}-{row_end}:{col_start}-{col_end}"
+#                       chrom has NO 'chr' prefix.
+#     Anchor format   : "chrN:start-end"  (with 'chr' prefix, from the Excel file).
+
+#     A loop is assigned to a region if the midpoint of each anchor falls within the
+#     corresponding row / col window (both orientations are checked because Hi-C is
+#     symmetric).
+#     """
+#     df = pd.read_excel(
+#         excel_path,
+#         usecols=["loop_coordinate_row_mm10", "loop_coordinate_col_mm10", "class", "cluster_id"],
+#     )
+
+#     df = df.dropna(subset=["cluster_id"]).copy()
+#     df["cluster_id"] = df["cluster_id"].astype(int)
+#     df = df[
+#         df["class"].apply(lambda c: _is_ep_loop(c) or _is_structural_loop(c))
+#     ].copy()
 
     # Parse all loop anchors once
-    loops = []  # list of ((chrom, start, end), (chrom, start, end), cluster_id)
-    for _, row in df.iterrows():
-        a1 = _parse_loop_anchor(row["loop_coordinate_row_mm10"])
-        a2 = _parse_loop_anchor(row["loop_coordinate_col_mm10"])
-        if a1 and a2:
-            loops.append((a1, a2, int(row["cluster_id"])))
+#     loops = []  # list of ((chrom, start, end), (chrom, start, end), class, cluster_id)
+#     for _, row in df.iterrows():
+#         a1 = _parse_loop_anchor(row["loop_coordinate_row_mm10"])
+#         a2 = _parse_loop_anchor(row["loop_coordinate_col_mm10"])
+#         if a1 and a2:
+#             loops.append((a1, a2, row["class"], int(row["cluster_id"])))
 
-    print(f"Loaded {len(loops)} loops from {excel_path}")
+#     n_ep = sum(1 for *_, cls, _ in loops if _is_ep_loop(cls))
+#     n_struct = sum(1 for *_, cls, _ in loops if _is_structural_loop(cls))
+#     print(f"Loaded {len(loops)} loops from {excel_path} "
+#           f"(E/P={n_ep}, structural={n_struct})")
 
     # Group loops by chromosome for fast lookup
-    from collections import defaultdict
-    loops_by_chrom = defaultdict(list)
-    for a1, a2, cid in loops:
-        loops_by_chrom[a1[0]].append((a1, a2, cid))
+#     from collections import defaultdict
+#     loops_by_chrom = defaultdict(list)
+#     for a1, a2, cls, cid in loops:
+#         loops_by_chrom[a1[0]].append((a1, a2, cls, cid))
 
-    label_dict = {}
-    for region in all_regions:
-        parts = region.split(":")
-        chrom = parts[0]
-        rs, re_ = map(int, parts[1].split("-"))
-        cs, ce  = map(int, parts[2].split("-")) if len(parts) == 3 else (rs, re_)
+#     label_dict = {}
+#     for region in all_regions:
+#         parts = region.split(":")
+#         chrom = parts[0]
+#         rs, re_ = map(int, parts[1].split("-"))
+#         cs, ce  = map(int, parts[2].split("-")) if len(parts) == 3 else (rs, re_)
 
-        has_12 = False
-        has_3  = False
+#         has_ep_12 = False
+#         has_ep_3  = False
+#         has_structural = False
 
-        for (a1_chrom, a1_s, a1_e), (a2_chrom, a2_s, a2_e), cid in loops_by_chrom.get(chrom, []):
-            if a2_chrom != chrom:
-                continue
-            forward = _mid_in_window(a1_s, a1_e, rs, re_) and _mid_in_window(a2_s, a2_e, cs, ce)
-            reverse = _mid_in_window(a2_s, a2_e, rs, re_) and _mid_in_window(a1_s, a1_e, cs, ce)
-            if forward or reverse:
-                if cid in (1, 2):
-                    has_12 = True
-                elif cid == 3:
-                    has_3 = True
+#         for (a1_chrom, a1_s, a1_e), (a2_chrom, a2_s, a2_e), cls, cid in loops_by_chrom.get(chrom, []):
+#             if a2_chrom != chrom:
+#                 continue
+#             forward = _mid_in_window(a1_s, a1_e, rs, re_) and _mid_in_window(a2_s, a2_e, cs, ce)
+#             reverse = _mid_in_window(a2_s, a2_e, rs, re_) and _mid_in_window(a1_s, a1_e, cs, ce)
+#             if not (forward or reverse):
+#                 continue
+#             if _is_ep_loop(cls):
+#                 if cid in (1, 2):
+#                     has_ep_12 = True
+#                 elif cid == 3:
+#                     has_ep_3 = True
+#             elif _is_structural_loop(cls):
+#                 has_structural = True
 
-        if has_12 and has_3:
-            label_dict[region] = -1   # ambiguous — skip
-        elif has_3:
-            label_dict[region] = 2
-        elif has_12:
-            label_dict[region] = 1
-        else:
-            label_dict[region] = 0
+#         if has_ep_12 and has_ep_3:
+#             label_dict[region] = -1   # ambiguous — skip
+#         elif has_ep_3:
+#             label_dict[region] = 2
+#         elif has_ep_12:
+#             label_dict[region] = 1
+#         elif has_structural:
+#             label_dict[region] = 3
+#         else:
+#             label_dict[region] = 0
 
-    n_per_label = {v: sum(1 for l in label_dict.values() if l == v) for v in (-1, 0, 1, 2)}
-    print(f"Loop label distribution: "
-          f"no-loop={n_per_label[0]}  cluster-1/2={n_per_label[1]}  "
-          f"cluster-3={n_per_label[2]}  ambiguous(skip)={n_per_label[-1]}")
-    return label_dict
+#     n_per_label = {v: sum(1 for l in label_dict.values() if l == v) for v in (-1, 0, 1, 2, 3)}
+#     print(f"Loop label distribution: "
+#           f"no-loop={n_per_label[0]}  E/P-cluster-1/2={n_per_label[1]}  "
+#           f"E/P-cluster-3={n_per_label[2]}  structural={n_per_label[3]}  "
+#           f"ambiguous(skip)={n_per_label[-1]}")
+#     return label_dict
 
 
-def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) -> torch.Tensor:
-    """
-    Compute inverse-frequency class weights for the loop classification loss so that
-    all three classes contribute equally regardless of their prevalence in training data.
+# def compute_loop_class_weights(loop_label_dict: dict, training_regions: list) -> torch.Tensor:
+#     """
+#     Compute inverse-frequency class weights for the loop classification loss.
 
-    Only training regions (not holdout) are counted; ambiguous samples (label -1) are
-    excluded from the frequency estimate since they are masked out of the loss anyway.
+#     Counts are restricted to main-diagonal training regions only (the same subset
+#     that contributes to chip_loop_loss).  Ambiguous samples (label -1) are excluded.
 
-    Returns a (3,) float32 tensor of per-class weights suitable for passing directly
-    to F.cross_entropy(..., weight=...).
+#     Returns a (4,) float32 tensor for F.cross_entropy(..., weight=...).
 
-    Weight formula (sklearn convention):
-        weight[c] = n_valid / (n_classes * n_c)
-    where n_valid = total non-ambiguous training samples, n_classes = 3.
-    """
-    counts = [0, 0, 0]  # counts[0], counts[1], counts[2]
-    for region in training_regions:
-        label = loop_label_dict.get(region, 0)
-        if 0 <= label <= 2:
-            counts[label] += 1
+#     Weight formula (sklearn convention):
+#         weight[c] = n_valid / (n_classes * n_c)
+#     where n_valid = total non-ambiguous diagonal training samples, n_classes = 4.
+#     """
+#     counts = [0, 0, 0, 0]
+#     for region in training_regions:
+#         if not _is_diagonal_region(region):
+#             continue
+#         label = loop_label_dict.get(region, 0)
+#         if 0 <= label <= 3:
+#             counts[label] += 1
 
-    n_valid = sum(counts)
-    if n_valid == 0:
-        return torch.ones(3, dtype=torch.float32)
+#     n_valid = sum(counts)
+#     if n_valid == 0:
+#         return torch.ones(4, dtype=torch.float32)
 
-    weights = [n_valid / (3 * c) if c > 0 else 1.0 for c in counts]
-    w = torch.tensor(weights, dtype=torch.float32)
-    print(f"Loop class weights (training, inv-freq): "
-          f"no-loop={w[0]:.3f}  cluster-1/2={w[1]:.3f}  cluster-3={w[2]:.3f}  "
-          f"(counts: {counts[0]} / {counts[1]} / {counts[2]})")
-    return w
+#     weights = [n_valid / (4 * c) if c > 0 else 1.0 for c in counts]
+#     w = torch.tensor(weights, dtype=torch.float32)
+#     print(f"Loop class weights (diagonal training, inv-freq): "
+#           f"no-loop={w[0]:.3f}  E/P-cluster-1/2={w[1]:.3f}  "
+#           f"E/P-cluster-3={w[2]:.3f}  structural={w[3]:.3f}  "
+#           f"(counts: {counts[0]} / {counts[1]} / {counts[2]} / {counts[3]})")
+#     return w
 
 
 ############################################
 # 3) CHECKPOINT LOADING  (was §2)
 ############################################
-def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, scheduler, device):
     if checkpoint_path is None:
         return 0, 0, float('inf')
 
@@ -259,13 +296,17 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device):
     model.load_state_dict(checkpoint['model_state_dict'])
     if 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if 'scheduler_state_dict' in checkpoint and scheduler is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
     start_epoch  = checkpoint['epoch'] + 1
     global_step  = checkpoint.get('global_step', 0)
     best_loss    = checkpoint.get('loss', float('inf'))
 
+    current_lr = optimizer.param_groups[0]['lr']
     print(f"✓ Resuming from epoch {checkpoint['epoch'] + 1}")
     print(f"  Loss: {checkpoint['loss']:.6f}, Global step: {global_step}")
+    print(f"  Learning rate: {current_lr:.2e}")
     print("="*80 + "\n")
 
     return start_epoch, global_step, best_loss
@@ -324,8 +365,8 @@ def _build_targets(batch, device):
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col)
 
 
-# Maps are nominally in [-1, 1]; SSIM `data_range` is max − min = 2 (pytorch_msssim).
-_SSIM_DATA_RANGE = 2.0
+# Log-normalised Hi-C maps span roughly [-2, 2]; data_range = max - min = 4.
+_SSIM_DATA_RANGE = 4.0
 
 
 def ssim_1_minus_mean(
@@ -473,16 +514,19 @@ def iw_ssim_map(
     return log_iw.exp()
 
 
-# iw_ssim_loss — was used for the chip aux head (chip_aux_loss); removed when the
-# auxiliary head was replaced by the loop classification head.  Kept here for reference.
-#
-# def iw_ssim_loss(pred, target, *, win_size=11, win_sigma=1.5,
-#                  data_range=_SSIM_DATA_RANGE, n_scales=4):
-#     """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels."""
-#     return 1.0 - iw_ssim_map(
-#         pred, target, win_size=win_size, win_sigma=win_sigma,
-#         data_range=data_range, n_scales=n_scales,
-#     ).mean()
+def iw_ssim_loss(pred, target, *, win_size=11, win_sigma=1.5,
+                 data_range=_SSIM_DATA_RANGE, n_scales=4):
+    """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels.
+
+    Note: data_range=2.0 assumes inputs in [-1, 1].  When applied to x0_current
+    (log-normalised Hi-C maps) and chip_pred (unconstrained 1×1 conv), the actual
+    range may exceed ±1.  The effect is a rescaling of SSIM stability constants C1/C2;
+    consider increasing data_range if maps routinely exceed [-1, 1].
+    """
+    return 1.0 - iw_ssim_map(
+        pred, target, win_size=win_size, win_sigma=win_sigma,
+        data_range=data_range, n_scales=n_scales,
+    ).mean()
 
 
 # The three helpers below supported chip_phase_similarity_loss, which compared
@@ -617,25 +661,19 @@ def compute_validation_loss(model, val_dataloader, device):
     return total_loss / n_batches if n_batches else 0.0
 
 
-def train_step(model, raw_model, optimizer, batch, device,
-               loop_label_dict: dict, loop_class_weights: torch.Tensor):
+def train_step(model, raw_model, optimizer, batch, device):
+    #               loop_label_dict: dict, loop_class_weights: torch.Tensor):
     """
     Single training step for SR3-style iterative refinement.
 
     Args:
         model:              nn.DataParallel-wrapped (or plain) SR3UNet — used for forward pass.
-        raw_model:          Underlying SR3UNet; used directly for loop_class_logits to avoid
+        raw_model:          Underlying SR3UNet; used directly for chip_aux_pred to avoid
                             DataParallel re-scattering a small tensor.
-        loop_label_dict:    Mapping region_str → label (0/1/2/-1).  Built once at startup from
-                            the loop-feature Excel file.  Labels:
-                              -1 : ambiguous (cluster-1/2 AND cluster-3 present) — skip in loss
-                               0 : no loop
-                               1 : cluster-1 or cluster-2 loop
-                               2 : cluster-3 loop
-        loop_class_weights: (3,) inverse-frequency weights for the cross-entropy loss so that
-                            each loop class contributes equally regardless of prevalence.
     Returns:
-        (total_loss, mse_loss, iw_ssim_main_loss, chip_loop_loss) as floats
+        (total_loss, mse_loss, chip_aux_loss) as floats
+        mse_loss:     channel-weighted MSE on noise residuals (main diffusion objective).
+        chip_aux_loss: IW-SSIM loss between chip_aux_pred(h_chip) and x0_current.
     """
     (x0_current, bulk_map,
      chip_ctcf_row, chip_hac_row, chip_me1_row, chip_me3_row,
@@ -662,44 +700,41 @@ def train_step(model, raw_model, optimizer, batch, device,
     mse_per_channel  = ((eps_pred - eps_true) ** 2).mean(dim=(0, 2, 3))  # (5,)
     mse_loss         = (channel_weights * mse_per_channel).sum()
 
-    # ---- IW-SSIM on noise residuals: emphasises structurally rich regions ----
-    iw_ssim_per_channel      = iw_ssim_map(eps_pred, eps_true)       # (B, C=5)
-    iw_ssim_per_channel_mean = iw_ssim_per_channel.mean(dim=0)       # (C=5,)
-    iw_ssim_main_loss        = (channel_weights * (1.0 - iw_ssim_per_channel_mean)).sum()
+    # ---- Loop classification head (disabled) ----
+    # loop_logits = raw_model.loop_class_logits(h_chip)          # (B, 4)
+    # regions = batch["region"]
+    # loop_labels = torch.tensor(
+    #     [loop_label_dict.get(r, 0) for r in regions],
+    #     dtype=torch.long, device=device,
+    # )                                                           # (B,)
+    # # Loop loss only on main-diagonal crops; skip ambiguous labels (label == -1).
+    # diagonal_mask = torch.tensor(
+    #     [_is_diagonal_region(r) for r in regions],
+    #     dtype=torch.bool, device=device,
+    # )
+    # loss_mask = (loop_labels >= 0) & diagonal_mask
+    # if loss_mask.any():
+    #     chip_loop_loss = F.cross_entropy(
+    #         loop_logits[loss_mask],
+    #         loop_labels[loss_mask],
+    #         weight=loop_class_weights.to(device),
+    #     )
+    # else:
+    #     chip_loop_loss = loop_logits.new_zeros(())
 
-    # ---- Loop classification: predict loop presence/type from ChIP pair features ----
-    # loop_class_logits: (B, 3) — classes 0/1/2 (no-loop / cluster-1or2 / cluster-3)
-    loop_logits = raw_model.loop_class_logits(h_chip)          # (B, 3)
+    # ---- ChIP aux head: predict phase maps, supervise with IW-SSIM ----
+    # chip_pred outputs (B, 5, N, N) phase-map predictions from ChIP pair features.
+    # Compared directly against x0_current (log-normalised Hi-C targets).
+    chip_pred     = raw_model.chip_aux_pred(h_chip)          # (B, 5, N, N)
+    chip_aux_loss = iw_ssim_loss(chip_pred, x0_current)
 
-    regions = batch["region"]                                   # list of B strings
-    loop_labels = torch.tensor(
-        [loop_label_dict.get(r, 0) for r in regions],
-        dtype=torch.long, device=device,
-    )                                                           # (B,)
-
-    # Skip samples where both cluster-1/2 and cluster-3 loops are present (label == -1)
-    valid_mask = loop_labels >= 0
-    if valid_mask.any():
-        chip_loop_loss = F.cross_entropy(
-            loop_logits[valid_mask],
-            loop_labels[valid_mask],
-            weight=loop_class_weights.to(device),
-        )
-    else:
-        chip_loop_loss = loop_logits.new_zeros(())
-
-    #breakpoint()
-
-    loss = mse_loss + iw_ssim_main_loss + chip_loop_loss / 10
+    loss = mse_loss + chip_aux_loss / 5
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-    return (
-        loss.item(), mse_loss.item(), iw_ssim_main_loss.item(),
-        chip_loop_loss.item() / 10,
-    )
+    return loss.item(), mse_loss.item(), chip_aux_loss.item() / 5
 
 
 ############################################
@@ -737,10 +772,20 @@ def main():
 
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=LR)
 
+    # Cosine annealing over the total planned epochs (T_max).
+    # --num_epochs sets the window length; the scheduler decays LR from LR → LR/100
+    # over that many epochs.  On resume the saved state_dict restores the exact
+    # position in the schedule so LR continues smoothly rather than restarting.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=LR / 100,
+    )
+
     # Load checkpoint into raw_model BEFORE wrapping with DataParallel so that
     # state-dict keys never have the "module." prefix.
     start_epoch, global_step, best_loss = load_checkpoint_for_training(
-        resume_checkpoint, raw_model, optimizer, DEVICE
+        resume_checkpoint, raw_model, optimizer, scheduler, DEVICE
     )
 
     n_gpus = torch.cuda.device_count()
@@ -843,28 +888,28 @@ def main():
     print(f"Batches per epoch: {len(train_dataloader)}")
     print("="*80)
 
-    # Build loop label dictionary and balanced class weights once before training starts.
-    excel_path = data_dir / "41586_2019_1778_MOESM5_ESM_split.xlsx"
-    all_regions = cell_cycle_loader_train.regions + cell_cycle_loader_eval.holdout_regions
-    loop_label_dict     = load_loop_label_dict(str(excel_path), all_regions)
-    loop_class_weights  = compute_loop_class_weights(loop_label_dict,
-                                                      cell_cycle_loader_train.regions)
+    # Build loop label dictionary and diagonal-only class weights before training.
+    # excel_path = data_dir / "41586_2019_1778_MOESM5_ESM_split.xlsx"
+    # all_regions = cell_cycle_loader_train.regions + cell_cycle_loader_eval.holdout_regions
+    # loop_label_dict    = load_loop_label_dict(str(excel_path), all_regions)
+    # loop_class_weights = compute_loop_class_weights(
+    #     loop_label_dict, cell_cycle_loader_train.regions,
+    # )
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
-        epoch_losses, epoch_mse, epoch_iw_ssim, epoch_chip_loop = [], [], [], []
+        epoch_losses, epoch_mse, epoch_chip_aux = [], [], []
         model.train()
 
         total_epochs = start_epoch + num_epochs
         pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{total_epochs} [5-phase]")
         for batch in pbar:
-            loss, mse, iw_ssim, chip_loop = train_step(
+            loss, mse, chip_aux = train_step(
                 model, raw_model, optimizer, batch, DEVICE,
-                loop_label_dict, loop_class_weights,
+                # loop_label_dict, loop_class_weights,
             )
             epoch_losses.append(loss)
             epoch_mse.append(mse)
-            epoch_iw_ssim.append(iw_ssim)
-            epoch_chip_loop.append(chip_loop)
+            epoch_chip_aux.append(chip_aux)
             global_step += 1
 
             if global_step % 100 == 0:
@@ -872,27 +917,31 @@ def main():
                 print(f"  [step {global_step}] val_loss = {val_loss:.6f}")
             if global_step % 20 == 0:
                 pbar.set_postfix({
-                    'total':     f"{loss:.4f}",
-                    'mse':       f"{mse:.4f}",
-                    'iw_ssim':   f"{iw_ssim:.4f}",
-                    'chip_loop': f"{chip_loop:.4f}",
+                    'total':    f"{loss:.4f}",
+                    'mse':      f"{mse:.4f}",
+                    'chip_aux': f"{chip_aux:.4f}",
                 })
+
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
 
         avg_loss = np.mean(epoch_losses)
         print(f"\nEpoch {epoch+1}/{total_epochs} - "
               f"total={avg_loss:.6f}  mse={np.mean(epoch_mse):.6f}  "
-              f"iw_ssim={np.mean(epoch_iw_ssim):.6f}  chip_loop={np.mean(epoch_chip_loop):.6f}")
+              f"chip_aux={np.mean(epoch_chip_aux):.6f}  "
+              f"lr={current_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120):
+        if (epoch + 1) in (40, 60):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-1_chip_loop_loss.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-16-iwssim-aux_holdout_14.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss':                 avg_loss,
                 'global_step':          global_step,
             }, checkpoint_path)

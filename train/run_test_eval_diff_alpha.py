@@ -54,7 +54,7 @@ def load_checkpoint(checkpoint_path, device):
     ).to(device)
     
     # Load trained weights
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
     
     print(f"✓ Loaded model from epoch {checkpoint['epoch'] + 1}")

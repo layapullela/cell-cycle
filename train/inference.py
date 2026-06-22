@@ -173,7 +173,9 @@ class Inference:
         chip_me1_col  = batch.get('chip_seq_h3k4me1_col', chip_me1_row).float().to(self.device)
         chip_me3_col  = batch.get('chip_seq_h3k4me3_col', chip_me3_row).float().to(self.device)
 
-        bulk_map = (x0_early + x0_mid + x0_late + x0_anatelo + x0_prometa).mul(0.2).unsqueeze(1)  # (B, 1, N, N)
+        #bulk_map = (x0_early + x0_mid + x0_late + x0_anatelo + x0_prometa).mul(0.2).unsqueeze(1)  # (B, 1, N, N)
+        bulk_map = batch['bulk'].float().to(self.device)
+        bulk_map = bulk_map.unsqueeze(1)  # (B, 1, N, N)
 
         chip_histone_1d = chip_hac_row[0].detach().cpu().numpy()
 
