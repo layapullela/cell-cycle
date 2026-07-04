@@ -30,6 +30,7 @@ import torch.nn.functional as F
 import numpy as np
 # import pandas as pd  # loop label Excel I/O (disabled)
 import pytorch_msssim
+from iw_ssim import InformationWeightedSSIMLoss
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
@@ -268,8 +269,7 @@ RESUME_CHECKPOINT = None
 ############################################
 # 3) CHECKPOINT LOADING  (was §2)
 ############################################
-def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, scheduler=None,
-                                finetune_lr=None):
+def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, scheduler=None):
     if checkpoint_path is None:
         return 0, 0, float('inf')
 
@@ -290,18 +290,14 @@ def load_checkpoint_for_training(checkpoint_path, model, optimizer, device, sche
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
-    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    load_result = model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     if load_result.missing_keys:
         print(f"  New params (random init): {load_result.missing_keys}")
     if load_result.unexpected_keys:
         print(f"  Ignored keys: {load_result.unexpected_keys}")
     if 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if finetune_lr is not None:
-        for pg in optimizer.param_groups:
-            pg['lr'] = finetune_lr
-        print(f"  Finetune: LR reset to {finetune_lr:.2e} (scheduler will restart)")
-    elif scheduler is not None and 'scheduler_state_dict' in checkpoint:
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         print(f"  Scheduler state restored (last_epoch={scheduler.last_epoch})")
 
@@ -371,7 +367,6 @@ def _build_targets(batch, device):
             chip_ctcf_col, chip_hac_col, chip_me1_col, chip_me3_col)
 
 
-# Log-normalised Hi-C maps span roughly [-2, 2]; data_range = max - min = 4.
 _SSIM_DATA_RANGE = 4.0
 
 
@@ -409,128 +404,12 @@ def ssim_1_minus_mean(
 ############################################
 # IW-SSIM  (Information-Weighted SSIM)
 ############################################
-def _gaussian_kernel_2d(
-    kernel_size: int, sigma: float, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    coords = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
-    g = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
-    g = g / g.sum()
-    kernel = torch.outer(g, g)
-    return kernel / kernel.sum()
-
-
-def _depthwise_conv(x: torch.Tensor, kernel: torch.Tensor, pad: int) -> torch.Tensor:
-    """Apply a 2-D kernel independently to every channel of x: (B, C, H, W)."""
-    C = x.shape[1]
-    ks = kernel.shape[0]
-    k = kernel.view(1, 1, ks, ks).expand(C, 1, -1, -1).contiguous()
-    return F.conv2d(x, k, padding=pad, groups=C)
-
-
-def iw_ssim_map(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    win_size: int = 11,
-    win_sigma: float = 1.5,
-    data_range: float = _SSIM_DATA_RANGE,
-    n_scales: int = 4,
-) -> torch.Tensor:
-    """
-    Information-Weighted SSIM following Wang & Simoncelli (2005) as used in Hi-Compass.
-
-    At each scale the per-pixel SSIM values are averaged with weights derived from the
-    local variance of the reference image — regions with higher variance carry more
-    structural information (GSM approximation) and are given proportionally more weight.
-    Scales are combined multiplicatively using the MS-SSIM β exponents from the paper:
-        β = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
-
-    Args:
-        pred, target : (B, C, H, W) in [-1, 1]
-        n_scales     : number of pyramid levels (4 recommended for 64×64 maps)
-
-    Returns:
-        (B, C) tensor of IW-SSIM values in (0, 1]
-    """
-    B, C, H, W = pred.shape
-    device, dtype = pred.device, pred.dtype
-
-    # Scale combination weights β (Wang et al. 2003 / Hi-Compass paper)
-    _betas_full = torch.tensor(
-        [0.0448, 0.2856, 0.3001, 0.2363, 0.1333], device=device, dtype=dtype
-    )
-    betas = _betas_full[:n_scales]
-    betas = betas / betas.sum()   # re-normalise in case n_scales < 5
-
-    C1 = (0.01 * data_range) ** 2   # luminance stability constant
-    C2 = (0.03 * data_range) ** 2   # contrast  stability constant
-
-    scale_vals: list[torch.Tensor] = []
-    p, t = pred, target
-
-    for s in range(n_scales):
-        _H, _W = p.shape[2], p.shape[3]
-        # Shrink window if the feature map has become smaller than win_size
-        _ws = min(win_size, _H, _W)
-        if _ws % 2 == 0:
-            _ws -= 1
-        if _ws < 3:
-            break
-        _pad = _ws // 2
-        kern = _gaussian_kernel_2d(_ws, win_sigma, device, dtype)
-
-        mu_p  = _depthwise_conv(p,     kern, _pad)
-        mu_t  = _depthwise_conv(t,     kern, _pad)
-        mu_p2 = mu_p * mu_p
-        mu_t2 = mu_t * mu_t
-        mu_pt = mu_p * mu_t
-
-        # Local variances and cross-covariance via E[x²] - μ²
-        var_p  = (_depthwise_conv(p * p, kern, _pad) - mu_p2).clamp(min=0.0)
-        var_t  = (_depthwise_conv(t * t, kern, _pad) - mu_t2).clamp(min=0.0)
-        cov_pt =  _depthwise_conv(p * t, kern, _pad) - mu_pt
-
-        # Per-pixel SSIM map
-        ssim_map = (
-            (2.0 * mu_pt + C1) * (2.0 * cov_pt + C2)
-        ) / (
-            (mu_p2 + mu_t2 + C1) * (var_p + var_t + C2).clamp(min=1e-8)
-        )  # (B, C, H', W')
-
-        # Information-content weights: local variance of the reference.
-        # Regions with larger signal variance contain more structural information
-        # (the GSM model assigns higher mutual information to high-variance patches).
-        info_w = var_t + 1e-6   # (B, C, H', W')
-
-        # Spatially weighted average of SSIM -> (B, C)
-        iw = (info_w * ssim_map).sum(dim=(-2, -1)) / info_w.sum(dim=(-2, -1))
-        scale_vals.append(iw)
-
-        if s < n_scales - 1:
-            p = F.avg_pool2d(p, kernel_size=2, stride=2)
-            t = F.avg_pool2d(t, kernel_size=2, stride=2)
-
-    n_actual = len(scale_vals)
-    if n_actual == 0:
-        return pred.new_ones(B, C)
-
-    betas_used = betas[:n_actual] / betas[:n_actual].sum()
-    stacked  = torch.stack(scale_vals, dim=0).clamp(min=1e-7, max=1.0)  # (n, B, C)
-    log_iw   = (betas_used[:, None, None] * stacked.log()).sum(dim=0)    # (B, C)
-    return log_iw.exp()
-
-
-def iw_ssim_loss(pred, target, *, win_size=11, win_sigma=1.5,
-                 data_range=_SSIM_DATA_RANGE, n_scales=4):
-    """Scalar IW-SSIM loss: 1 − mean IW-SSIM over batch and channels.
-
-    Note: data_range=4.0 assumes inputs span roughly [-2, 2], matching the
-    typical range of log-normalised Hi-C maps.
-    """
-    return 1.0 - iw_ssim_map(
-        pred, target, win_size=win_size, win_sigma=win_sigma,
-        data_range=data_range, n_scales=n_scales,
-    ).mean()
+# Log-normalised Hi-C maps span roughly [-2, 2]; data_range = max - min = 4.
+# PIQ default uses 5 pyramid levels (min 161×161); N=64 maps support at most 3.
+_iw_ssim_loss = InformationWeightedSSIMLoss(
+    data_range=4,
+    scale_weights=torch.tensor([0.0448, 0.2856, 0.3001]),
+)
 
 
 # def _gaussian_blur_depthwise(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
@@ -681,7 +560,12 @@ def train_step(model, raw_model, optimizer, batch, device):
     # chip_pred outputs (B, 5, N, N) phase-map predictions from ChIP pair features.
     # Compared directly against x0_current (log-normalised Hi-C targets).
     chip_pred     = raw_model.chip_aux_pred(h_chip)          # (B, 5, N, N)
-    chip_aux_loss = iw_ssim_loss(chip_pred, x0_current)
+    # PIQ IW-SSIM expects inputs in [0, data_range]; log-normalised Hi-C maps
+    # span roughly [-2, 2], so shift into [0, 4] to satisfy the range check.
+    chip_aux_loss = _iw_ssim_loss(
+        (chip_pred + 2).clamp(0, 4),
+        (x0_current + 2).clamp(0, 4),
+    )
 
     loss = mse_loss + chip_aux_loss / 5
 
@@ -699,18 +583,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train diffusion model for Hi-C phase decomposition')
     parser.add_argument('--resume_checkpoint', type=str, default=None)
     parser.add_argument('--num_epochs', type=int, default=None)
-    parser.add_argument(
-        '--finetune_lr', nargs='?', const=-1.0, default=None, type=float, metavar='LR',
-        help='After resume, reset LR and restart cosine scheduler over --num_epochs. '
-             'Optional LR value (default: config LR).',
-    )
     args = parser.parse_args()
 
     resume_checkpoint = args.resume_checkpoint if args.resume_checkpoint is not None else RESUME_CHECKPOINT
     num_epochs        = args.num_epochs if args.num_epochs is not None else NUM_EPOCHS
-    finetune_lr       = None
-    if args.finetune_lr is not None:
-        finetune_lr = LR if args.finetune_lr < 0 else args.finetune_lr
 
     print("="*80)
     print("TRAINING: all five phases (matrix I/O, diagonal + off-diagonal crops)")
@@ -720,8 +596,6 @@ def main():
     print(f"Batch size: {BATCH_SIZE}, Epochs: {num_epochs}")
     if resume_checkpoint:
         print(f"Resume checkpoint: {resume_checkpoint}")
-    if finetune_lr is not None:
-        print(f"Finetune LR: {finetune_lr:.2e} (fresh cosine over {num_epochs} epochs)")
 
     noise_embed_module = NoiseEmbedding(d_t, max_value=1000)
 
@@ -749,16 +623,7 @@ def main():
     # state-dict keys never have the "module." prefix.
     start_epoch, global_step, best_loss = load_checkpoint_for_training(
         resume_checkpoint, raw_model, optimizer, DEVICE, scheduler=scheduler,
-        finetune_lr=finetune_lr if resume_checkpoint else None,
     )
-    if finetune_lr is not None and resume_checkpoint:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=num_epochs,
-            eta_min=finetune_lr / 100,
-        )
-        print(f"Scheduler restarted: cosine {finetune_lr:.1e} → {finetune_lr / 100:.1e} "
-              f"over {num_epochs} epochs\n")
 
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
@@ -771,11 +636,11 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "20"
+    HOLD_OUT_CHROMOSOME = "3"
 
     processed_data_dir = [
-        #Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
-        Path(__file__).parent.parent / "processed_data" / "kang",
+        Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
+        # Path(__file__).parent.parent / "processed_data" / "kang",
     ]
     for _d in processed_data_dir:
         if not _d.exists():
@@ -902,11 +767,11 @@ def main():
               f"lr={cur_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (60, 80):
+        if (epoch + 1) in (20, 40, 60, 80):
             data_type_str = cell_cycle_loader_train.hic_data_type
             log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
             checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_6-22-kang-finetune.pth")
+                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_7-3-test.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
