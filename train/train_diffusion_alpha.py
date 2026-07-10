@@ -564,7 +564,7 @@ def train_step(model, raw_model, optimizer, batch, device):
     # span roughly [-2, 2], so shift into [0, 4] to satisfy the range check.
     chip_aux_loss = _iw_ssim_loss(
         (chip_pred + 2).clamp(0, 4),
-        (x0_current + 2).clamp(0, 4),
+        (x0_current.detach() + 2).clamp(0, 4),
     )
 
     loss = mse_loss + chip_aux_loss / 5
@@ -583,10 +583,21 @@ def main():
     parser = argparse.ArgumentParser(description='Train diffusion model for Hi-C phase decomposition')
     parser.add_argument('--resume_checkpoint', type=str, default=None)
     parser.add_argument('--num_epochs', type=int, default=None)
+    parser.add_argument('--hold_out_chromosome', type=str, default='21')
+    parser.add_argument('--checkpoint_dir', type=str, default=None,
+                        help='Directory for saved checkpoints (default: train/checkpoints)')
+    parser.add_argument('--save_epochs', type=str, default='20,40,60,80',
+                        help='Comma-separated epoch numbers at which to save checkpoints')
+    parser.add_argument('--checkpoint_basename', type=str, default=None,
+                        help='If set, save as {checkpoint_dir}/{basename}.pth instead of the default name')
     args = parser.parse_args()
 
     resume_checkpoint = args.resume_checkpoint if args.resume_checkpoint is not None else RESUME_CHECKPOINT
     num_epochs        = args.num_epochs if args.num_epochs is not None else NUM_EPOCHS
+    hold_out_chromosome = args.hold_out_chromosome
+    checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else CHECKPOINT_DIR
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    save_epochs = tuple(int(e.strip()) for e in args.save_epochs.split(',') if e.strip())
 
     print("="*80)
     print("TRAINING: all five phases (matrix I/O, diagonal + off-diagonal crops)")
@@ -636,11 +647,9 @@ def main():
     data_dir = Path(__file__).parent.parent / "raw_data" / "zhang_4dn"
     print(f"Loading data from: {data_dir}")
 
-    HOLD_OUT_CHROMOSOME = "3"
-
     processed_data_dir = [
-        Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
-        # Path(__file__).parent.parent / "processed_data" / "kang",
+        #Path(__file__).parent.parent / "processed_data" / "zhang" / "obs",
+        Path(__file__).parent.parent / "processed_data" / "kang",
     ]
     for _d in processed_data_dir:
         if not _d.exists():
@@ -655,7 +664,7 @@ def main():
         resolution=RESOLUTION_BP,
         region_size=REGION_SIZE_BP,
         normalization="KR",
-        hold_out_chromosome=HOLD_OUT_CHROMOSOME,
+        hold_out_chromosome=hold_out_chromosome,
         hic_data_type="observed",
         use_log_transform=True,
         normalization_stats_file=data_dir / "normalization_stats.csv",
@@ -675,7 +684,7 @@ def main():
     )
 
     print(f"Training regions: {len(cell_cycle_loader_train)}")
-    print(f"Holdout regions (chr{HOLD_OUT_CHROMOSOME}): "
+    print(f"Holdout regions (chr{hold_out_chromosome}): "
           f"{len(cell_cycle_loader_eval.get_holdout_regions())}")
     print(f"Available phases: {cell_cycle_loader_train.get_available_phases()}")
 
@@ -683,7 +692,7 @@ def main():
 
     holdout_regions = cell_cycle_loader_eval.get_holdout_regions()
     if not holdout_regions:
-        raise ValueError(f"No regions found for holdout chromosome '{HOLD_OUT_CHROMOSOME}'")
+        raise ValueError(f"No regions found for holdout chromosome '{hold_out_chromosome}'")
 
     class HoldoutDataset(Dataset):
         def __init__(self, loader, holdout_regions):
@@ -701,7 +710,7 @@ def main():
     NUM_VAL_SAMPLES = 30
     validation_regions = get_validation_regions(holdout_regions, n=NUM_VAL_SAMPLES)
     if not validation_regions:
-        raise ValueError(f"No holdout regions on chr{HOLD_OUT_CHROMOSOME} for validation")
+        raise ValueError(f"No holdout regions on chr{hold_out_chromosome} for validation")
 
     val_dataset    = HoldoutDataset(cell_cycle_loader_eval, validation_regions)
     val_dataloader = TorchDataLoader(
@@ -711,7 +720,7 @@ def main():
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
     )
-    print(f"Validation regions (chr{HOLD_OUT_CHROMOSOME}, seed={VAL_SPLIT_SEED}): "
+    print(f"Validation regions (chr{hold_out_chromosome}, seed={VAL_SPLIT_SEED}): "
           f"{validation_regions[:3]}{'...' if len(validation_regions) > 3 else ''} "
           f"(n={len(validation_regions)})")
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}, Val: {len(val_dataset)}")
@@ -767,11 +776,15 @@ def main():
               f"lr={cur_lr:.2e}")
 
         # Save only selected epochs to reduce checkpoint churn.
-        if (epoch + 1) in (20, 40, 60, 80):
-            data_type_str = cell_cycle_loader_train.hic_data_type
-            log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
-            checkpoint_path = (CHECKPOINT_DIR /
-                               f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_7-3-test.pth")
+        if (epoch + 1) in save_epochs:
+            if args.checkpoint_basename:
+                checkpoint_path = checkpoint_dir / f"{args.checkpoint_basename}.pth"
+            else:
+                data_type_str = cell_cycle_loader_train.hic_data_type
+                log_str       = "log" if cell_cycle_loader_train.use_log_transform else "nolog"
+                checkpoint_path = (checkpoint_dir /
+                                   f"{data_type_str}_{log_str}_5phase_epoch{epoch+1}_"
+                                   f"7-9-chip-aux-loss-kang-holdout{hold_out_chromosome}.pth")
             torch.save({
                 'epoch':                epoch,
                 'model_state_dict':     raw_model.state_dict(),  # never has "module." prefix
@@ -785,7 +798,7 @@ def main():
     print("\n" + "="*80)
     print("Training complete for all five phases!")
     print(f"Best loss: {best_loss:.6f}")
-    print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
+    print(f"Checkpoints saved to: {checkpoint_dir}")
     print("="*80)
 
     cell_cycle_loader_train.close()
