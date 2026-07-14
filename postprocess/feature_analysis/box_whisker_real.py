@@ -3,13 +3,18 @@
 Box-and-whisker plots of Hi-C contact strength at loop coordinates using
 real (experimental) Hi-C data, grouped by cluster, one plot per cluster.
 
+Loop intensity is computed on quantile-normalized (QN) contact matrices:
+  1. KR-balance matrices per phase.
+  2. QN-normalize full chromosome matrices across phases.
+  3. Extract a 130 kb × 130 kb window (13 bins at 10 kb) per loop.
+  4. Use the mean QN value over that window as the y-axis metric.
+
 Differences from box_whisker.py
 --------------------------------
 * HiC files are named <phase>.hic (no chromosome prefix or resolution token).
 * Chromosomes inside the files are stored WITHOUT the 'chr' prefix (e.g. '2').
 * KR normalization is used by default.
 * Resolution is fixed at 10 000 bp.
-* Contact values are log1p-transformed before plotting.
 
 Usage
 -----
@@ -22,7 +27,6 @@ python box_whisker_real.py \
     raw_data/zhang_4dn/41586_2019_1778_MOESM5_ESM_split.xlsx \
     --chrom 2 \
     --output_dir results/box_whisker_real
-    --score mean \
 """
 
 import argparse
@@ -30,10 +34,19 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import hicstraw
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from qn_hic import (
+    RESOLUTION_BP,
+    load_qn_phase_matrices,
+    mean_qn_window_intensity,
+    qn_window_ylabel,
+)
+
+# Loop-intensity window: 3 bins → 30 kb × 30 kb at 10 kb resolution
+WINDOW_PIXELS = 3
 
 
 # ── phase / file discovery ─────────────────────────────────────────────────────
@@ -106,28 +119,20 @@ def parse_anchor(coord: str) -> Tuple[str, int, int]:
     return chrom, int(start), int(end)
 
 
-# ── HiC querying ───────────────────────────────────────────────────────────────
+def _anchor_midpoint(coord: str) -> int:
+    _, start, end = parse_anchor(coord)
+    return (start + end) // 2
 
-def query_contact_from_mzd(
-    mzd,
-    start1: int,
-    end1: int,
-    start2: int,
-    end2: int,
-    score: str = "max",
-) -> Optional[float]:
-    """
-    Query a pre-opened MatrixZoomData for the contact value in the window
-    (start1-end1) × (start2-end2).  Returns None if no positive records found.
-    """
-    try:
-        records = mzd.getRecords(start1, end1, start2, end2)
-        if not records:
-            return None
-        values = [r.counts for r in records if r.counts > 0]
-        return float(max(values) if score == "max" else np.mean(values)) if values else None
-    except Exception:
-        return None
+
+def _chroms_in_loops(loops: pd.DataFrame) -> List[str]:
+    chroms = {parse_anchor(c)[0] for c in loops["loop_coordinate_row_mm10"]}
+
+    def _sort_key(chrom: str) -> Tuple[int, object]:
+        if chrom.isdigit():
+            return (0, int(chrom))
+        return (1, chrom)
+
+    return sorted(chroms, key=_sort_key)
 
 
 # ── main data-building pipeline ────────────────────────────────────────────────
@@ -137,33 +142,34 @@ def build_contact_table(
     excel_path: str,
     chrom: Optional[str] = None,
     normalization: str = "KR",
-    resolution: int = 10_000,
-    score: str = "max",
+    resolution: int = RESOLUTION_BP,
+    window_pixels: int = WINDOW_PIXELS,
 ) -> pd.DataFrame:
     """
-    For every (phase, loop) combination, query the Hi-C contact value and
-    return a tidy DataFrame with columns:
+    For every (phase, loop) combination, compute mean QN contact in a loop-centered
+    APA window and return a tidy DataFrame with columns:
       phase, loop_coordinate_row_mm10, loop_coordinate_col_mm10,
       class, cluster_id, feature_label, contact_value
-
-    contact_value is log1p-transformed.
 
     Parameters
     ----------
     chrom : str or None
         Chromosome to restrict to (e.g. '2' or 'chr2').  Both anchors must
         be on this chromosome.  Pass None to include all chromosomes.
+    resolution : int
+        Hi-C bin size in bp (default: 10 000).
+    window_pixels : int
+        Side length of the square APA window in bins (default: 13 → 130 kb).
     """
     phase_files = extract_phases_from_hic_dir(hic_dir)
     print(f"Found {len(phase_files)} phase(s): {sorted(phase_files)}")
 
     loops = load_loop_features(excel_path)
 
-    # normalise chrom: strip 'chr' to match file convention
     chrom_raw: Optional[str] = None
     if chrom is not None:
-        chrom_raw = chrom.lstrip("chr")  # '2', not 'chr2'
-        chrom_prefix = f"chr{chrom_raw}:"   # Excel coords use 'chr' prefix
+        chrom_raw = chrom.lstrip("chr")
+        chrom_prefix = f"chr{chrom_raw}:"
         before = len(loops)
         loops = loops[
             loops["loop_coordinate_row_mm10"].str.startswith(chrom_prefix)
@@ -176,64 +182,55 @@ def build_contact_table(
     for lbl in labels:
         print(f"    {lbl}")
 
-    rows = []
-    for phase, hic_file in sorted(phase_files.items()):
-        print(f"\n  Phase: {phase}")
+    chrom_bares = [chrom_raw] if chrom_raw is not None else _chroms_in_loops(loops)
 
-        try:
-            hic_obj = hicstraw.HiCFile(hic_file)
-        except Exception as exc:
-            print(f"    Could not open {hic_file}: {exc} — skipping")
+    rows = []
+    for chrom_bare in chrom_bares:
+        chrom_prefix = f"chr{chrom_bare}:"
+        chrom_loops = loops[
+            loops["loop_coordinate_row_mm10"].str.startswith(chrom_prefix)
+            & loops["loop_coordinate_col_mm10"].str.startswith(chrom_prefix)
+        ]
+        if chrom_loops.empty:
             continue
 
-        available_chroms = {c.name for c in hic_obj.getChromosomes()}
-        mzd_cache: Dict[Tuple[str, str], Optional[object]] = {}
+        print(f"\nChromosome chr{chrom_bare}: {len(chrom_loops)} loops", flush=True)
+        print(f"  Normalization: {normalization}")
+        print(f"  QN-normalizing matrices across phases …", flush=True)
 
-        def get_mzd(c1: str, c2: str) -> Optional[object]:
-            key = (c1, c2)
-            if key not in mzd_cache:
-                if c1 not in available_chroms or c2 not in available_chroms:
-                    mzd_cache[key] = None
-                else:
-                    try:
-                        mzd_cache[key] = hic_obj.getMatrixZoomData(
-                            c1, c2, "observed", normalization, "BP", resolution
-                        )
-                    except Exception:
-                        mzd_cache[key] = None
-            return mzd_cache[key]
+        try:
+            qn_dicts, n_bins, zero_qn = load_qn_phase_matrices(
+                phase_files, chrom_bare, resolution, norm=normalization
+            )
+        except RuntimeError as exc:
+            print(f"  Skipping chr{chrom_bare}: {exc}")
+            continue
 
         n_ok = n_skip = 0
-        for _, row in loops.iterrows():
-            try:
-                chrom1, s1, e1 = parse_anchor(row["loop_coordinate_row_mm10"])
-                chrom2, s2, e2 = parse_anchor(row["loop_coordinate_col_mm10"])
-            except ValueError:
-                n_skip += 1
-                continue
-
-            mzd = get_mzd(chrom1, chrom2)
-            if mzd is None:
-                n_skip += 1
-                continue
-
-            val = query_contact_from_mzd(mzd, s1, e1, s2, e2, score)
-            if val is not None:
-                val = float(np.log1p(val))   # log1p transform
-            n_ok += 1
-            rows.append(
-                {
-                    "phase": phase,
-                    "loop_coordinate_row_mm10": row["loop_coordinate_row_mm10"],
-                    "loop_coordinate_col_mm10": row["loop_coordinate_col_mm10"],
-                    "class": row["class"],
-                    "cluster_id": row["cluster_id"],
-                    "feature_label": row["feature_label"],
-                    "contact_value": val,
-                }
-            )
-
-        print(f"    Queried {n_ok} loops, skipped {n_skip}")
+        for phase, qn_dict in sorted(qn_dicts.items()):
+            print(f"  Phase: {phase}")
+            for _, row in chrom_loops.iterrows():
+                mid1 = _anchor_midpoint(row["loop_coordinate_row_mm10"])
+                mid2 = _anchor_midpoint(row["loop_coordinate_col_mm10"])
+                val = mean_qn_window_intensity(
+                    qn_dict, mid1, mid2, window_pixels, resolution, n_bins, zero_qn
+                )
+                if val is None:
+                    n_skip += 1
+                    continue
+                n_ok += 1
+                rows.append(
+                    {
+                        "phase": phase,
+                        "loop_coordinate_row_mm10": row["loop_coordinate_row_mm10"],
+                        "loop_coordinate_col_mm10": row["loop_coordinate_col_mm10"],
+                        "class": row["class"],
+                        "cluster_id": row["cluster_id"],
+                        "feature_label": row["feature_label"],
+                        "contact_value": val,
+                    }
+                )
+            print(f"    Queried {n_ok} loop-phase values so far, skipped {n_skip}")
 
     df = pd.DataFrame(rows)
     df = df.dropna(subset=["contact_value"])
@@ -255,11 +252,13 @@ def plot_box_whisker(
     contact_df: pd.DataFrame,
     output_dir: str = "box_whisker_real_plots",
     chrom: Optional[str] = None,
+    resolution: int = RESOLUTION_BP,
+    window_pixels: int = WINDOW_PIXELS,
 ) -> None:
     """
     Produce one box-and-whisker plot per cluster.
     X-axis = phases ordered by cell-cycle progression.
-    Y-axis = log1p(Hi-C contact value, KR-normalised).
+    Y-axis = mean QN contact over the APA window.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -267,8 +266,14 @@ def plot_box_whisker(
     clusters = sorted(contact_df["feature_label"].unique())
     phases = _ordered(sorted(contact_df["phase"].unique()), _PHASE_ORDER)
     colors = plt.cm.tab10(np.linspace(0, 1, len(phases)))
+    ylabel = qn_window_ylabel(window_pixels, resolution)
 
-    chrom_tag = f"chr{chrom.lstrip('chr')}" if chrom else "all"
+    if not chrom:
+        chrom_tag = "all"
+    elif chrom == "all_chr":
+        chrom_tag = "all_chr"
+    else:
+        chrom_tag = f"chr{chrom.lstrip('chr')}"
     print(f"\nGenerating {len(clusters)} plot(s) in '{output_dir}' ...")
 
     for cluster in clusters:
@@ -296,9 +301,9 @@ def plot_box_whisker(
 
         ax.set_xticks(range(1, len(phases) + 1))
         ax.set_xticklabels(phases, rotation=25, ha="right", fontsize=10)
-        ax.set_ylabel("log1p(Hi-C contact, KR)", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
         ax.set_title(
-            f"Hi-C contact strength — {cluster}  ({chrom_tag}, real data)",
+            f"QN-normalized loop contact — {cluster}  ({chrom_tag}, real data)",
             fontsize=12,
         )
         ax.grid(axis="y", linestyle="--", alpha=0.4)
@@ -327,8 +332,8 @@ def plot_box_whisker(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Box-and-whisker plots of real Hi-C contact values at loop "
-            "coordinates, log1p-transformed, KR-normalised, grouped by cluster."
+            "Box-and-whisker plots of QN-normalized real Hi-C loop contact "
+            "(mean over 130 kb APA window), grouped by cluster."
         )
     )
     parser.add_argument(
@@ -349,38 +354,61 @@ def main() -> None:
         "--chrom",
         default="2",
         help="Chromosome to process — no 'chr' prefix needed (default: 2). "
-             "Pass 'all' for every chromosome.",
+             "Pass 'all' for every chromosome in the .hic files.",
+    )
+    parser.add_argument(
+        "--all_chr",
+        action="store_true",
+        help=(
+            "Process all chromosomes present in the .hic files and pool "
+            "contact values before plotting.  Equivalent to --chrom all, "
+            "but also labels output files with 'all_chr'."
+        ),
     )
     parser.add_argument(
         "--normalization",
         default="KR",
         choices=["KR", "VC", "VC_SQRT", "NONE"],
-        help="Hi-C normalization to apply (default: KR).",
+        help="Hi-C normalization before QN (default: KR).",
     )
     parser.add_argument(
         "--resolution",
         type=int,
-        default=10_000,
+        default=RESOLUTION_BP,
         help="Hi-C resolution in bp (default: 10000).",
     )
     parser.add_argument(
-        "--score",
-        default="max",
-        choices=["max", "mean"],
-        help="How to summarise multiple bins within a loop window (default: max).",
+        "--window-pixels",
+        type=int,
+        default=WINDOW_PIXELS,
+        help="Window side length in bins (default: 3 → 30 kb at 10 kb).",
     )
     args = parser.parse_args()
 
-    chrom_filter = None if args.chrom.lower() == "all" else args.chrom
+    # --all_chr overrides --chrom: process every chromosome and pool results
+    if args.all_chr or args.chrom.lower() == "all":
+        chrom_filter = None
+    else:
+        chrom_filter = args.chrom
+
     contact_df = build_contact_table(
         args.hic_dir,
         args.excel_path,
         chrom=chrom_filter,
         normalization=args.normalization,
         resolution=args.resolution,
-        score=args.score,
+        window_pixels=args.window_pixels,
     )
-    plot_box_whisker(contact_df, args.output_dir, chrom=chrom_filter)
+    # When --all_chr is used, label outputs with 'all_chr' rather than the
+    # generic 'all' tag that the existing --chrom all path would produce.
+    plot_chrom = "all_chr" if args.all_chr else chrom_filter
+    plot_box_whisker(
+        contact_df,
+        args.output_dir,
+        chrom=plot_chrom,
+        resolution=args.resolution,
+        window_pixels=args.window_pixels,
+    )
     print("\nDone.")
 
 
