@@ -8,13 +8,9 @@ Kang et al. arrest-release time course (U2OS human cells, hg19):
   120/180 min → mid G1
   240/360 min → late G1
 
-Phase composition (replicates chosen to equalise raw read totals across all 5 phases;
-no per-file depth scaling applied):
-  prometa  = Rep1@0min   + Rep2@0min           (~306 M reads)
-  anatelo  = Rep1@35min  + Rep2@35min           (~288 M reads)
-  earlyG1  = Rep1@60min  + Rep2@90min           (~302 M reads)
-  midG1    = Rep1@120min + Rep1@180min          (~321 M reads)
-  lateG1   = Rep1@240min + Rep2@360min          (~316 M reads)
+Phase .hic files (merged replicates, 10 kb) are read directly — one file per
+phase, same pattern as preprocess/prestore_hic.py:
+  prometa.hic, anatelo.hic, earlyG1.hic, midG1.hic, lateG1.hic
 
 Output layout:
   <output_dir>/chr{chrom}/{row_start}-{row_end},{col_start}-{col_end}.npz
@@ -36,11 +32,12 @@ two replicates per phase):
 
 Usage:
   python preprocess/kang/prestore_kang.py \
+      --data_dir raw_data/kang \
       --raw_data_dir raw_data/kang \
       --output_dir processed_data/kang \
       [--chrom 1] [--chrom_prefix chr|none] [--no_chr_prefix] [--dry_run]
 
-  sbatch preprocess/kang/prestore_kang_chr1.sh
+  sbatch preprocess/kang/prestore_kang_all.sh
 """
 
 from __future__ import annotations
@@ -63,85 +60,59 @@ from preprocess.chip_signal import (
     compute_chip_chrom_stats,
 )
 
-# ---------------------------------------------------------------------------
-# Phase → list of .hic filenames to sum (within the raw_data_dir)
-# ---------------------------------------------------------------------------
-PHASE_HIC_FILES: Dict[str, List[str]] = {
-    "prometa": ["GSM4194449_U2OS_0min_Rep1.hic",   "GSM4194450_U2OS_0min_Rep2.hic"],
-    "anatelo": ["GSM4194451_U2OS_35min_Rep1.hic",  "GSM4194452_U2OS_35min_Rep2.hic"],
-    # One replicate per timepoint, chosen so that raw read totals are balanced
-    # across all 5 phases (~288–321 M per phase) without per-file depth scaling.
-    "earlyG1": ["GSM4194453_U2OS_60min_Rep1.hic",  "GSM4194456_U2OS_90min_Rep2.hic"],
-    "midG1":   ["GSM4194457_U2OS_120min_Rep1.hic", "GSM4194459_U2OS_180min_Rep1.hic"],
-    "lateG1":  ["GSM4194461_U2OS_240min_Rep1.hic", "GSM4194464_U2OS_360min_Rep2.hic"],
-}
-
-# All phases now sum exactly 2 files; no divisor needed.
-PHASE_DIVISOR: Dict[str, float] = {
-    "prometa": 1.0,
-    "anatelo": 1.0,
-    "earlyG1": 1.0,
-    "midG1":   1.0,
-    "lateG1":  1.0,
+PHASE_HIC_FILES: Dict[str, str] = {
+    "earlyG1": "earlyG1.hic",
+    "midG1": "midG12.hic", # this is a little less sparse
+    "lateG1": "lateG1.hic",
+    "anatelo": "anatelo.hic",
+    "prometa": "prometa.hic",
 }
 
 # ChIP-seq bulk tracks: sum per-bin max across all phases and replicates.
 # hac slot uses H3K27ac as a functional proxy.
 CHIP_BW_FILES: Dict[str, List[str]] = {
     "ctcf": [
-        # Interphase
-        "GSM4194671_HK81_CTCF_I_S10_both.bw",
-        "GSM4194672_HK148_CTCF_I_S10_both.bw",
-        # Prometaphase
-        "GSM4194673_HK82_CTCF_M_S11_both.bw",
-        "GSM4194674_HK149_CTCF_M_S11_both.bw",
-        # Anaphase/Telophase
-        "GSM4194675_HK83_CTCF_AT_S12_both.bw",
-        "GSM4194676_HK150_CTCF_AT_S12_both.bw",
+        "GSM4194671_HK81_CTCF_I_S10_both_hg38.bw",
+        "GSM4194672_HK148_CTCF_I_S10_both_hg38.bw",
+        "GSM4194673_HK82_CTCF_M_S11_both_hg38.bw",
+        "GSM4194674_HK149_CTCF_M_S11_both_hg38.bw",
+        "GSM4194675_HK83_CTCF_AT_S12_both_hg38.bw",
+        "GSM4194676_HK150_CTCF_AT_S12_both_hg38.bw",
     ],
     "hac": [
-        # Interphase
-        "GSM4194659_HK75_H3K27ac_I_S4_both.bw",
-        "GSM4194660_HK158_H3K27ac_I1_S1_both.bw",
-        # Prometaphase
-        "GSM4194661_HK76_H3K27ac_M_S5_both.bw",
-        "GSM4194662_HK160_H3K27ac_M1_S3_both.bw",
-        # Anaphase/Telophase
-        "GSM4194663_HK77_H3K27ac_AT_S6_both.bw",
-        "GSM4194664_HK162_H3K27ac_AT1_S5_both.bw",
+        "GSM4194659_HK75_H3K27ac_I_S4_both_hg38.bw",
+        "GSM4194660_HK158_H3K27ac_I1_S1_both_hg38.bw",
+        "GSM4194661_HK76_H3K27ac_M_S5_both_hg38.bw",
+        "GSM4194662_HK160_H3K27ac_M1_S3_both_hg38.bw",
+        "GSM4194663_HK77_H3K27ac_AT_S6_both_hg38.bw",
+        "GSM4194664_HK162_H3K27ac_AT1_S5_both_hg38.bw",
     ],
     "h3k4me1": [
-        # Interphase
-        "GSM4194665_HK78_H3K4me1_I_S7_both.bw",
-        "GSM4194666_HK145_H3K4me1_I_S7_both.bw",
-        # Prometaphase
-        "GSM4194667_HK79_H3K4me1_M_S8_both.bw",
-        "GSM4194668_HK146_H3K4me1_M_S8_both.bw",
-        # Anaphase/Telophase
-        "GSM4194669_HK80_H3K4me1_AT_S9_both.bw",
-        "GSM4194670_HK147_H3K4me1_AT_S9_both.bw",
+        "GSM4194665_HK78_H3K4me1_I_S7_both_hg38.bw",
+        "GSM4194666_HK145_H3K4me1_I_S7_both_hg38.bw",
+        "GSM4194667_HK79_H3K4me1_M_S8_both_hg38.bw",
+        "GSM4194668_HK146_H3K4me1_M_S8_both_hg38.bw",
+        "GSM4194669_HK80_H3K4me1_AT_S9_both_hg38.bw",
+        "GSM4194670_HK147_H3K4me1_AT_S9_both_hg38.bw",
     ],
     "h3k4me3": [
-        # Interphase
-        "GSM4194653_HK72_H3K4me3_I_S1_both.bw",
-        "GSM4194654_HK139_H3K4me3_I_S1_both.bw",
-        # Prometaphase
-        "GSM4194655_HK73_H3K4me3_M_S2_both.bw",
-        "GSM4194656_HK140_H3K4me3_M_S2_both.bw",
-        # Anaphase/Telophase
-        "GSM4194657_HK74_H3K4me3_AT_S3_both.bw",
-        "GSM4194658_HK141_H3K4me3_AT_S3_both.bw",
+        "GSM4194653_HK72_H3K4me3_I_S1_both_hg38.bw",
+        "GSM4194654_HK139_H3K4me3_I_S1_both_hg38.bw",
+        "GSM4194655_HK73_H3K4me3_M_S2_both_hg38.bw",
+        "GSM4194656_HK140_H3K4me3_M_S2_both_hg38.bw",
+        "GSM4194657_HK74_H3K4me3_AT_S3_both_hg38.bw",
+        "GSM4194658_HK141_H3K4me3_AT_S3_both_hg38.bw",
     ],
 }
 
-# hg19 chromosome sizes
+# hg38 chromosome sizes (from raw_data/kang/hg38.chrom.sizes)
 CHROMOSOME_SIZES: Dict[str, int] = {
-    "1":  249250621, "2":  243199373, "3":  198022430, "4":  191154276,
-    "5":  180915260, "6":  171115067, "7":  159138663, "8":  146364022,
-    "9":  141213431, "10": 135534747, "11": 135006516, "12": 133851895,
-    "13": 115169878, "14": 107349540, "15": 102531392, "16":  90354753,
-    "17":  81195210, "18":  78077248, "19":  59128983, "20":  63025520,
-    "21":  48129895, "22":  51304566, "X":  155270560,
+    "1":  248956422, "2":  242193529, "3":  198295559, "4":  190214555,
+    "5":  181538259, "6":  170805979, "7":  159345973, "8":  145138636,
+    "9":  138394717, "10": 133797422, "11": 135086622, "12": 133275309,
+    "13": 114364328, "14": 107043718, "15": 101991189, "16":  90338345,
+    "17":  83257441, "18":  80373285, "19":  58617616, "20":  64444167,
+    "21":  46709983, "22":  50818468, "X":  156040895,
 }
 
 MIN_START           = 3_000_000
@@ -151,11 +122,12 @@ STEP_PIXELS         = 10
 STEP_BP             = STEP_PIXELS * RESOLUTION
 OFFDIAG_NEAR_BAND   = 5_000_000
 OFFDIAG_PER_DIAG    = 2
+MIN_MEAN_COUNTS_PER_BIN = 0.2
 
 # ---------------------------------------------------------------------------
 # Process-level globals (set once in main)
 # ---------------------------------------------------------------------------
-_hic_paths: Dict[str, List[str]] = {}
+_hic_paths: Dict[str, Optional[str]] = {}
 _chip_paths: Dict[str, List[Optional[str]]] = {}
 _bw_handles: Dict[str, List[object]] = {}
 _chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
@@ -167,7 +139,7 @@ _chrom_prefix: str = "chr"
 
 
 def _init(
-    hic_paths: Dict[str, List[str]],
+    hic_paths: Dict[str, Optional[str]],
     chip_paths: Dict[str, List[Optional[str]]],
     hic_data_type: str,
     normalization: str,
@@ -190,10 +162,7 @@ def _init(
             if p is None:
                 handles.append(None)
             else:
-                try:
-                    handles.append(pyBigWig.open(p))
-                except Exception:
-                    handles.append(None)
+                handles.append(pyBigWig.open(p))
         _bw_handles[mark] = handles
 
     chroms = chromosomes if chromosomes is not None else list(CHROMOSOME_SIZES.keys())
@@ -216,9 +185,11 @@ def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
     return chrom, rs, re, cs, ce
 
 
-def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: int) -> np.ndarray:
-    """Extract one (N,N) KR-normalized contact matrix from a single .hic file."""
+def _extract_matrix(hic_file: str, region: str) -> np.ndarray:
+    """Extract one (N,N) contact matrix from a single phase .hic file."""
     import hicstraw as straw
+
+    chrom, rs, re, cs, ce = _parse_region(region)
     qchrom = _chrom_prefix + chrom
     try:
         result = straw.straw(
@@ -226,7 +197,6 @@ def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: in
             f"{qchrom}:{rs}:{re}", f"{qchrom}:{cs}:{ce}", "BP", _resolution,
         )
     except Exception as exc:
-        # Fallback: try the opposite prefix convention
         alt_chrom = chrom if _chrom_prefix else ("chr" + chrom)
         try:
             result = straw.straw(
@@ -236,35 +206,28 @@ def _extract_matrix(hic_file: str, chrom: str, rs: int, re: int, cs: int, ce: in
         except Exception:
             raise RuntimeError(
                 f"hicstraw failed for {hic_file} chrom={qchrom} (also tried {alt_chrom}): {exc}"
-            )
+            ) from exc
 
     mat = np.zeros((_image_size, _image_size), dtype=np.float32)
     for rec in result:
         val = float(rec.counts)
-        xi  = int((rec.binX - rs) // _resolution)
-        yj  = int((rec.binY - cs) // _resolution)
+        xi = int((rec.binX - rs) // _resolution)
+        yj = int((rec.binY - cs) // _resolution)
         if 0 <= xi < _image_size and 0 <= yj < _image_size:
             mat[xi, yj] = val
         xi2 = int((rec.binY - rs) // _resolution)
         yj2 = int((rec.binX - cs) // _resolution)
         if 0 <= xi2 < _image_size and 0 <= yj2 < _image_size and (xi2, yj2) != (xi, yj):
             mat[xi2, yj2] = val
-
     return mat
 
 
-def _sum_matrices(
-    hic_files: List[str], chrom: str, rs: int, re: int, cs: int, ce: int,
-    divisor: float = 1.0,
-) -> np.ndarray:
-    """Sum contact matrices across a list of .hic files, then divide by divisor."""
-    total = np.zeros((_image_size, _image_size), dtype=np.float32)
-    for f in hic_files:
-        if f is not None:
-            total += _extract_matrix(f, chrom, rs, re, cs, ce)
-    if divisor != 1.0:
-        total /= divisor
-    return total
+def _mean_counts_per_bin(mat: np.ndarray) -> float:
+    """Mean observed KR counts per 10 kb bin (same metric as visualize_npz.py)."""
+    n = mat.size
+    if n == 0:
+        return 0.0
+    return float(mat.sum()) / n
 
 
 def _extract_chip_1d(
@@ -279,31 +242,38 @@ def _extract_chip_1d(
         for i in range(_image_size):
             b0 = start + i * _resolution
             b1 = start + (i + 1) * _resolution
-            try:
-                vals = bw.stats(chrom_name, b0, b1, type="max")
-                accum[i] += vals[0] if vals and vals[0] is not None else 0.0
-            except Exception:
-                pass
+            vals = bw.stats(chrom_name, b0, b1, type="max")
+            accum[i] += vals[0] if vals and vals[0] is not None else 0.0
     mean, std = _chip_chrom_stats[(mark, chrom)]
     return apply_chip_zscore(np.log1p(accum), mean, std)
 
 
 def _process_region(args: Tuple[str, Path]) -> Optional[str]:
-    """Compute and write one .npz file. Returns region string on success, None if skipped."""
+    """Compute and write one .npz file.
+
+    Returns region string on success, None if skipped (already exists or low signal).
+    """
     region, output_dir = args
     chrom, rs, re, cs, ce = _parse_region(region)
+    is_diagonal = (rs == cs)
 
     chrom_dir = output_dir / f"chr{chrom}"
-    out_path  = chrom_dir / f"{rs}-{re},{cs}-{ce}.npz"
+    out_path = chrom_dir / f"{rs}-{re},{cs}-{ce}.npz"
     if out_path.exists():
         return None
 
     arrays: Dict[str, np.ndarray] = {}
-    for phase_key, hic_files in _hic_paths.items():
-        divisor = PHASE_DIVISOR.get(phase_key, 1.0)
-        arrays[phase_key] = _sum_matrices(hic_files, chrom, rs, re, cs, ce, divisor=divisor)
+    for phase in ("earlyG1", "midG1", "lateG1", "anatelo", "prometa"):
+        hic_file = _hic_paths.get(phase)
+        if hic_file is None:
+            arrays[phase] = np.zeros((_image_size, _image_size), dtype=np.float32)
+        else:
+            arrays[phase] = _extract_matrix(hic_file, region)
 
-    is_diagonal = (rs == cs)
+    for phase in ("earlyG1", "midG1", "lateG1", "anatelo", "prometa"):
+        if _mean_counts_per_bin(arrays[phase]) < MIN_MEAN_COUNTS_PER_BIN:
+            return None
+
     for mark, bw_list in _bw_handles.items():
         row_sig = _extract_chip_1d(chrom, rs, re, mark, bw_list)
         col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, mark, bw_list)
@@ -335,7 +305,7 @@ def _sample_offdiag(chrom: str, diag_positions: List[int], rng: np.random.Genera
     else:
         weights = np.zeros(near_steps.size)
         low = near_steps <= split
-        weights[low]  = 0.70 / low.sum()
+        weights[low] = 0.70 / low.sum()
         weights[~low] = 0.30 / (~low).sum()
     regions: List[str] = []
     for ri in range(n - 1):
@@ -368,17 +338,28 @@ def _parse_chrom_prefix(value: str) -> str:
     return value
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Pre-store Kang et al. Hi-C data to .npz cache")
-    default_raw = Path(__file__).resolve().parent.parent.parent / "raw_data"  / "kang"
-    default_out = Path(__file__).resolve().parent.parent.parent / "processed_data" / "kang"
-    parser.add_argument("--raw_data_dir", default=str(default_raw))
-    parser.add_argument("--output_dir",   default=str(default_out))
-    parser.add_argument("--hic_type",     default="observed", help="hicstraw data type")
-    parser.add_argument("--norm",         default="KR",       help="Hi-C normalization")
+    default_kang = _REPO_ROOT / "raw_data" / "kang"
+    default_hic = default_kang
+    default_out = _REPO_ROOT / "processed_data" / "kang"
+    parser.add_argument(
+        "--data_dir",
+        default=str(default_hic),
+        help="Directory containing merged phase *.hic files (default: raw_data/kang)",
+    )
+    parser.add_argument(
+        "--raw_data_dir",
+        default=str(default_kang),
+        help="Directory containing Kang ChIP-seq bigWig files (default: raw_data/kang)",
+    )
+    parser.add_argument("--output_dir", default=str(default_out))
+    parser.add_argument("--hic_type", default="observed", help="hicstraw data type")
+    parser.add_argument(
+        "--norm",
+        default="KR",
+        help="Hi-C normalization (default: KR)",
+    )
     parser.add_argument(
         "--chrom_prefix",
         type=_parse_chrom_prefix,
@@ -395,28 +376,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Query .hic with bare chrom names (same as --chrom_prefix none).",
     )
-    parser.add_argument("--chrom", default=None,
-                        help="Comma-separated chromosomes to process (e.g. '1' or '1,2'). Default: all.")
+    parser.add_argument(
+        "--chrom",
+        default=None,
+        help="Comma-separated chromosomes to process (e.g. '1' or '1,2'). Default: all.",
+    )
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args(argv)
     chrom_prefix = "" if args.no_chr_prefix else args.chrom_prefix
 
-    raw_dir    = Path(args.raw_data_dir)
+    data_dir = Path(args.data_dir)
+    raw_dir = Path(args.raw_data_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve .hic paths
-    hic_paths: Dict[str, List[str]] = {}
+    hic_paths: Dict[str, Optional[str]] = {}
     print("Hi-C files:")
-    for phase_key, fnames in PHASE_HIC_FILES.items():
-        resolved = []
-        for fname in fnames:
-            p = raw_dir / fname
-            print(f"  {'✓' if p.exists() else '✗'} {phase_key}: {p}")
-            resolved.append(str(p) if p.exists() else None)
-        hic_paths[phase_key] = resolved
+    for phase, fname in PHASE_HIC_FILES.items():
+        p = data_dir / fname
+        hic_paths[phase] = str(p) if p.exists() else None
+        print(f"  {'✓' if p.exists() else '✗'} {phase}: {p}")
 
-    # Resolve bigWig paths
     chip_paths: Dict[str, List[Optional[str]]] = {}
     print("\nChIP-seq bigWig files:")
     for mark, fnames in CHIP_BW_FILES.items():
@@ -435,7 +415,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise ValueError(f"Unknown chromosome(s): {unknown}. Valid: {list(CHROMOSOME_SIZES)}")
 
     chrom_label = ",".join(chromosomes) if chromosomes else "all"
-    print(f"\nGenerating regions for human (hg19), chromosomes: {chrom_label}...")
+    print(f"\nGenerating regions for human (hg38), chromosomes: {chrom_label}...")
     all_regions = generate_all_regions(chromosomes)
 
     def _npz_exists(region: str) -> bool:
@@ -446,6 +426,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Total regions  : {len(all_regions):,}")
     print(f"Already cached : {len(all_regions) - len(pending):,}")
     print(f"To process     : {len(pending):,}")
+    print(f"Normalization  : {args.norm}")
+    print(f"Min mean ct/bin: {MIN_MEAN_COUNTS_PER_BIN} (per phase; below → skip)")
 
     if args.dry_run or not pending:
         if not pending:
@@ -461,13 +443,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         chromosomes=chromosomes,
     )
 
+    n_written = 0
+    n_filtered = 0
     for region in tqdm(pending, desc="Caching Kang"):
-        try:
-            _process_region((region, output_dir))
-        except Exception as exc:
-            print(f"\nWARN: skipping {region}: {exc}", file=sys.stderr)
+        if _process_region((region, output_dir)) is None:
+            n_filtered += 1
+        else:
+            n_written += 1
 
-    print("\nDone.")
+    print(f"\nWritten        : {n_written:,}")
+    print(f"Filtered (low) : {n_filtered:,}")
+    print("Done.")
     return 0
 
 
@@ -479,14 +465,3 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
-
-
-# sbatch --job-name=prestore_kang_chr1 \
-#   --partition=standard \
-#   --account=minjilab99 \
-#   --time=3:00:00 \
-#   --mem=32G \
-#   --cpus-per-task=4 \
-#   --output=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.out \
-#   --error=/nfs/turbo/umms-minjilab/lpullela/cell-cycle/preprocess/kang/logs/prestore_kang_chr1_%j.err \
-#   --wrap="source ~/.bashrc && conda activate test_env && cd /nfs/turbo/umms-minjilab/lpullela/cell-cycle && python preprocess/kang/prestore_kang.py --raw_data_dir raw_data/kang --output_dir processed_data/kang --chrom_prefix chr --chrom 1 --no_chr_prefix"
