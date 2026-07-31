@@ -122,15 +122,12 @@ class CellCycleDataLoader:
         """Open all pyBigWig file handles (single-process inference)."""
         if not self.allow_live_fallback:
             return
+        import pyBigWig  # lazy import; fail loudly if unavailable
         for key, path in self._chipseq_paths.items():
             if path is None:
                 self.chipseq_files[key] = None
                 continue
-            try:
-                import pyBigWig  # lazy import
-                self.chipseq_files[key] = pyBigWig.open(path)
-            except Exception:
-                self.chipseq_files[key] = None
+            self.chipseq_files[key] = pyBigWig.open(path)
 
     # ------------------------------------------------------------------
     # Live sources (used only when region isn't cached)

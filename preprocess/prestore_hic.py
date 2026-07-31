@@ -38,10 +38,13 @@ _hic_paths: Dict[str, Optional[str]] = {}
 _chip_paths: Dict[str, Optional[str]] = {}
 _resolution: int = 10_000
 _image_size: int = 64
-_hic_data_type: str = "oe"
+_hic_data_type: str = "observed"
 _normalization: str = "KR"
 _bw_handles: Dict[str, object] = {}
 _chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
+
+# chr8 prometa KR fix — populated in _init_single_process when prometa.hic exists
+_chr8_kr_vec: Optional[np.ndarray] = None
 
 
 def _init_single_process(
@@ -54,7 +57,7 @@ def _init_single_process(
 ) -> None:
     """Initialize globals and open bigWig handles once (single process)."""
     global _hic_paths, _chip_paths, _resolution, _image_size, _hic_data_type, _normalization
-    global _bw_handles, _chip_chrom_stats
+    global _bw_handles, _chip_chrom_stats, _chr8_kr_vec
     _hic_paths = hic_paths
     _chip_paths = chip_paths
     _resolution = int(resolution)
@@ -81,6 +84,17 @@ def _init_single_process(
             mean, std = compute_chip_chrom_stats(bw, chrom, CHROMOSOME_SIZES, _resolution)
             _chip_chrom_stats[(mark, chrom)] = (mean, std)
             print(f"  {mark} chr{chrom}: mean={mean:.4f} std={std:.4f}")
+
+    # Load or compute KR fix for chr8 prometa (hicstraw KR diverges on this chromosome).
+    prometa_path = hic_paths.get("prometa")
+    if prometa_path is not None and Path(prometa_path).exists():
+        from preprocess.fix_chr_8_zhang import load_or_compute_kr_cache
+        _chr8_kr_vec = load_or_compute_kr_cache(
+            hic_path=prometa_path,
+            resolution=_resolution,
+        )
+    else:
+        _chr8_kr_vec = None
 
 
 def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
@@ -164,6 +178,18 @@ def _process_region(args: Tuple[str, Path]) -> Optional[str]:
         hic_file = _hic_paths.get(phase)
         if hic_file is None:
             arrays[phase] = np.zeros((_image_size, _image_size), dtype=np.float32)
+        elif chrom == "8" and phase == "prometa" and _chr8_kr_vec is not None:
+            from preprocess.fix_chr_8_zhang import get_chr8_kr_region
+            arrays[phase] = get_chr8_kr_region(
+                hic_path=hic_file,
+                kr_vec=_chr8_kr_vec,
+                row_start=rs,
+                row_end=re,
+                col_start=cs,
+                col_end=ce,
+                resolution=_resolution,
+                image_size=_image_size,
+            )
         else:
             arrays[phase] = _extract_matrix(hic_file, region)
 
@@ -277,7 +303,7 @@ def generate_all_regions() -> List[str]:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Pre-store Hi-C + ChIP-seq to .npz cache files")
     parser.add_argument("--data_dir", required=True, help="Directory containing *.hic inputs")
-    default_output_dir = Path(__file__).resolve().parent.parent / "processed_data" / "zhang" / "oe_kr2"
+    default_output_dir = Path(__file__).resolve().parent.parent / "processed_data" / "zhang" / "obs"
     parser.add_argument(
         "--output_dir",
         default=str(default_output_dir),
@@ -286,8 +312,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"(default: {default_output_dir})"
         ),
     )
-    parser.add_argument("--hic_type", default="oe", help="hic_data_type (oe or observed)")
+    parser.add_argument("--hic_type", default="observed", help="hic_data_type (observed or oe)")
     parser.add_argument("--norm", default="KR", help="Normalization (KR, SCALE, NONE, ...)")
+    parser.add_argument("--chrom", default=None, help="Restrict processing to a single chromosome (e.g. 8, X)")
     parser.add_argument("--dry_run", action="store_true", help="Print counts without writing")
     args = parser.parse_args(argv)
 
@@ -328,7 +355,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         chrom, rs, re, cs, ce = _parse_region(region)
         return (output_dir / f"chr{chrom}" / f"{rs}-{re},{cs}-{ce}.npz").exists()
 
-    pending = [r for r in all_regions if not _npz_exists(r)]
+    pending = [
+        r for r in all_regions
+        if not _npz_exists(r) and (args.chrom is None or r.startswith(f"{args.chrom}:"))
+    ]
     print(f"Total regions  : {len(all_regions):,}")
     print(f"Already cached : {len(all_regions) - len(pending):,}")
     print(f"To process     : {len(pending):,}")

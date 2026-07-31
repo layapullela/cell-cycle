@@ -1,7 +1,7 @@
 """
 prestore_kang.py — precompute cache files for Kang et al. Hi-C data.
 
-Kang et al. arrest-release time course (U2OS human cells, hg19):
+Kang et al. arrest-release time course (U2OS human cells, hg38):
   0 min  → prometaphase
   35 min → anatelophase
   60/90 min   → early G1

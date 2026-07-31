@@ -265,7 +265,8 @@ def information_weighted_ssim(x: torch.Tensor, y: torch.Tensor, data_range: Unio
     x = lo_x
     y = lo_y
     wmcs = []
-
+    EPS = torch.finfo(x.dtype).eps
+    #breakpoint()
     for i in range(levels):
         if i < levels - 2:
             lo_x, x_diff = _pyr_step(x, bin_filter)
@@ -295,12 +296,15 @@ def information_weighted_ssim(x: torch.Tensor, y: torch.Tensor, data_range: Unio
                                           sigma_nsq=sigma_nsq)
             iw_map = iw_map[:, :, iw_pad:-iw_pad, iw_pad:-iw_pad]
 
-        wmcs.append(torch.sum(cs_map * iw_map, dim=(-2, -1)) / torch.sum(iw_map, dim=(-2, -1)))
+        wmcs.append(
+            torch.sum(cs_map * iw_map, dim=(-2, -1))
+            / torch.sum(iw_map, dim=(-2, -1)).clamp(min=EPS)
+        )
 
         x_diff_old = x_diff
         y_diff_old = y_diff
 
-    wmcs = torch.stack(wmcs, dim=0).abs()
+    wmcs = torch.stack(wmcs, dim=0).abs().clamp(min=EPS)
 
     score = torch.prod((wmcs ** scale_weights.view(-1, 1, 1)), dim=0)
 
@@ -433,7 +437,6 @@ def _pyr_step(x: torch.Tensor, kernel: torch.Tensor) -> Tuple[torch.Tensor, torc
         hi_x = F.pad(hi_x, pad=[0, 0, up_pad, down_pad], mode='reflect')
         hi_x = F.conv2d(input=hi_x, weight=kernel_v, groups=n_channels, padding=0)[:, :, :x.size(-2), :]
 
-    #breakpoint()
     hi_x = x - hi_x
     return lo_x, hi_x
 
