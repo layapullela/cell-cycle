@@ -242,10 +242,22 @@ def build_contact_table(
 
 _PHASE_ORDER = ["prometa", "anatelo", "earlyG1", "midG1", "lateG1"]
 
+# Cap on individual loop lines drawn (subsampled for speed; mean uses all loops)
+_MAX_SPAGHETTI_LINES = 500
+
 
 def _ordered(items: List[str], preferred: List[str]) -> List[str]:
     order = {p: i for i, p in enumerate(preferred)}
     return sorted(items, key=lambda x: (order.get(x, len(preferred)), x))
+
+
+def _format_median(values: np.ndarray) -> str:
+    """Format the median of *values* for the box label line."""
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return "med=NA"
+    return f"med={np.median(finite):.2f}"
 
 
 def plot_box_whisker(
@@ -259,6 +271,7 @@ def plot_box_whisker(
     Produce one box-and-whisker plot per cluster.
     X-axis = phases ordered by cell-cycle progression.
     Y-axis = mean QN contact over the APA window.
+    The label line under each box shows n and the median.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -274,7 +287,7 @@ def plot_box_whisker(
         chrom_tag = "all_chr"
     else:
         chrom_tag = f"chr{chrom.lstrip('chr')}"
-    print(f"\nGenerating {len(clusters)} plot(s) in '{output_dir}' ...")
+    print(f"\nGenerating {len(clusters)} box-whisker plot(s) in '{output_dir}' ...")
 
     for cluster in clusters:
         cluster_df = contact_df[contact_df["feature_label"] == cluster]
@@ -312,7 +325,7 @@ def plot_box_whisker(
             ax.text(
                 i,
                 ax.get_ylim()[0],
-                f"n={len(values)}",
+                f"n={len(values)}\n{_format_median(values)}",
                 ha="center",
                 va="bottom",
                 fontsize=7,
@@ -322,6 +335,115 @@ def plot_box_whisker(
         plt.tight_layout()
         safe_name = cluster.lower().replace(" ", "_")
         out_path = output_dir / f"box_whisker_real_{safe_name}_{chrom_tag}.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {out_path}")
+
+
+def _make_spaghetti(
+    ax,
+    cluster_df: pd.DataFrame,
+    phases: List[str],
+    ylabel: str,
+) -> None:
+    """
+    Spaghetti plot on *ax*: one thin line per loop tracking QN contact across
+    phases, with a bold mean trajectory overlaid.
+
+    Loops missing a value for some phases are still drawn for the phases where
+    data exist.  If there are more than ``_MAX_SPAGHETTI_LINES`` loops, the
+    individual lines are drawn from a random subsample; the mean is always
+    computed from all loops.
+    """
+    pivot = cluster_df.pivot_table(
+        index=["loop_coordinate_row_mm10", "loop_coordinate_col_mm10"],
+        columns="phase",
+        values="contact_value",
+        aggfunc="mean",
+    )
+    ordered_phases = [p for p in phases if p in pivot.columns]
+    pivot = pivot.reindex(columns=ordered_phases)
+
+    x = np.arange(1, len(ordered_phases) + 1)
+    vals = pivot.to_numpy(dtype=float)
+
+    # Mean trajectory (all loops)
+    mean_y = np.nanmean(vals, axis=0)
+
+    # Individual loop lines — subsample for rendering speed
+    plot_vals = vals
+    if len(vals) > _MAX_SPAGHETTI_LINES:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(vals), _MAX_SPAGHETTI_LINES, replace=False)
+        plot_vals = vals[idx]
+
+    for row_y in plot_vals:
+        valid = ~np.isnan(row_y)
+        if valid.sum() >= 2:
+            ax.plot(x[valid], row_y[valid],
+                    color="steelblue", alpha=0.12, linewidth=0.8, zorder=1)
+
+    # Mean on top
+    valid_mean = ~np.isnan(mean_y)
+    ax.plot(
+        x[valid_mean], mean_y[valid_mean],
+        color="firebrick", linewidth=2.5, marker="o", markersize=5,
+        zorder=5, label="Mean",
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(ordered_phases, rotation=25, ha="right", fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    ax.legend(fontsize=9, loc="upper right")
+
+    # Sample-size annotation
+    finite_vals = vals[np.isfinite(vals)]
+    ymin = float(np.nanmin(finite_vals)) if finite_vals.size else 0.0
+    for i in range(len(ordered_phases)):
+        n = int(np.isfinite(vals[:, i]).sum())
+        ax.text(i + 1, ymin, f"n={n}", ha="center", va="top", fontsize=7, color="grey")
+
+
+def plot_spaghetti(
+    contact_df: pd.DataFrame,
+    output_dir: str = "spaghetti_real_plots",
+    chrom: Optional[str] = None,
+    resolution: int = RESOLUTION_BP,
+    window_pixels: int = WINDOW_PIXELS,
+) -> None:
+    """
+    Produce one spaghetti plot per cluster: each loop is drawn as a thin line
+    across cell-cycle phases, with a bold mean trajectory overlaid.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    clusters = sorted(contact_df["feature_label"].unique())
+    phases = _ordered(sorted(contact_df["phase"].unique()), _PHASE_ORDER)
+    ylabel = qn_window_ylabel(window_pixels, resolution)
+
+    if not chrom:
+        chrom_tag = "all"
+    elif chrom == "all_chr":
+        chrom_tag = "all_chr"
+    else:
+        chrom_tag = f"chr{chrom.lstrip('chr')}"
+    print(f"\nGenerating {len(clusters)} spaghetti plot(s) in '{output_dir}' ...")
+
+    for cluster in clusters:
+        cluster_df = contact_df[contact_df["feature_label"] == cluster]
+
+        fig, ax = plt.subplots(figsize=(max(6, len(phases) * 1.8), 5))
+        _make_spaghetti(ax, cluster_df, phases, ylabel)
+        ax.set_title(
+            f"QN-normalized loop contact — {cluster}  ({chrom_tag}, real data)",
+            fontsize=12,
+        )
+
+        plt.tight_layout()
+        safe_name = cluster.lower().replace(" ", "_")
+        out_path = output_dir / f"spaghetti_real_{safe_name}_{chrom_tag}.png"
         plt.savefig(out_path, dpi=150)
         plt.close(fig)
         print(f"  Saved: {out_path}")
@@ -403,6 +525,13 @@ def main() -> None:
     # generic 'all' tag that the existing --chrom all path would produce.
     plot_chrom = "all_chr" if args.all_chr else chrom_filter
     plot_box_whisker(
+        contact_df,
+        args.output_dir,
+        chrom=plot_chrom,
+        resolution=args.resolution,
+        window_pixels=args.window_pixels,
+    )
+    plot_spaghetti(
         contact_df,
         args.output_dir,
         chrom=plot_chrom,
