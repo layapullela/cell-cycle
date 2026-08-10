@@ -6,9 +6,20 @@ pre-stored `.npz` files under `processed_data` and serves them as training or
 holdout samples based on the chromosome split.
 """
 
+import sys
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Union, Optional, Tuple
+from typing import Dict, List, Union, Optional, Tuple, Sequence
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from preprocess.chip_signal import (
+    CHROMOSOME_SIZES_MM10,
+    apply_chip_zscore,
+    compute_chip_chrom_stats,
+)
 
 
 class CellCycleDataLoader:
@@ -35,7 +46,7 @@ class CellCycleDataLoader:
         hic_data_type: str = "oe",
         use_log_transform: bool = True,
         augment: Union[int, float] = 50,
-        processed_data_dir: Optional[Union[str, Path]] = None,
+        processed_data_dir: Optional[Union[str, Path, Sequence[Union[str, Path]]]] = None,
         allow_live_fallback: bool = True,
     ):
         self.data_dir = Path(data_dir)
@@ -48,7 +59,6 @@ class CellCycleDataLoader:
         self.use_log_transform = use_log_transform
         self.augment = float(augment)
         self.allow_live_fallback = bool(allow_live_fallback)
-        self.processed_data_dir = Path(processed_data_dir) if processed_data_dir else None
 
         self.save_normalization_stats = save_normalization_stats
         if normalization_stats_file is None:
@@ -65,17 +75,32 @@ class CellCycleDataLoader:
         self.phase_paths: Dict[str, Path] = {}
         self._chipseq_paths: Dict[str, Optional[str]] = {}
         self.chipseq_files: Dict[str, Optional[object]] = {}
+        self._chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
+        # Normalise processed_data_dir to a list of Path objects.
+        # A single Path or str is wrapped in a list; a sequence is converted element-wise.
         default_processed_data_dir = Path(__file__).resolve().parent.parent / "processed_data"
-        self.processed_data_dir = Path(processed_data_dir) if processed_data_dir else default_processed_data_dir
-        if not self.processed_data_dir.exists() and not self.allow_live_fallback:
+        if processed_data_dir is None:
+            raw_dirs = [default_processed_data_dir]
+        elif isinstance(processed_data_dir, (str, Path)):
+            raw_dirs = [Path(processed_data_dir)]
+        else:
+            raw_dirs = [Path(d) for d in processed_data_dir]
+
+        # Keep the first entry as self.processed_data_dir for backward compatibility.
+        self.processed_data_dir  = raw_dirs[0]
+        self.processed_data_dirs = raw_dirs
+
+        existing_dirs = [d for d in self.processed_data_dirs if d.exists()]
+        if not existing_dirs and not self.allow_live_fallback:
             raise ValueError(
-                f"Processed data directory not found: {self.processed_data_dir}. "
-                "Run preprocess/prestore_hic.py first (or set allow_live_fallback=True)."
+                f"No processed data directories found: {self.processed_data_dirs}. "
+                "Run prestore_hic.py / prestore_kang.py first (or set allow_live_fallback=True)."
             )
 
-        self.region_to_path: Dict[str, Path] = {}
-        if self.processed_data_dir.exists():
+        # region_to_path holds a LIST of paths per region to support multiple source datasets.
+        self.region_to_path: Dict[str, List[Path]] = {}
+        if existing_dirs:
             self.regions, self.holdout_regions = self._generate_regions()
         else:
             self.regions, self.holdout_regions = [], []
@@ -83,8 +108,8 @@ class CellCycleDataLoader:
         total_cached = len(self.regions) + len(self.holdout_regions)
         if total_cached == 0 and not self.allow_live_fallback:
             raise ValueError(
-                f"No cached .npz files found under {self.processed_data_dir}. "
-                "Run preprocess/prestore_hic.py first (or set allow_live_fallback=True)."
+                f"No cached .npz files found under {self.processed_data_dirs}. "
+                "Run prestore_hic.py / prestore_kang.py first (or set allow_live_fallback=True)."
             )
 
         if self.allow_live_fallback:
@@ -97,15 +122,12 @@ class CellCycleDataLoader:
         """Open all pyBigWig file handles (single-process inference)."""
         if not self.allow_live_fallback:
             return
+        import pyBigWig  # lazy import; fail loudly if unavailable
         for key, path in self._chipseq_paths.items():
             if path is None:
                 self.chipseq_files[key] = None
                 continue
-            try:
-                import pyBigWig  # lazy import
-                self.chipseq_files[key] = pyBigWig.open(path)
-            except Exception:
-                self.chipseq_files[key] = None
+            self.chipseq_files[key] = pyBigWig.open(path)
 
     # ------------------------------------------------------------------
     # Live sources (used only when region isn't cached)
@@ -165,14 +187,27 @@ class CellCycleDataLoader:
                 matrix[x2, y2] = val
         return matrix
 
-    def _extract_chipseq_signal_live(self, region_1d: str, bw) -> np.ndarray:
+    def _chip_chrom_stats_for(self, mark: str, chrom: str, bw) -> Tuple[float, float]:
+        chrom_key = chrom[3:] if chrom.startswith("chr") else chrom
+        cache_key = (mark, chrom_key)
+        if cache_key in self._chip_chrom_stats:
+            return self._chip_chrom_stats[cache_key]
+        if bw is None or chrom_key not in CHROMOSOME_SIZES_MM10:
+            stats = (0.0, 1.0)
+        else:
+            stats = compute_chip_chrom_stats(bw, chrom_key, CHROMOSOME_SIZES_MM10, self.resolution)
+        self._chip_chrom_stats[cache_key] = stats
+        return stats
+
+    def _extract_chipseq_signal_live(self, region_1d: str, mark: str, bw) -> np.ndarray:
         if bw is None:
             return np.zeros(self.image_size, dtype=np.float32)
         parts = region_1d.split(':')
         chrom = parts[0]
+        chrom_key = chrom[3:] if chrom.startswith("chr") else chrom
         start, end = map(int, parts[1].split('-'))
         signal = np.zeros(self.image_size, dtype=np.float32)
-        chrom_name = "chr" + chrom
+        chrom_name = chrom if chrom.startswith("chr") else "chr" + chrom
         try:
             for i in range(self.image_size):
                 bin_start = start + i * self.resolution
@@ -181,7 +216,8 @@ class CellCycleDataLoader:
                 signal[i] = np.log1p(values[0] if values[0] is not None else 0.0)
         except Exception:
             pass
-        return signal
+        mean, std = self._chip_chrom_stats_for(mark, chrom_key, bw)
+        return apply_chip_zscore(signal, mean, std)
 
     def _load_from_live(self, region: str, do_flip: bool) -> Dict[str, object]:
         if not self.phase_paths:
@@ -235,8 +271,8 @@ class CellCycleDataLoader:
 
         for mark in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
             bw = self.chipseq_files.get(mark)
-            row = self._extract_chipseq_signal_live(row_1d, bw)
-            col = row.copy() if is_diagonal else self._extract_chipseq_signal_live(col_1d, bw)
+            row = self._extract_chipseq_signal_live(row_1d, mark, bw)
+            col = row.copy() if is_diagonal else self._extract_chipseq_signal_live(col_1d, mark, bw)
             if do_flip:
                 row = np.flip(row).copy()
                 col = np.flip(col).copy()
@@ -279,7 +315,8 @@ class CellCycleDataLoader:
         indexes what has already been written to disk.
         """
         training_regions, holdout_regions = self._enumerate_cached_regions()
-        print(f"Indexed cached regions from: {self.processed_data_dir}")
+        dirs_str = ", ".join(str(d) for d in self.processed_data_dirs)
+        print(f"Indexed cached regions from: {dirs_str}")
         print(f"Training regions: {len(training_regions)}")
         if self.hold_out_chromosome is not None:
             print(f"Holdout chromosome '{self.hold_out_chromosome}': {len(holdout_regions)} regions")
@@ -287,34 +324,43 @@ class CellCycleDataLoader:
 
     def _enumerate_cached_regions(self) -> Tuple[List[str], List[str]]:
         """
-        Enumerate all cached `.npz` files under `processed_data_dir`.
+        Enumerate all cached `.npz` files across all `processed_data_dirs`.
 
         File naming convention:
             .../chr{chrom}/{rs}-{re},{cs}-{ce}.npz  →  "{chrom}:{rs}-{re}:{cs}-{ce}"
+
+        Multiple source datasets (e.g. Zhang + Kang) are supported: if the same
+        region coordinate appears in more than one source directory, it is added to
+        the training list once per source file and all paths are tracked in
+        self.region_to_path[region] (a list).  At load time one path is chosen
+        randomly so both datasets are sampled uniformly.
         """
         training_regions: List[str] = []
         holdout_regions: List[str] = []
         holdout = str(self.hold_out_chromosome) if self.hold_out_chromosome else None
 
-        for npz_path in sorted(self.processed_data_dir.rglob("*.npz")):
-            chrom_dir = npz_path.parent.name
-            if not chrom_dir.startswith("chr"):
+        for data_dir in self.processed_data_dirs:
+            if not data_dir.exists():
                 continue
+            for npz_path in sorted(data_dir.rglob("*.npz")):
+                chrom_dir = npz_path.parent.name
+                if not chrom_dir.startswith("chr"):
+                    continue
 
-            chrom = chrom_dir[3:]
-            row_part, col_part = npz_path.stem.split(",")
-            region = f"{chrom}:{row_part}:{col_part}"
-            if region in self.region_to_path and self.region_to_path[region] != npz_path:
-                raise ValueError(
-                    f"Duplicate cached region found for {region} under {self.processed_data_dir}. "
-                    "Pass a more specific processed_data_dir."
-                )
-            self.region_to_path[region] = npz_path
+                chrom = chrom_dir[3:]
+                try:
+                    row_part, col_part = npz_path.stem.split(",")
+                except ValueError:
+                    continue  # skip files that don't match naming convention
+                region = f"{chrom}:{row_part}:{col_part}"
 
-            if holdout is not None and chrom == holdout:
-                holdout_regions.append(region)
-            else:
-                training_regions.append(region)
+                # Allow multiple paths per region (multi-dataset support).
+                self.region_to_path.setdefault(region, []).append(npz_path)
+
+                if holdout is not None and chrom == holdout:
+                    holdout_regions.append(region)
+                else:
+                    training_regions.append(region)
 
         return training_regions, holdout_regions
 
@@ -347,28 +393,36 @@ class CellCycleDataLoader:
     # Cache helpers
     # ------------------------------------------------------------------
     def _npz_path(self, region: str) -> Optional[Path]:
-        """Return the cached .npz path for a region, if indexed."""
-        return self.region_to_path.get(region)
+        """Return the first cached .npz path for a region, if indexed."""
+        paths = self.region_to_path.get(region)
+        return paths[0] if paths else None
 
     def _load_from_cache(self, region: str, do_flip: bool) -> Optional[Dict]:
         """
         Load a pre-stored .npz file and return a fully normalised sample dict,
-        or None if the cache file does not exist.
+        or None if no cache file exists.
 
-        The .npz stores raw Hi-C counts (no log) and log1p chip signals, matching
-        exactly what prestore_hic.py writes.
+        Both Zhang and Kang caches use the same keys:
+          earlyG1, midG1, lateG1, anatelo, prometa
+
+        When multiple source paths exist for the same region (multi-dataset), one is
+        chosen uniformly at random so that all sources contribute equally.
         """
-        path = self._npz_path(region)
-        if path is None or not path.exists():
+        paths = self.region_to_path.get(region)
+        if not paths:
+            return None
+        path = paths[np.random.randint(len(paths))] if len(paths) > 1 else paths[0]
+        if not path.exists():
             return None
 
         data   = np.load(path)
         sample = {'region': region}
 
-        # ---- Hi-C phases (same normalisation as the live path) ----
+        # ---- Hi-C phases ----
+        phase_keys = {ph: ph for ph in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')}
         clipped: Dict[str, np.ndarray] = {}
-        for phase in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa'):
-            mat = data[phase].copy()                   # (N, N) raw counts
+        for phase, key in phase_keys.items():
+            mat = data[key].copy()
             threshold = np.percentile(mat, 99.5)
             clipped[phase] = np.where(mat > threshold, threshold, mat).astype(np.float32)
 
@@ -397,7 +451,7 @@ class CellCycleDataLoader:
                 normalized = np.flip(normalized, axis=(0, 1)).copy()
             sample[phase] = normalized
 
-        # ---- ChIP-seq tracks (already log1p in the .npz) ----
+        # ---- ChIP-seq tracks (chromosome z-scored log1p in the .npz) ----
         for mark in ('ctcf', 'hac', 'h3k4me1', 'h3k4me3'):
             row = data[f"chip_{mark}_row"].copy()
             col = data[f"chip_{mark}_col"].copy()
@@ -423,7 +477,7 @@ class CellCycleDataLoader:
         Returns a sample dict with:
           region           : str
           earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) matrices, normalised to [-1,1]
-          chip_seq_{mark}_row / _col                : float32 (N,) log1p ChIP-seq signals
+          chip_seq_{mark}_row / _col                : float32 (N,) chrom z-scored log1p ChIP-seq signals
         """
         if isinstance(idx, str):
             region = idx

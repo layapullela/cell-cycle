@@ -108,6 +108,7 @@ class Inference:
         y_t = torch.randn(B, 5, N, N2, device=self.device)
 
         for t_idx in range(self.T - 1, 0, -1):
+            print(f"t_idx: {t_idx}")
             gamma_t = self.gammas[t_idx]
             alpha_t = self.alphas[t_idx]
 

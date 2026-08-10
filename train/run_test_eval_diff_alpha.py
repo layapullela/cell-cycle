@@ -239,6 +239,7 @@ def run_test_evaluation_chromosome2(
     checkpoint_path,
     phase_name='earlyG1',
     data_dir=None,
+    processed_data_dir=None,
     output_dir="./test_inference_visualizations_chr2",
     target_regions=None,
 ):
@@ -282,8 +283,15 @@ def run_test_evaluation_chromosome2(
     print(f"Using hic_data_type='{hic_data_type}', use_log_transform={use_log_transform}")
     print(f"  (Model trained on '{hic_data_type}' data with log1p transformation)")
     
-    # Default cache location (matches training)
-    processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
+    # Default cache location (matches training); pass kang-only dir for Kang eval.
+    if processed_data_dir is None:
+        processed_data_dir = Path(__file__).parent.parent / "processed_data" / "zhang" / "obs"
+    elif isinstance(processed_data_dir, (str, Path)):
+        processed_data_dir = Path(processed_data_dir)
+    else:
+        processed_data_dir = [Path(d) for d in processed_data_dir]
+
+    print(f"Using cache: {processed_data_dir}")
 
     cell_cycle_loader = CellCycleDataLoader(
         data_dir=data_dir,
@@ -438,6 +446,16 @@ color scale [0, 40], allowing direct comparison across all maps.
         help="Path to data directory (default: ../raw_data/zhang_4dn)"
     )
     parser.add_argument(
+        "--processed_data_dir",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "One or more cache dirs with .npz patches (default: ../processed_data/zhang/obs). "
+            "For Kang only: ../processed_data/kang"
+        ),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./test_inference_visualizations_chr2",
@@ -462,6 +480,7 @@ color scale [0, 40], allowing direct comparison across all maps.
         checkpoint_path=args.checkpoint,
         phase_name=args.phase,
         data_dir=args.data_dir,
+        processed_data_dir=args.processed_data_dir,
         output_dir=args.output_dir,
         target_regions=args.regions,
     )

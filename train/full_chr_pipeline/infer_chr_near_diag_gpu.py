@@ -313,9 +313,17 @@ def main() -> None:
         action="store_true",
         help="Disable tile weighting when merging overlapping tiles (uniform weights).",
     )
+    p.add_argument(
+        "--chrom_size_bp",
+        type=int,
+        default=None,
+        help="Override chromosome size in bp (use for non-mouse genomes, e.g. human hg19).",
+    )
     args = p.parse_args()
 
     chrom = str(args.chrom)
+    if args.chrom_size_bp is not None:
+        CHROMOSOME_SIZES[chrom] = args.chrom_size_bp
     arrays_dir = Path(args.arrays_dir)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

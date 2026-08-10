@@ -11,7 +11,7 @@ Output layout:
 Each `.npz` contains:
   earlyG1, midG1, lateG1, anatelo, prometa : float32 (N, N) raw counts (no log transform)
   chip_ctcf_row/col, chip_hac_row/col, chip_h3k4me1_row/col, chip_h3k4me3_row/col
-                                  float32 (N,) log1p(max-per-bin) tracks
+                                  float32 (N,) chrom z-scored log1p(max-per-bin) tracks
 """
 
 from __future__ import annotations
@@ -25,6 +25,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from tqdm import tqdm
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from preprocess.chip_signal import apply_chip_zscore, compute_chip_chrom_stats
+
 # ---------------------------------------------------------------------------
 # Single-process globals (initialized once in main)
 # ---------------------------------------------------------------------------
@@ -32,9 +38,13 @@ _hic_paths: Dict[str, Optional[str]] = {}
 _chip_paths: Dict[str, Optional[str]] = {}
 _resolution: int = 10_000
 _image_size: int = 64
-_hic_data_type: str = "oe"
+_hic_data_type: str = "observed"
 _normalization: str = "KR"
 _bw_handles: Dict[str, object] = {}
+_chip_chrom_stats: Dict[Tuple[str, str], Tuple[float, float]] = {}
+
+# chr8 prometa KR fix — populated in _init_single_process when prometa.hic exists
+_chr8_kr_vec: Optional[np.ndarray] = None
 
 
 def _init_single_process(
@@ -46,7 +56,8 @@ def _init_single_process(
     normalization: str,
 ) -> None:
     """Initialize globals and open bigWig handles once (single process)."""
-    global _hic_paths, _chip_paths, _resolution, _image_size, _hic_data_type, _normalization, _bw_handles
+    global _hic_paths, _chip_paths, _resolution, _image_size, _hic_data_type, _normalization
+    global _bw_handles, _chip_chrom_stats, _chr8_kr_vec
     _hic_paths = hic_paths
     _chip_paths = chip_paths
     _resolution = int(resolution)
@@ -65,6 +76,25 @@ def _init_single_process(
             _bw_handles[key] = pyBigWig.open(path)
         except Exception:
             _bw_handles[key] = None
+
+    _chip_chrom_stats = {}
+    print("\nChIP-seq chromosome stats (log1p, chromosome-wide z-score):")
+    for chrom in CHROMOSOME_SIZES:
+        for mark, bw in _bw_handles.items():
+            mean, std = compute_chip_chrom_stats(bw, chrom, CHROMOSOME_SIZES, _resolution)
+            _chip_chrom_stats[(mark, chrom)] = (mean, std)
+            print(f"  {mark} chr{chrom}: mean={mean:.4f} std={std:.4f}")
+
+    # Load or compute KR fix for chr8 prometa (hicstraw KR diverges on this chromosome).
+    prometa_path = hic_paths.get("prometa")
+    if prometa_path is not None and Path(prometa_path).exists():
+        from preprocess.fix_chr_8_zhang import load_or_compute_kr_cache
+        _chr8_kr_vec = load_or_compute_kr_cache(
+            hic_path=prometa_path,
+            resolution=_resolution,
+        )
+    else:
+        _chr8_kr_vec = None
 
 
 def _parse_region(region: str) -> Tuple[str, int, int, int, int]:
@@ -113,8 +143,8 @@ def _extract_matrix(hic_file: str, region: str) -> np.ndarray:
     return mat
 
 
-def _extract_chip_1d(chrom: str, start: int, end: int, bw) -> np.ndarray:
-    """Extract log1p(max) bigWig signal per Hi-C bin across [start,end)."""
+def _extract_chip_1d(chrom: str, start: int, end: int, mark: str, bw) -> np.ndarray:
+    """Extract chromosome z-scored log1p(max) bigWig signal per Hi-C bin across [start,end)."""
     signal = np.zeros(_image_size, dtype=np.float32)
     if bw is None:
         return signal
@@ -124,7 +154,8 @@ def _extract_chip_1d(chrom: str, start: int, end: int, bw) -> np.ndarray:
         b1 = start + (i + 1) * _resolution
         values = bw.stats(chrom_name, b0, b1, type="max")
         signal[i] = np.log1p(values[0] if values and values[0] is not None else 0.0)
-    return signal
+    mean, std = _chip_chrom_stats[(mark, chrom)]
+    return apply_chip_zscore(signal, mean, std)
 
 
 def _process_region(args: Tuple[str, Path]) -> Optional[str]:
@@ -147,13 +178,25 @@ def _process_region(args: Tuple[str, Path]) -> Optional[str]:
         hic_file = _hic_paths.get(phase)
         if hic_file is None:
             arrays[phase] = np.zeros((_image_size, _image_size), dtype=np.float32)
+        elif chrom == "8" and phase == "prometa" and _chr8_kr_vec is not None:
+            from preprocess.fix_chr_8_zhang import get_chr8_kr_region
+            arrays[phase] = get_chr8_kr_region(
+                hic_path=hic_file,
+                kr_vec=_chr8_kr_vec,
+                row_start=rs,
+                row_end=re,
+                col_start=cs,
+                col_end=ce,
+                resolution=_resolution,
+                image_size=_image_size,
+            )
         else:
             arrays[phase] = _extract_matrix(hic_file, region)
 
     for mark in ("ctcf", "hac", "h3k4me1", "h3k4me3"):
         bw = _bw_handles.get(mark)
-        row_sig = _extract_chip_1d(chrom, rs, re, bw)
-        col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, bw)
+        row_sig = _extract_chip_1d(chrom, rs, re, mark, bw)
+        col_sig = row_sig.copy() if is_diagonal else _extract_chip_1d(chrom, cs, ce, mark, bw)
         arrays[f"chip_{mark}_row"] = row_sig
         arrays[f"chip_{mark}_col"] = col_sig
 
@@ -260,7 +303,7 @@ def generate_all_regions() -> List[str]:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Pre-store Hi-C + ChIP-seq to .npz cache files")
     parser.add_argument("--data_dir", required=True, help="Directory containing *.hic inputs")
-    default_output_dir = Path(__file__).resolve().parent.parent / "processed_data" / "zhang" / "oe_kr2"
+    default_output_dir = Path(__file__).resolve().parent.parent / "processed_data" / "zhang" / "obs"
     parser.add_argument(
         "--output_dir",
         default=str(default_output_dir),
@@ -269,8 +312,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"(default: {default_output_dir})"
         ),
     )
-    parser.add_argument("--hic_type", default="oe", help="hic_data_type (oe or observed)")
+    parser.add_argument("--hic_type", default="observed", help="hic_data_type (observed or oe)")
     parser.add_argument("--norm", default="KR", help="Normalization (KR, SCALE, NONE, ...)")
+    parser.add_argument("--chrom", default=None, help="Restrict processing to a single chromosome (e.g. 8, X)")
     parser.add_argument("--dry_run", action="store_true", help="Print counts without writing")
     args = parser.parse_args(argv)
 
@@ -311,7 +355,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         chrom, rs, re, cs, ce = _parse_region(region)
         return (output_dir / f"chr{chrom}" / f"{rs}-{re},{cs}-{ce}.npz").exists()
 
-    pending = [r for r in all_regions if not _npz_exists(r)]
+    pending = [
+        r for r in all_regions
+        if not _npz_exists(r) and (args.chrom is None or r.startswith(f"{args.chrom}:"))
+    ]
     print(f"Total regions  : {len(all_regions):,}")
     print(f"Already cached : {len(all_regions) - len(pending):,}")
     print(f"To process     : {len(pending):,}")
