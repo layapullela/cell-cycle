@@ -402,8 +402,11 @@ class CellCycleDataLoader:
         Load a pre-stored .npz file and return a fully normalised sample dict,
         or None if no cache file exists.
 
-        Both Zhang and Kang caches use the same keys:
-          earlyG1, midG1, lateG1, anatelo, prometa
+        Supports two cache formats, detected by key presence:
+          Zhang/Kang : earlyG1, midG1, lateG1, anatelo, prometa
+                       bulk = average of the five phases
+          Pelham-Webb: mitosis, earlyG1, lateG1, async
+                       bulk = async (loaded directly, not averaged)
 
         When multiple source paths exist for the same region (multi-dataset), one is
         chosen uniformly at random so that all sources contribute equally.
@@ -418,22 +421,39 @@ class CellCycleDataLoader:
         data   = np.load(path)
         sample = {'region': region}
 
-        # ---- Hi-C phases ----
-        phase_keys = {ph: ph for ph in ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')}
+        # ---- Hi-C phases and bulk construction ----
         clipped: Dict[str, np.ndarray] = {}
-        for phase, key in phase_keys.items():
-            mat = data[key].copy()
-            threshold = np.percentile(mat, 99.5)
-            clipped[phase] = np.where(mat > threshold, threshold, mat).astype(np.float32)
 
-        bulk_avg = 0.2 * sum(clipped[ph] for ph in clipped)
-        if self.use_log_transform:
-            bulk_avg = np.log1p(bulk_avg).astype(np.float32)
-        b_min, b_max = float(bulk_avg.min()), float(bulk_avg.max())
+        if 'async' in data:
+            # Pelham-Webb format: async is the bulk Hi-C measurement.
+            phase_names = ('mitosis', 'earlyG1', 'lateG1')
+            for phase in phase_names:
+                mat = data[phase].copy()
+                threshold = np.percentile(mat, 99.5)
+                clipped[phase] = np.where(mat > threshold, threshold, mat).astype(np.float32)
+
+            bulk_raw = data['async'].copy()
+            threshold = np.percentile(bulk_raw, 99.5)
+            bulk_raw = np.where(bulk_raw > threshold, threshold, bulk_raw).astype(np.float32)
+            if self.use_log_transform:
+                bulk_raw = np.log1p(bulk_raw).astype(np.float32)
+        else:
+            # Zhang/Kang format: bulk = equal-weight average of five phases.
+            phase_names = ('earlyG1', 'midG1', 'lateG1', 'anatelo', 'prometa')
+            for phase in phase_names:
+                mat = data[phase].copy()
+                threshold = np.percentile(mat, 99.5)
+                clipped[phase] = np.where(mat > threshold, threshold, mat).astype(np.float32)
+
+            bulk_raw = (1.0 / len(phase_names)) * sum(clipped[ph] for ph in phase_names)
+            if self.use_log_transform:
+                bulk_raw = np.log1p(bulk_raw).astype(np.float32)
+
+        b_min, b_max = float(bulk_raw.min()), float(bulk_raw.max())
         bulk_norm = (
-            np.zeros_like(bulk_avg, dtype=np.float32)
+            np.zeros_like(bulk_raw, dtype=np.float32)
             if b_max - b_min < 1e-10
-            else ((bulk_avg - b_min) / (b_max - b_min) * 2.0 - 1.0).astype(np.float32)
+            else ((bulk_raw - b_min) / (b_max - b_min) * 2.0 - 1.0).astype(np.float32)
         )
         if do_flip:
             bulk_norm = np.flip(bulk_norm, axis=(0, 1)).copy()

@@ -583,29 +583,28 @@ class PhaseStreamAttention(nn.Module):
 ############################################
 class SR3UNet(nn.Module):
     """
-    SR3-style U-Net with shared encoder and 5 parallel phase-specific decoder streams.
+    SR3-style U-Net with shared encoder and n_phases parallel phase-specific decoder streams.
 
-    Inputs are now full 2-D contact matrices (B, 5, N, N) rather than flattened
+    Inputs are now full 2-D contact matrices (B, n_phases, N, N) rather than flattened
     upper-triangular vectors, so no vec↔matrix conversion happens inside the model.
 
     Architecture:
         Encoder (shared):
-            (B, 6, N, N) → enc1 → enc2 → enc3 → bottleneck → (B, 512, N/8, N/8)
-            Input channels: 5 noisy phases + bulk (all as N×N matrices)
+            (B, n_phases+1, N, N) → enc1 → enc2 → enc3 → bottleneck → (B, 512, N/8, N/8)
+            Input channels: n_phases noisy phases + bulk (all as N×N matrices)
 
-        Decoder (5 parallel streams, one per phase):
+        Decoder (n_phases parallel streams, one per phase):
             bottleneck → stream_init → 3 up-sampling levels with PhaseStreamAttention
 
         Output:
-            (B, 5, N, N) predicted denoised matrices
+            (B, n_phases, N, N) predicted denoised matrices
     """
-    N_PHASES = 5
-
-    def __init__(self, n: int, noise_embed_module: nn.Module, base_ch: int = 64):
+    def __init__(self, n: int, noise_embed_module: nn.Module, base_ch: int = 64, n_phases: int = 5):
         super().__init__()
         self.n        = n
         self.base_ch  = base_ch
         self.noise_embed = noise_embed_module
+        self.N_PHASES = n_phases
         assert base_ch % 2 == 0
         self.c_pair = base_ch // 2
         P = self.N_PHASES
@@ -613,8 +612,8 @@ class SR3UNet(nn.Module):
         noise_dim = self.noise_embed.mlp[-1].out_features
 
         # ---- INPUT ----
-        # 6 channels: 5 noisy phases + bulk (all N×N matrices)
-        self.input_conv        = nn.Conv2d(6, base_ch // 2, kernel_size=3, padding=1)
+        # n_phases noisy phases + 1 bulk channel (all N×N matrices)
+        self.input_conv        = nn.Conv2d(P + 1, base_ch // 2, kernel_size=3, padding=1)
         self.chip_pair_encoder = ChipPairEncoderAlpha(n_bins=n, c_pair=self.c_pair)
 
         # ---- SHARED ENCODER ----
@@ -673,7 +672,7 @@ class SR3UNet(nn.Module):
         # Default kaiming-uniform init (not zero) so chip_oe_similarity_loss gets
         # non-zero, phase-varying predictions from step 1.  Zero init caused a dead
         # gradient: |0 - 0| = 0 and sign(0) = 0, so weights never moved.
-        self.chip_pred_head = nn.Conv2d(self.c_pair, 5, kernel_size=1)
+        self.chip_pred_head = nn.Conv2d(self.c_pair, P, kernel_size=1)
 
         # ---- LOOP CLASSIFICATION HEAD ----
         # Predicts loop presence/type in the contact map from ChIP-seq pair features.
@@ -719,13 +718,13 @@ class SR3UNet(nn.Module):
     ):
         """
         Args:
-            x_t:          (B, 5, N, N)  noisy phase matrices [earlyG1, midG1, lateG1, anatelo, prometa]
+            x_t:          (B, n_phases, N, N)  noisy phase matrices
             gamma:        (B,)           noise level
             chip_*_row:   (B, N)         ChIP-seq for the row genomic window
             chip_*_col:   (B, N)         ChIP-seq for the col genomic window
             bulk_map:     (B, 1, N, N)  bulk Hi-C conditioning (already a 2-D matrix)
         Returns:
-            x0:    (B, 5, N, N)  predicted clean matrices
+            x0:    (B, n_phases, N, N)  predicted clean matrices
             h_chip:(B, c_pair, N, N)  chip pair features (used for aux loss)
         """
         B = x_t.shape[0]
